@@ -733,19 +733,20 @@ loadNdDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTiles,
   VectorType vecLoadType =
       VectorType::get(tileType.getShape(), tileType.getElementType());
   IntegerAttr vnniAxisAttr = nullptr;
+  mlir::UnitAttr packedAttr = nullptr;
   if (vnniConf) {
     vnniAxisAttr = IntegerAttr::get(rewriter.getI64Type(), vnniConf->vnniAxis);
     vecLoadType = getVnniVector(tileType.getShape(), tileType.getElementType(),
                                 *vnniConf);
+    packedAttr = mlir::UnitAttr::get(rewriter.getContext());
   }
-
+  IntegerAttr transpose_bit = nullptr;
   SmallVector<Value> loadVec;
   for (auto tile : loadTiles) {
-    IntegerAttr transposeBitWidthAttr = nullptr;
-    mlir::UnitAttr packed = nullptr;
+    
     auto loadOp = rewriter.create<xegpu::LoadNdOp>(
-        loc, vecLoadType, tile, packed, transpose,
-        /*transposeBitWidthAttr=*/transposeBitWidthAttr,
+        loc, vecLoadType, tile, packedAttr, transpose,
+        transpose_bit,
         /*l1_hint=*/hint,
         /*l2_hint=*/hint, /*l3_hint=*/hint);
     loadVec.push_back(loadOp);
@@ -1060,7 +1061,7 @@ static LogicalResult createDPASKernel(linalg::LinalgOp linalgOp,
 
   // Load A sub-tiles.
   SmallVector<Value> loadVecA =
-      loadNdDescTiles(rewriter, loc, tilesA, readCacheHint, vnniConfA);
+      loadNdDescTiles(rewriter, loc, tilesA, readCacheHint);
   auto tileTypeA = cast<xegpu::TensorDescType>(tilesA[0].getType());
 
   // Load B sub-tiles.
