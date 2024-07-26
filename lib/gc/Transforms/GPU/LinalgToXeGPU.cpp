@@ -741,8 +741,11 @@ loadNdDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTiles,
 
   SmallVector<Value> loadVec;
   for (auto tile : loadTiles) {
+    IntegerAttr transposeBitWidthAttr = nullptr;
+    mlir::UnitAttr packed = nullptr;
     auto loadOp = rewriter.create<xegpu::LoadNdOp>(
-        loc, vecLoadType, tile, vnniAxisAttr, transpose,
+        loc, vecLoadType, tile, packed, transpose,
+        /*transposeBitWidthAttr=*/transposeBitWidthAttr,
         /*l1_hint=*/hint,
         /*l2_hint=*/hint, /*l3_hint=*/hint);
     loadVec.push_back(loadOp);
