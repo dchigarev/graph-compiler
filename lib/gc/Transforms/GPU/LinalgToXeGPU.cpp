@@ -951,7 +951,7 @@ static LogicalResult createDPASKernel(linalg::LinalgOp linalgOp,
 
   // Create A sub-tiles.
   SmallVector<Value> tilesA =
-      createCoarseDscTiles(rewriter, loc, matA, {dimM, kTile}, /*isVnni=*/true);
+      createCoarseDscTiles(rewriter, loc, matA, {dimM, kTile}, /*isVnni=*/false);
 
   // Create B sub-tiles.
   SmallVector<Value> tilesB =
@@ -1069,7 +1069,6 @@ static LogicalResult createDPASKernel(linalg::LinalgOp linalgOp,
   if (vnniFactor == -1)
     return failure();
 
-  VnniConfig vnniConfA{.vnniFactor = vnniFactor, .vnniAxis = 1};
   VnniConfig vnniConfB{.vnniFactor = vnniFactor, .vnniAxis = 0};
 
   // Load A sub-tiles.
@@ -1105,7 +1104,7 @@ static LogicalResult createDPASKernel(linalg::LinalgOp linalgOp,
   // Extract DPAS tiles from loaded sub-tiles.
   TilesArray dpasVecA = extractVecSubTiles(rewriter, loc, loadVecA,
                                            {dimM, kTile}, tileTypeA.getShape(),
-                                           {dpasTileM, dpasTileK}, vnniConfA);
+                                           {dpasTileM, dpasTileK});
   TilesArray dpasVecB = extractVecSubTiles(rewriter, loc, loadVecB,
                                            {kTile, dimN}, tileTypeB.getShape(),
                                            {dpasTileK, dpasTileN}, vnniConfB);
