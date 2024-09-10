@@ -377,8 +377,9 @@ private:
 
     auto ptr = mod.lookupSymbol<LLVM::GlobalOp>(str("Ptr"));
     assert(ptr);
-    SmallVector<char> nameChars(kernelModName.getValue().begin(),
-                                kernelModName.getValue().end());
+    auto kernelName = gpuLaunch.getKernelName();
+    SmallVector<char> nameChars(kernelName.getValue().begin(),
+                                kernelName.getValue().end());
     nameChars.emplace_back('\0');
     // Kernel name and SPIRV are stored as global strings
     auto name = LLVM::createGlobalString(
