@@ -264,48 +264,23 @@ private:
     va_start(args, kernel);
     for (size_t i = 0, n = kernel->argSize.size(); i < n; i++) {
       auto size = kernel->argSize[i];
-      switch (size) {
-      case 0: {
-        void *ptr = va_arg(args, void *);
-        if (ctx->clPtrs.find(ptr) == ctx->clPtrs.end()) {
-          gcLogD("Setting kernel ", cloned.kernel, " argument ", i,
-                 " to USM pointer ", ptr);
-          err = ctx->runtime.ext.clSetKernelArgMemPointerINTEL(cloned.kernel, i,
-                                                               ptr);
-        } else {
-          gcLogD("Setting kernel ", cloned.kernel, " argument ", i,
-                 " to CL pointer ", ptr);
-          err = clSetKernelArg(cloned.kernel, i, sizeof(cl_mem), &ptr);
-        }
-        break;
+      void *ptr = va_arg(args, void *);
+
+      if (size) {
+        gcLogD("Setting kernel ", cloned.kernel, " argument ", i, " to ",
+               *static_cast<int64_t *>(ptr));
+        err = clSetKernelArg(cloned.kernel, i, size, ptr);
+      } else if (ctx->clPtrs.find(ptr) == ctx->clPtrs.end()) {
+        gcLogD("Setting kernel ", cloned.kernel, " argument ", i,
+               " to USM pointer ", ptr);
+        err = ctx->runtime.ext.clSetKernelArgMemPointerINTEL(cloned.kernel, i,
+                                                             ptr);
+      } else {
+        gcLogD("Setting kernel ", cloned.kernel, " argument ", i,
+               " to CL pointer ", ptr);
+        err = clSetKernelArg(cloned.kernel, i, sizeof(cl_mem), &ptr);
       }
-      case 1: {
-        auto val = static_cast<int8_t>(va_arg(args, int));
-        gcLogD("Setting kernel ", cloned.kernel, " argument ", i, " to ", val);
-        err = clSetKernelArg(cloned.kernel, i, size, &val);
-        break;
-      }
-      case 2: {
-        auto val = static_cast<int16_t>(va_arg(args, int));
-        gcLogD("Setting kernel ", cloned.kernel, " argument ", i, " to ", val);
-        err = clSetKernelArg(cloned.kernel, i, size, &val);
-        break;
-      }
-      case 4: {
-        auto val = va_arg(args, int32_t);
-        gcLogD("Setting kernel ", cloned.kernel, " argument ", i, " to ", val);
-        err = clSetKernelArg(cloned.kernel, i, size, &val);
-        break;
-      }
-      case 8: {
-        auto val = va_arg(args, int64_t);
-        gcLogD("Setting kernel ", cloned.kernel, " argument ", i, " to ", val);
-        err = clSetKernelArg(cloned.kernel, i, size, &val);
-        break;
-      }
-      default:
-        report_fatal_error(gcMakeErr("Unsupported argument size: ", size));
-      }
+
       if (err != CL_SUCCESS) {
         reportClErr("Failed to set kernel ", cloned.kernel, " argument ", i,
                     " of size ", size);
