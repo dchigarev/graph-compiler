@@ -163,7 +163,7 @@ struct OclRuntime::Exports {
     llvm::orc::SymbolMap map;
     map.reserve(6);
     map.try_emplace(interner(GPU_OCL_MALLOC),
-                    llvm::orc::ExecutorAddr::fromPtr(&malloc),
+                    llvm::orc::ExecutorAddr::fromPtr(&alloc),
                     llvm::JITSymbolFlags::Exported);
     map.try_emplace(interner(GPU_OCL_DEALLOC),
                     llvm::orc::ExecutorAddr::fromPtr(&dealloc),
@@ -184,7 +184,7 @@ struct OclRuntime::Exports {
   }
 
 private:
-  static void *maloc(const OclContext *ctx, size_t size) {
+  static void *alloc(const OclContext *ctx, size_t size) {
     return gcGetOrReport(ctx->runtime.usmAllocDev(size));
   }
 
