@@ -17,14 +17,12 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
-#include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #include <memory>
 
-#include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/Transforms/Passes.h>
 
 #include "gc/Transforms/Passes.h"
@@ -57,20 +55,15 @@ static OwningOpRef<ModuleOp> parse(MLIRContext &ctx, const char *code) {
 }
 
 TEST(GpuOclRuntime, TestAdd) {
-  MLIRContext mlirCtx{gc::initCompilerAndGetDialects()};
-  OwningOpRef<ModuleOp> module = parse(mlirCtx, mlirAdd);
-  auto rt = gcGetOrReport(OclRuntime::get());
-
-  int64_t shape[] = {32, 32};
-  int64_t strides[] = {32, 1};
-  auto size = shape[0] * shape[1];
+  constexpr unsigned size = 32 * 32;
   float cpuBuf1[size];
   float cpuBuf2[size];
 
-  for (int i = 0; i < size; i++) {
-    cpuBuf1[i] = 2.0f;
+  for (float &i : cpuBuf1) {
+    i = 2.0f;
   }
 
+  auto rt = gcGetOrReport(OclRuntime::get());
   auto buf0 = gcGetOrReport(rt.usmNewDev<float>(size));
   auto buf1 = gcGetOrReport(rt.usmNewDev<float>(size));
   auto buf2 = gcGetOrReport(rt.usmNewShared<float>(size));
@@ -81,14 +74,13 @@ TEST(GpuOclRuntime, TestAdd) {
   assert(rt.usmCpy(ctx, cpuBuf1, buf0, size));
   assert(rt.usmCpy(ctx, cpuBuf1, buf1, size));
 
+  MLIRContext mlirCtx{gc::initCompilerAndGetDialects()};
+  OwningOpRef<ModuleOp> module = parse(mlirCtx, mlirAdd);
+
   OclModuleBuilder modBuilder(module);
   auto mod = gcGetOrReport(modBuilder.build(rt));
-  mod = gcGetOrReport(modBuilder.build(rt));
-  OclModuleArgs<27> args(ctx);
-  args.add(buf0, 2, shape, strides);
-  args.add(buf1, 2, shape, strides);
-  args.add(buf2, 2, shape, strides);
-  mod->exec(args);
+  OclModuleExecutor<27> exec(mod);
+  assert(exec(ctx, &buf0, &buf1, &buf2));
 
   assert(rt.usmCpy(ctx, buf2, cpuBuf2, size));
   ctx.finish();
@@ -96,15 +88,15 @@ TEST(GpuOclRuntime, TestAdd) {
   assert(rt.usmFree(buf0));
   assert(rt.usmFree(buf1));
 
-  for (int i = 0; i < size; i++) {
+  for (unsigned i = 0; i < size; i++) {
     // std::cout << buf2[i] << " ";
     assert(buf2[i] == 4.0f);
   }
   // std::cout << "\n";
 
-  for (int i = 0; i < size; i++) {
+  for (float i : cpuBuf2) {
     // std::cout << cpuBuf2[i] << " ";
-    assert(cpuBuf2[i] == 4.0f);
+    assert(i == 4.0f);
   }
   // std::cout << "\n";
   assert(rt.usmFree(buf2));

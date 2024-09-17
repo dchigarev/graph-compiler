@@ -270,7 +270,7 @@ private:
         gcLogD("Setting kernel ", cloned.kernel, " argument ", i, " to ",
                *static_cast<int64_t *>(ptr));
         err = clSetKernelArg(cloned.kernel, i, size, ptr);
-      } else if (ctx->clPtrs.find(ptr) == ctx->clPtrs.end()) {
+      } else if (ctx->clPtrs->find(ptr) == ctx->clPtrs->end()) {
         gcLogD("Setting kernel ", cloned.kernel, " argument ", i,
                " to USM pointer ", ptr);
         err = ctx->runtime.ext.clSetKernelArgMemPointerINTEL(cloned.kernel, i,
@@ -555,6 +555,14 @@ bool OclRuntime::isUsm(const void *ptr) const {
   return err == CL_SUCCESS && allocType != CL_MEM_TYPE_UNKNOWN_INTEL;
 }
 
+#ifndef NDEBUG
+void OclRuntime::debug(const char *file, int line, const char *msg) {
+#ifndef GC_LOG_NO_DEBUG
+  mlir::gc::log::insetLog(file, line, std::cout, "DEBUG", msg);
+#endif
+}
+#endif
+
 void OclContext::finish() {
   gcLogD("Waiting for the enqueued OpenCL commands to finish: ", queue);
   CL_CHECKR(clFinish(queue),
@@ -582,14 +590,13 @@ OclModuleBuilder::OclModuleBuilder(const ModuleOp module) : mlirModule(module) {
       return;
     }
 
-    funcName = func.getName();
     // Add a new argument for GcGpuOclContext.
-    auto ctx = mlirModule->getContext();
     auto funcType = func.getFunctionType();
+    auto ctx = mlirModule->getContext();
     auto argTypes = llvm::to_vector(funcType.getInputs());
     auto resultTypes = llvm::to_vector<1>(funcType.getResults());
 
-    Type newArgType = MemRefType::get({}, IntegerType::get(ctx, 8));
+    auto newArgType = MemRefType::get({}, IntegerType::get(ctx, 8));
     argTypes.push_back(newArgType);
     auto newFuncType = FunctionType::get(ctx, argTypes, resultTypes);
     func.setType(newFuncType);
@@ -598,8 +605,9 @@ OclModuleBuilder::OclModuleBuilder(const ModuleOp module) : mlirModule(module) {
     auto &entryBlock = func.getBody().front();
     OpBuilder builder(func.getBody());
     entryBlock.addArgument(newArgType, func.getLoc());
+    functionOp = func;
   });
-  assert(!funcName.empty());
+  assert(functionOp);
 }
 
 llvm::Expected<std::shared_ptr<const OclModule>>
@@ -648,18 +656,17 @@ OclModuleBuilder::build(const OclRuntime::Ext &ext) {
   CHECKE(eng, "Failed to create ExecutionEngine!");
   eng->get()->registerSymbols(OclRuntime::Exports::symbolMap);
 
+  auto funcName = functionOp.getName();
   auto main = eng.get()->lookupPacked(funcName);
-  CHECKE(main, "Module function ", funcName.c_str(), " not found!");
+  CHECKE(main, "Module function '", funcName.begin(), "' not found!");
 
   std::lock_guard<std::shared_mutex> lock(mux);
   if (auto it = cache.find(ext); it != cache.end()) {
     return it->second;
   }
-  return cache
-      .emplace(std::piecewise_construct,
-               std::forward_as_tuple(ext.device, ext.context),
-               std::forward_as_tuple(std::make_shared<OclModule>(
-                   OclRuntime(ext), std::move(eng.get()), *main)))
+  std::shared_ptr<const OclModule> ptr(
+      new OclModule(OclRuntime(ext), *main, functionOp, std::move(eng.get())));
+  return cache.emplace(OclDevCtxPair(ext.device, ext.context), ptr)
       .first->second;
 }
 }; // namespace mlir::gc::gpu

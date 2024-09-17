@@ -44,8 +44,8 @@ static void insetLog(
 } // namespace mlir::gc::log
 
 #ifdef GC_LOG_NO_DEBUG
+#undef gcLogD
 #define gcLogD(...)
-#undef GC_LOG_NO_DEBUG
 #endif
 
 #endif
