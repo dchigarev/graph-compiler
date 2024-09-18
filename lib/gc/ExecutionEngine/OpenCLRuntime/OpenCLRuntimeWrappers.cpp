@@ -51,7 +51,7 @@ constexpr char MemBlockingFreeName[] = "clMemBlockingFreeINTEL";
 constexpr char SetKernelArgMemPointerName[] = "clSetKernelArgMemPointerINTEL";
 static constexpr char EnqueueMemcpyName[] = "clEnqueueMemcpyINTEL";
 
-OCL_RUNTIME_EXPORT int ocl_runtime_keep_alive = 0;
+extern "C" OCL_RUNTIME_EXPORT int ocl_runtime_keep_alive = 0;
 
 void *queryCLExtFunc(cl_platform_id CurPlatform, const char *FuncName) {
   void *ret = clGetExtensionFunctionAddressForPlatform(CurPlatform, FuncName);
