@@ -20,6 +20,10 @@
 #include <thread>
 #include <vector>
 
+#include "gc/Utils.h"
+
+#define OCL_RUNTIME_EXPORT GC_DLL_EXPORT
+
 namespace {
 
 #define CL_SAFE_CALL2(a)                                                       \
