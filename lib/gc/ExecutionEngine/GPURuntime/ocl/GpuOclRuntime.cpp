@@ -20,7 +20,10 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Pass/PassManager.h"
+
+#include <llvm/ADT/SmallSet.h>
 
 namespace mlir::gc::gpu {
 
@@ -134,7 +137,7 @@ struct Kernel {
                                    gridSize[2] * blockSize[2]},
         localSize{blockSize[0], blockSize[1], blockSize[2]},
         argSize(argSize, argSize + argNum) {
-#ifndef _NDEBUG
+#ifndef NDEBUG
     std::string args;
     for (size_t i = 0; i < argNum; i++) {
       args += std::to_string(argSize[i]);
@@ -361,7 +364,7 @@ OclRuntime::gcIntelDevices(size_t max) {
       }
       if (vendorId == 0x8086) {
         intelDevices.emplace_back(dev);
-#ifndef _NDEBUG
+#ifndef NDEBUG
         size_t nameSize;
         std::string name;
         clGetDeviceInfo(dev, CL_DEVICE_NAME, 0, nullptr, &nameSize);
@@ -563,15 +566,16 @@ void OclRuntime::debug(const char *file, int line, const char *msg) {
 }
 #endif
 
-void OclContext::finish() {
+llvm::Expected<bool> OclContext::finish() {
   gcLogD("Waiting for the enqueued OpenCL commands to finish: ", queue);
-  CL_CHECKR(clFinish(queue),
-            "Failed to finish the OpenCL command queue: ", queue);
+  CL_CHECK(clFinish(queue),
+           "Failed to finish the OpenCL command queue: ", queue);
   if (preserveOrder) {
     waitListLen = 0;
     waitList = nullptr;
     lastEvent = nullptr;
   }
+  return true;
 }
 
 OclModule::~OclModule() {
@@ -584,13 +588,118 @@ OclModule::~OclModule() {
   }
 }
 
+constexpr char STATIC_MAIN[] = "gcGpuOclStaticMain";
+
+// If all arguments of 'origFunc' are memrefs with static shape, create a new
+// function called STATIC_MAIN, that accepts 2 arguments: a pointer to
+// OclContext and a pointer to an array, containing pointers to aligned memory
+// buffers. The function will call the original function with the context,
+// buffers and the offset/shape/strides, statically created from the
+// memref descriptor.
+bool createStaticMain(ModuleOp &module, func::FuncOp &origFunc) {
+  auto mainFunc = module.lookupSymbol<LLVM::LLVMFuncOp>(origFunc.getName());
+  if (!mainFunc) {
+    gcLogE("Failed to create static main, because the function '",
+           origFunc.getName().begin(), "' not found!");
+    return false;
+  }
+  mainFunc.setAlwaysInline(true);
+
+  auto origFuncType = origFunc.getFunctionType();
+  // Assuming the original function is void
+  assert(origFuncType.getResults().empty());
+  auto origTypes = origFuncType.getInputs();
+  auto nargs = origTypes.size() - 1; // The last one is OclContext
+  SmallVector<int64_t, 64> constArgs;
+  unsigned argsCounter = 0;
+
+  for (unsigned i = 0; i < nargs; ++i) {
+    if (auto type = mlir::dyn_cast<MemRefType>(origTypes[i])) {
+      if (!type.hasStaticShape()) {
+        gcLogD("The argument ", i, " of the function ",
+               origFunc.getName().begin(), " has a dynamic shape.");
+        return false;
+      }
+
+      auto shape = type.getShape();
+      auto offsetPtr = constArgs.end();
+      constArgs.emplace_back(0);
+      constArgs.append(shape.begin(), shape.end());
+      if (failed(getStridesAndOffset(type, constArgs, *offsetPtr))) {
+        gcLogD("Failed to get strides and offset of arg", i,
+               " of the function ", origFunc.getName().begin());
+        return false;
+      }
+      argsCounter += shape.size() * 2 + 3;
+    }
+  }
+
+  auto loc = origFunc.getLoc();
+  auto ctx = module.getContext();
+  ctx->getOrLoadDialect<LLVM::LLVMDialect>();
+  OpBuilder builder(ctx);
+  auto i64Type = builder.getI64Type();
+  auto ptrType = LLVM::LLVMPointerType::get(ctx);
+  auto newFuncType = LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(ctx),
+                                                 {ptrType, ptrType});
+  auto newFunc = OpBuilder::atBlockEnd(module.getBody())
+                     .create<LLVM::LLVMFuncOp>(loc, STATIC_MAIN, newFuncType);
+  auto &entryBlock = *newFunc.addEntryBlock(builder);
+  builder.setInsertionPointToStart(&entryBlock);
+  Value arrayPtr = entryBlock.getArgument(1);
+
+  std::unordered_map<int64_t, Value> constMap;
+  auto createConst = [&](int64_t i) {
+    if (auto v = constMap.find(i); v != constMap.end()) {
+      return v->second;
+    }
+    return constMap
+        .emplace(i, builder.create<LLVM::ConstantOp>(
+                        loc, i64Type, builder.getIntegerAttr(i64Type, i)))
+        .first->second;
+  };
+  Value zero = createConst(0);
+  Value one = createConst(1);
+
+  SmallVector<Value, 64> args;
+  args.reserve(argsCounter);
+
+  for (unsigned i = 0, j = 0; i < nargs; i++) {
+    if (i != 0) {
+      arrayPtr =
+          builder.create<LLVM::GEPOp>(loc, ptrType, ptrType, arrayPtr, one);
+    }
+
+    auto ptr = builder.create<LLVM::LoadOp>(loc, ptrType, arrayPtr);
+    args.emplace_back(ptr);
+    args.emplace_back(ptr);
+    args.emplace_back(createConst(constArgs[j++]));
+
+    for (unsigned
+             k = 0,
+             m = 2 * mlir::cast<MemRefType>(origTypes[i]).getShape().size();
+         k < m; k++) {
+      args.emplace_back(createConst(constArgs[j++]));
+    }
+  }
+
+  auto oclCtxArg = entryBlock.getArgument(0);
+  args.emplace_back(oclCtxArg);
+  args.emplace_back(oclCtxArg);
+  args.emplace_back(zero);
+
+  auto call = builder.create<LLVM::CallOp>(loc, mainFunc, args);
+  builder.create<LLVM::ReturnOp>(loc, call.getResults());
+  return true;
+}
+
 OclModuleBuilder::OclModuleBuilder(const ModuleOp module) : mlirModule(module) {
   mlirModule->walk([&](func::FuncOp func) {
     if (!func.isPublic()) {
       return;
     }
 
-    // Add a new argument for GcGpuOclContext.
+    // Add a new argument for OclContext.
     auto funcType = func.getFunctionType();
     auto ctx = mlirModule->getContext();
     auto argTypes = llvm::to_vector(funcType.getInputs());
@@ -650,22 +759,39 @@ OclModuleBuilder::build(const OclRuntime::Ext &ext) {
   populateGPUPipeline(pm);
   CHECK(!pm.run(mod).failed(), "GPU pipeline failed!");
 
+  auto isStatic = createStaticMain(mod, functionOp);
+
   ExecutionEngineOptions opts;
   opts.jitCodeGenOptLevel = llvm::CodeGenOptLevel::Aggressive;
+#ifndef NDEBUG
+  opts.enableGDBNotificationListener = false;
+  opts.enablePerfNotificationListener = false;
+#endif
+
   auto eng = ExecutionEngine::create(mod, opts);
   CHECKE(eng, "Failed to create ExecutionEngine!");
   eng->get()->registerSymbols(OclRuntime::Exports::symbolMap);
 
-  auto funcName = functionOp.getName();
-  auto main = eng.get()->lookupPacked(funcName);
-  CHECKE(main, "Module function '", funcName.begin(), "' not found!");
+  OclModule::MainFunc main = {nullptr};
+
+  if (isStatic) {
+    auto expect = eng.get()->lookup(STATIC_MAIN);
+    CHECKE(expect, "Module function '", STATIC_MAIN, "' not found!");
+    main.staticMain = reinterpret_cast<OclModule::StaticMainFunc>(*expect);
+  } else {
+    auto funcName = functionOp.getName();
+    auto expect = eng.get()->lookupPacked(funcName);
+    CHECKE(expect, "Module function '", funcName.begin(), "' not found!");
+    main.wrappedMain = *expect;
+  }
 
   std::lock_guard<std::shared_mutex> lock(mux);
   if (auto it = cache.find(ext); it != cache.end()) {
     return it->second;
   }
   std::shared_ptr<const OclModule> ptr(
-      new OclModule(OclRuntime(ext), *main, functionOp, std::move(eng.get())));
+      new OclModule(OclRuntime(ext), isStatic, main,
+                    functionOp.getFunctionType(), std::move(eng.get())));
   return cache.emplace(OclDevCtxPair(ext.device, ext.context), ptr)
       .first->second;
 }

@@ -16,7 +16,7 @@
 #include "llvm/Support/Error.h"
 
 namespace mlir::gc::err {
-#ifdef _NDEBUG
+#ifdef NDEBUG
 #define GC_ERR_LOC_DECL
 #define GC_ERR_LOC_ARGS
 #define GC_ERR_LOC

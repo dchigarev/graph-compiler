@@ -21,18 +21,18 @@ static void insertArgs(std::ostream &stream, T first, Args... args) {
 
 template <typename... Args>
 static void insetLog(
-#ifndef _NDEBUG
+#ifndef NDEBUG
     const char *fileName, int lineNum,
 #endif
     std::ostream &stream, const char *pref, Args... args) {
   stream << "[" << pref << "] ";
-#ifndef _NDEBUG
+#ifndef NDEBUG
   stream << "[" << fileName << ":" << lineNum << "] ";
 #endif
   insertArgs(stream, args...);
 }
 
-#ifdef _NDEBUG
+#ifdef NDEBUG
 #define gcLogD(...)
 #define gcLogE(...) mlir::gc::log::insetLog(std::cerr, "ERROR", __VA_ARGS__)
 #else
