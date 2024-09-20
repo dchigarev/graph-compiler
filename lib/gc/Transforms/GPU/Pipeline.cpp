@@ -95,7 +95,7 @@ void populateGPUPipeline(mlir::OpPassManager &pm) {
   pm.addNestedPass<func::FuncOp>(LLVM::createRequestCWrappersPass());
   pm.addPass(imex::createSerializeSPIRVPass());
   pm.addPass(createConvertVectorToSCFPass());
-  pm.addPass(imex::createConvertGPUToGPUXPass());
+  // pm.addPass(imex::createConvertGPUToGPUXPass());
   pm.addPass(createConvertSCFToCFPass());
   pm.addPass(createConvertControlFlowToLLVMPass());
   pm.addPass(createConvertVectorToLLVMPass());
@@ -103,8 +103,8 @@ void populateGPUPipeline(mlir::OpPassManager &pm) {
   pm.addPass(createArithToLLVMConversionPass());
   pm.addPass(createConvertFuncToLLVMPass());
   pm.addPass(createConvertMathToLLVMPass());
-  pm.addPass(imex::createConvertGPUXToLLVMPass());
-  // pm.addPass(createGpuToGpuOcl());
+  // pm.addPass(imex::createConvertGPUXToLLVMPass());
+  pm.addPass(createGpuToGpuOcl());
   pm.addPass(createConvertIndexToLLVMPass());
   pm.addPass(memref::createExpandStridedMetadataPass());
   pm.addPass(createLowerAffinePass());

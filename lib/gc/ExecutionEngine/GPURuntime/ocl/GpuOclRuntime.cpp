@@ -760,6 +760,7 @@ OclModuleBuilder::build(const OclRuntime::Ext &ext) {
   CHECK(!pm.run(mod).failed(), "GPU pipeline failed!");
 
   auto isStatic = createStaticMain(mod, functionOp);
+  mod.dump();
 
   ExecutionEngineOptions opts;
   opts.jitCodeGenOptLevel = llvm::CodeGenOptLevel::Aggressive;
