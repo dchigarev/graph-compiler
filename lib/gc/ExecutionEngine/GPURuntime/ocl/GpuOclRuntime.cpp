@@ -269,7 +269,7 @@ private:
       auto size = kernel->argSize[i];
       void *ptr = va_arg(args, void *);
 
-      if (size || i == 3) {
+      if (size) {
         gcLogD("Setting kernel ", cloned.kernel, " argument ", i, " to ",
                *static_cast<int64_t *>(ptr));
         err = clSetKernelArg(cloned.kernel, i, size, ptr);
