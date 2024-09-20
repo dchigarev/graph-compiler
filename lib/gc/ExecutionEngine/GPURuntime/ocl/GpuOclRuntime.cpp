@@ -269,7 +269,7 @@ private:
       auto size = kernel->argSize[i];
       void *ptr = va_arg(args, void *);
 
-      if (size) {
+      if (size || i == 3) {
         gcLogD("Setting kernel ", cloned.kernel, " argument ", i, " to ",
                *static_cast<int64_t *>(ptr));
         err = clSetKernelArg(cloned.kernel, i, size, ptr);
@@ -281,12 +281,12 @@ private:
       } else {
         gcLogD("Setting kernel ", cloned.kernel, " argument ", i,
                " to CL pointer ", ptr);
-        err = clSetKernelArg(cloned.kernel, i, sizeof(cl_mem), &ptr);
+        err = clSetKernelArg(cloned.kernel, i, sizeof(cl_mem), ptr);
       }
 
       if (err != CL_SUCCESS) {
         reportClErr("Failed to set kernel ", cloned.kernel, " argument ", i,
-                    " of size ", size);
+                    " of size ", size, " CL_Error: ", err);
       }
     }
     va_end(args);

@@ -104,6 +104,7 @@ void populateGPUPipeline(mlir::OpPassManager &pm) {
   pm.addPass(createConvertFuncToLLVMPass());
   pm.addPass(createConvertMathToLLVMPass());
   // pm.addPass(imex::createConvertGPUXToLLVMPass());
+  pm.addPass(createPrintIRPass());
   pm.addPass(createGpuToGpuOcl());
   pm.addPass(createConvertIndexToLLVMPass());
   pm.addPass(memref::createExpandStridedMetadataPass());

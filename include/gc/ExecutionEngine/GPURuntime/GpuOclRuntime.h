@@ -302,7 +302,7 @@ protected:
   void checkArg(void *alignedPtr, bool isUsm = true) const {
     assert(!isUsm || mod->runtime.isUsm(alignedPtr));
     // It's recommended to have at least 16-byte alignment
-    assert(reinterpret_cast<std::uintptr_t>(alignedPtr) % 16 == 0);
+    assert(!isUsm || reinterpret_cast<std::uintptr_t>(alignedPtr) % 16 == 0);
   }
 #endif
 };
