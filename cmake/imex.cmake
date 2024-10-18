@@ -14,8 +14,7 @@ if (NOT DEFINED IMEX_INCLUDES)
 
     # TODO: Change to main https://github.com/intel/mlir-extensions when all the
     # required functionality is merged.
-    set(IMEX_URL https://github.com/intel/mlir-extensions)
-    gc_fetch_content(imex "${IMEX_HASH}" "${IMEX_URL}"
+    gc_fetch_content(imex "${IMEX_HASH}" https://github.com/dchigarev/mlir-extensions
             SET IMEX_CHECK_LLVM_VERSION=ON IMEX_ENABLE_L0_RUNTIME=0
     )
 

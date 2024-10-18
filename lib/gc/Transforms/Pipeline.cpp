@@ -78,11 +78,11 @@ void populateTensorPasses(mlir::OpPassManager &pm) {
 // scf + arith + math + vector + tensor + linalg.brgemm
 void populateVectorPasses(mlir::OpPassManager &pm) {
   // Do promotion for math / arith ops
-  pm.addNestedPass<func::FuncOp>(math::createMathLegalizeToF32());
+  // pm.addNestedPass<func::FuncOp>(math::createMathLegalizeToF32());
   // sourceTypeStrs can be extended
   arith::ArithEmulateUnsupportedFloatsOptions options;
   std::array<std::string, 1> typeStr = {"bf16"};
-  options.sourceTypeStrs = typeStr;
+  // options.sourceTypeStrs = typeStr;
   options.targetTypeStr = "f32";
   pm.addNestedPass<func::FuncOp>(
       arith::createArithEmulateUnsupportedFloats(options));

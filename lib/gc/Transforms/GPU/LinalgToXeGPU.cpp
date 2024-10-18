@@ -764,7 +764,10 @@ loadNdDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTiles,
   if (vnniConf) {
     vecLoadType = getVnniVector(tileType.getShape(), tileType.getElementType(),
                                 *vnniConf);
-    packedAttr = mlir::UnitAttr::get(rewriter.getContext());
+    if (!transpose_bit) {
+      packedAttr = mlir::UnitAttr::get(rewriter.getContext());
+    }
+    // packedAttr = mlir::UnitAttr::get(rewriter.getContext());
   }
   SmallVector<Value> loadVec;
   for (auto tile : loadTiles) {
@@ -1214,7 +1217,7 @@ static LogicalResult createDPASKernel(linalg::LinalgOp linalgOp,
   // Extract DPAS tiles from loaded sub-tiles.
   TilesArray dpasVecA = extractVecSubTiles(rewriter, loc, loadVecA,
                                            {dimM, kTile}, tileTypeA.getShape(),
-                                           {dpasTileM, dpasTileK}, vnniConfA);
+                                           {dpasTileM, dpasTileK});
   TilesArray dpasVecB = extractVecSubTiles(rewriter, loc, loadVecB,
                                            {kTile, dimN}, tileTypeB.getShape(),
                                            {dpasTileK, dpasTileN}, vnniConfB);
@@ -1629,6 +1632,7 @@ struct LinalgToXeGPU : public gc::impl::LinalgToXeGPUBase<LinalgToXeGPU> {
   using LinalgToXeGPUBase::LinalgToXeGPUBase;
 
   void runOnOperation() override {
+    SmallVector<int64_t> dpasTile{8, 16, 16};
     LinalgToXeGPUOptions options{kTile, stages, dpasTile};
 
     // Run GEMM pattern first to allow fusion with its consumers.
