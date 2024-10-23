@@ -14,6 +14,7 @@ gc_add_mlir_library(GcGpuPasses
   AddContextArg.cpp
   GpuLoopTiling.cpp
   GpuTilingAndFusion.cpp
+  AllocsToSLM.cpp
   GpuToGpuOcl.cpp
   LinalgToXeGPU.cpp
   Pipeline.cpp
