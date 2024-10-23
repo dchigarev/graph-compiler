@@ -94,6 +94,16 @@ def LinalgToXeGPU : Pass<"linalg-to-xegpu", "func::FuncOp"> {
   ];
 }
 
+def AllocsToSLM : Pass<"allocs-to-slm", "func::FuncOp"> {
+  let summary = "Convert linalg dialect to XeGPU dialect.";
+  let description = [{Lower linalg ops to XeGPU dialect.}];
+  let dependentDialects = [
+    "linalg::LinalgDialect", "gpu::GPUDialect", "xegpu::XeGPUDialect",
+    "scf::SCFDialect", "memref::MemRefDialect", "arith::ArithDialect",
+    "math::MathDialect", "vector::VectorDialect"
+  ];
+}
+
 def AddContextArg : Pass<"add-ctx-arg", "func::FuncOp"> {
   let summary = "Add a context argument.";
   let description = [{

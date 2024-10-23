@@ -33,6 +33,8 @@ FailureOr<SmallVector<int64_t>> getStaticStrides(Value val);
 // is not a memref.
 std::pair<Value, Value> getPtrAndOffset(OpBuilder &builder, Value operand);
 
+bool hasSharedMemSpace(mlir::Value memref);
+
 } // namespace utils
 } // namespace mlir
 

@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/GPU/TransformOps/Utils.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/Value.h"
@@ -148,6 +149,26 @@ std::pair<Value, Value> getPtrAndOffset(OpBuilder &builder, Value operand) {
       alignedPointerAsI64);
   Value offset = meta.getOffset();
   return std::make_pair(alignedPointer, offset);
+}
+
+bool hasSharedMemSpace(mlir::Value memref) {
+  // Ensure the value is of MemRefType
+  auto memRefType = memref.getType().dyn_cast<mlir::MemRefType>();
+
+  if (!memRefType)
+    return false;
+
+  auto memorySpaceAttr = memRefType.getMemorySpace();
+
+  if (!memorySpaceAttr)
+    return false;
+
+  auto gpuAttr = memorySpaceAttr.dyn_cast<IntegerAttr>();
+
+  if (!gpuAttr)
+    return false;
+  
+  return gpuAttr.getValue() == 3;
 }
 
 } // namespace utils
