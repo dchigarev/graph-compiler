@@ -8,6 +8,8 @@
 #ifndef GPUUTILS_H
 #define GPUUTILS_H
 
+#include <numeric>
+
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
@@ -68,5 +70,47 @@ static int64_t getConstIdxValue(Value value) {
     }
   }
   return 0;
+}
+
+static void normaliseTiles(size_t totalSize,
+                                SmallVector<int64_t> &loopSizes,
+                                SmallVector<int64_t> &tiles) {
+  size_t loopCount = loopSizes.size();
+  auto size = static_cast<int64_t>(
+      std::pow(totalSize, 1.0 / static_cast<double>(loopCount)));
+  tiles.assign(loopCount, size);
+  size_t product = 1;
+  for (auto ptr = tiles.begin(), end = tiles.end(); ptr != end - 1; ++ptr) {
+    product *= *ptr + 1;
+    if (std::accumulate(ptr + 1, end, product, std::multiplies<>()) >
+        totalSize) {
+      break;
+    }
+    *ptr += 1;
+  }
+}
+
+static void normaliseTiles2(size_t totalSize, SmallVector<int64_t> &loopSizes,
+                            SmallVector<int64_t> &tiles) {
+  size_t loopCount = loopSizes.size();
+  assert(loopCount > 0);
+  std::vector<std::pair<int64_t, size_t>> sorted;
+  sorted.reserve(loopCount);
+  for (size_t i = 0; i < loopCount; ++i) {
+    sorted.emplace_back(loopSizes[i], i);
+  }
+  std::sort(sorted.begin(), sorted.end());
+  tiles.assign(loopCount, 1);
+
+  // Distribute the totalSize among the tiles
+  for (size_t i = 0; i < loopCount; ++i) {
+    auto factor = static_cast<int64_t>(
+        std::pow(totalSize, 1.0 / static_cast<double>(loopCount - i)));
+    if (factor >= sorted[i].first) {
+      factor = sorted[i].first;
+    }
+    tiles[sorted[i].second] = factor;
+    totalSize /= factor;
+  }
 }
 #endif

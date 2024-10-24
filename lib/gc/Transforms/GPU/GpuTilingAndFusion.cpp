@@ -46,6 +46,21 @@ struct GpuTilingAndFusion final
   void runOnOperation() override {
     IRRewriter rewriter(&getContext());
     scf::SCFTileAndFuseOptions opts;
+    opts.setFusionControlFn(
+        [&](tensor::ExtractSliceOp candidateSliceOp, OpResult originalProducer,
+            bool isDestinationOperand)
+            -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
+          Operation *op = originalProducer.getOwner();
+          if (!op) {
+            return std::nullopt;
+          }
+          if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+            if (!linalgOp.hasOnlyProjectedPermutations()) {
+              return std::nullopt;
+            }
+          }
+          return scf::SCFTileAndFuseOptions::ControlFnResult{};
+        });
     opts.tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
     // The outer loop is converted to a GPU kernel and the tile sizes are mapped
     // to the grid sizes.
@@ -77,13 +92,15 @@ struct GpuTilingAndFusion final
           assert(itTypes.size() == itDomains.size());
 
           // TODO: Add a parameter to the options?
-          size_t totalSize = calcOperandsSize(op) * euThreads;
+          size_t totalSize = calcOperandsSize(op);
           unsigned loopCount = 0;
+          SmallVector<int64_t> sizes;
 
           for (auto [t, r] : zip(itTypes, itDomains)) {
             if (t == utils::IteratorType::parallel) {
               if (auto v = getConstantIntValue(r.size)) {
                 loopCount++;
+                sizes.emplace_back(*v);
                 totalSize *= *v;
               } else {
                 return calcDynamicSizes(builder, ti, euMem, euThreads);
@@ -95,11 +112,15 @@ struct GpuTilingAndFusion final
             return {};
           }
 
-          // TODO: In case of different sizes, calculate the ratio for each loop
-          double ratio = std::pow(static_cast<double>(totalSize) /
-                                      static_cast<double>(euMem),
-                                  1.0 / loopCount);
-          ratio = std::max(1.0, ratio);
+          auto outerTileSize = static_cast<size_t>(
+              std::ceil(static_cast<double>(euMem) /
+                        static_cast<double>(calcOperandsSize(op))));
+          SmallVector<int64_t> outerTiles;
+          SmallVector<int64_t> innerTiles;
+          normaliseTiles(outerTileSize, sizes, outerTiles);
+          normaliseTiles(euThreads, sizes, innerTiles);
+
+          unsigned counter = 0;
           SmallVector<OpFoldResult> tiles;
           tiles.reserve(itDomains.size());
 
@@ -107,7 +128,9 @@ struct GpuTilingAndFusion final
             if (t != utils::IteratorType::parallel) {
               tiles.emplace_back(builder.getIndexAttr(1));
             } else if (auto v = getConstantIntValue(r.size)) {
-              tiles.emplace_back(ceil(builder, *v, ratio));
+              tiles.emplace_back(
+                  ceil(builder, outerTiles[counter], innerTiles[counter]));
+              counter++;
             } else {
               abort(); // Must never get here
             }
@@ -174,7 +197,8 @@ private:
   static std::optional<TilingInterface> findTi(Operation *op) {
     std::optional<TilingInterface> last;
     op->walk<WalkOrder::PreOrder>([&](linalg::LinalgOp linalgOp) {
-      if (!linalgOp->getParentOfType<scf::ForallOp>()) {
+      if (linalgOp.hasOnlyProjectedPermutations() &&
+          !linalgOp->getParentOfType<scf::ForallOp>()) {
         if (auto ti = dyn_cast<TilingInterface>(linalgOp.getOperation())) {
           last = ti;
         }

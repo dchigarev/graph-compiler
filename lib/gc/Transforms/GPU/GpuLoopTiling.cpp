@@ -41,34 +41,30 @@ struct GpuLoopTiling final : GpuPass<GpuLoopTiling>,
 
   void runOnOperation() override {
     IRRewriter rewriter(&getContext());
-    auto euThreads = static_cast<double>(getEuThreads(rewriter));
+    size_t euThreads = getEuThreads(rewriter);
     getOperation().walk<WalkOrder::PreOrder>([&](scf::ParallelOp loop) {
       if (!loop->getParentOfType<scf::ParallelOp>()) {
-        tile(loop, euThreads);
+        SmallVector<int64_t> loopSizes;
+        auto steps = loop.getStep();
+        loopSizes.reserve(steps.size());
+
+        for (auto step : steps) {
+          if (auto v = getConstIdxValue(step)) {
+            loopSizes.push_back(v);
+          } else {
+            loopSizes.push_back(32);
+          }
+        }
+
+        SmallVector<int64_t> tileSizes;
+        normaliseTiles(euThreads, loopSizes, tileSizes);
+        tileParallelLoop(loop, tileSizes, false);
       }
       return WalkResult::skip();
     });
     if (failed(simplifyRegions(rewriter, getOperation()->getRegions()))) {
       gcLogD("Failed to simplify regions");
     }
-  }
-
-private:
-  static void tile(scf::ParallelOp loop, double euThreads) {
-    SmallVector<int64_t> tileSizes;
-    auto steps = loop.getStep();
-    tileSizes.reserve(steps.size());
-
-    for (auto step : steps) {
-      if (auto v = getConstIdxValue(step)) {
-        tileSizes.push_back(static_cast<int64_t>(
-            std::ceil(static_cast<double>(v) / euThreads)));
-      } else {
-        tileSizes.push_back(32);
-      }
-    }
-
-    tileParallelLoop(loop, tileSizes, false);
   }
 };
 } // namespace
