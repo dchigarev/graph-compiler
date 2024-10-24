@@ -22,7 +22,7 @@
 #include "gc/Utils/Log.h"
 
 using namespace mlir;
-// using namespace mlir::gc::gpu;
+using namespace mlir::gc;
 
 namespace mlir::gc {
 #define GEN_PASS_DECL_GPULOOPTILING
@@ -41,34 +41,29 @@ struct GpuLoopTiling final : GpuPass<GpuLoopTiling>,
 
   void runOnOperation() override {
     IRRewriter rewriter(&getContext());
-    auto euThreads = static_cast<double>(getEuThreads(rewriter));
+    auto numThreads = getNumThreads(rewriter);
     getOperation().walk<WalkOrder::PreOrder>([&](scf::ParallelOp loop) {
       if (!loop->getParentOfType<scf::ParallelOp>()) {
-        tile(loop, euThreads);
+        SmallVector<int64_t> tiles;
+        auto steps = loop.getStep();
+        tiles.reserve(steps.size());
+
+        for (auto step : steps) {
+          if (auto v = getConstIdxValue(step)) {
+            tiles.push_back(v);
+          } else {
+            tiles.push_back(32);
+          }
+        }
+
+        adjustTiles(numThreads, tiles);
+        tileParallelLoop(loop, tiles, false);
       }
       return WalkResult::skip();
     });
     if (failed(simplifyRegions(rewriter, getOperation()->getRegions()))) {
       gcLogD("Failed to simplify regions");
     }
-  }
-
-private:
-  static void tile(scf::ParallelOp loop, double euThreads) {
-    SmallVector<int64_t> tileSizes;
-    auto steps = loop.getStep();
-    tileSizes.reserve(steps.size());
-
-    for (auto step : steps) {
-      if (auto v = getConstIdxValue(step)) {
-        tileSizes.push_back(static_cast<int64_t>(
-            std::ceil(static_cast<double>(v) / euThreads)));
-      } else {
-        tileSizes.push_back(32);
-      }
-    }
-
-    tileParallelLoop(loop, tileSizes, false);
   }
 };
 } // namespace

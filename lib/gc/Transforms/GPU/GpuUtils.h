@@ -8,16 +8,24 @@
 #ifndef GPUUTILS_H
 #define GPUUTILS_H
 
+#include <numeric>
+
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 
+#include <gc/Utils/Log.h>
+
 using namespace mlir;
 
+namespace mlir::gc {
 template <typename DerivedT> struct GpuPass {
 
-  size_t getDeviceProperty(Builder &builder, StringRef name,
-                           size_t defaultValue) {
+  int64_t getDeviceProperty(Builder &builder, StringRef name,
+                            int64_t defaultValue) {
     if (auto mod = static_cast<DerivedT *>(this)
                        ->getOperation()
                        ->template getParentOfType<ModuleOp>()) {
@@ -26,31 +34,30 @@ template <typename DerivedT> struct GpuPass {
               builder.getStringAttr("GPU" /* device ID*/),
               builder.getStringAttr(name))) {
         if (auto attr = dyn_cast<IntegerAttr>(*value)) {
-          return static_cast<size_t>(attr.getInt());
+          return attr.getInt();
         }
       }
     }
     return defaultValue;
   }
 
-  size_t getEuMem(Builder &builder) {
-    return getDeviceProperty(builder, "L1_cache_size_in_bytes",
-                             static_cast<DerivedT *>(this)->euMem);
+  int64_t getNumThreads(Builder &builder) {
+    return getDeviceProperty(builder, "num_threads",
+                             static_cast<DerivedT *>(this)->numThreads);
   }
 
-  size_t getEuThreads(Builder &builder) {
-    return getDeviceProperty(builder, "threads_per_eu",
-                             static_cast<DerivedT *>(this)->euThreads);
+  int64_t getCacheSize(Builder &builder) {
+    return getDeviceProperty(builder, "L1_cache_size_in_bytes",
+                             static_cast<DerivedT *>(this)->cacheSize);
+  }
+
+  int64_t getVectorWidth(Builder &builder) {
+    return getDeviceProperty(builder, "max_vector_width",
+                             static_cast<DerivedT *>(this)->vectorWidth);
   }
 };
 
-template <typename A, typename B>
-static IntegerAttr ceil(OpBuilder &builder, A a, B b) {
-  return builder.getIndexAttr(
-      static_cast<int64_t>(std::ceil(static_cast<double>(a) / b)));
-}
-
-static int64_t getConstIdxValue(Value value) {
+static inline int64_t getConstIdxValue(Value value) {
   if (auto op = value.getDefiningOp<arith::ConstantIndexOp>()) {
     return op.value();
   }
@@ -69,4 +76,91 @@ static int64_t getConstIdxValue(Value value) {
   }
   return 0;
 }
+
+// Round to the largest power of 2 that is <= value.
+template <typename T> static T floorPow2(T value) {
+  auto v = static_cast<std::make_unsigned_t<T>>(value);
+  return T(1) << (llvm::bit_width(v) - 1);
+}
+
+// Round to the smallest power of 2 that is >= value.
+template <typename T> static T ceilPow2(T value) {
+  auto v = static_cast<std::make_unsigned_t<T>>(value);
+  return llvm::bit_ceil(v);
+}
+
+// Adjust tile sizes that meet the following conditions:
+// 1. The product of all tiles is as close to totalSize as possible.
+// 2. The new sizes are proportional to the initial sizes.
+// 3. The new sizes are powers of 2.
+template <typename T> static void adjustTiles(T totalSize, T *begin, T *end) {
+  auto count = end - begin;
+  if (count == 0) {
+    return;
+  }
+
+  T total = ceilPow2(totalSize);
+
+  if (count == 1) {
+    *begin = std::min(ceilPow2(*begin), total);
+    return;
+  }
+
+  if (count > 2) {
+    // Split the array in two. The first one consists of the 2 elements - the
+    // first one and the product of the rest. The second one is the rest.
+    T first[] = {*begin, std::accumulate(begin + 2, end, *(begin + 1),
+                                         std::multiplies<>())};
+    adjustTiles(total, first, first + 2);
+    adjustTiles(total / *first, begin + 1, end);
+    *begin = *first;
+    return;
+  }
+
+  --end;
+  T a = *begin;
+  T b = *end;
+  bool swap;
+  if ((swap = a < b)) {
+    std::swap(a, b);
+  }
+
+  a = ceilPow2(a);
+  b = floorPow2(b);
+
+  if (a * b <= total) {
+    *begin = swap ? b : a;
+    *end = swap ? a : b;
+    return;
+  }
+
+  double ratio = static_cast<double>(a) / static_cast<double>(b);
+  T x = static_cast<T>(std::sqrt(total)) * static_cast<T>(std::sqrt(ratio));
+  x = std::min(ceilPow2(x), std::min(a, total));
+  T y = std::min(floorPow2(total / x), b);
+
+  // Adjust x and y to get the closest ratio
+  if (auto diff =
+          std::abs(ratio - static_cast<double>(x) / static_cast<double>(y));
+      y >= 2 && x * 2 <= a &&
+      std::abs(ratio - static_cast<double>(x * 2) /
+                           static_cast<double>(y / 2)) < diff) {
+    x *= 2;
+    y /= 2;
+  } else if (x >= 2 && y * 2 <= b &&
+             std::abs(ratio - static_cast<double>(x / 2) /
+                                  static_cast<double>(y * 2)) < diff) {
+    x /= 2;
+    y *= 2;
+  }
+
+  *begin = swap ? y : x;
+  *end = swap ? x : y;
+}
+
+template <typename T, unsigned N>
+static void adjustTiles(T totalSize, SmallVector<T, N> &tiles) {
+  adjustTiles(totalSize, tiles.begin(), tiles.end());
+}
+} // namespace mlir::gc
 #endif

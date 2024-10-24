@@ -1522,7 +1522,8 @@ LogicalResult createMemoryFillKernel(linalg::LinalgOp linalgOp,
   // Extract SIMD sized sub-tiles
   int maxSizeSIMD = 256;
   int64_t subTileCols = outputShape[1];
-  int64_t subTileRows = std::min(outputShape[0], maxSizeSIMD / subTileCols);
+  int64_t subTileRows =
+      std::min(outputShape[0], std::max(maxSizeSIMD / subTileCols, 1L));
 
   // Output descriptors for later stores.
   SmallVector<Value> outputTiles = createDescriptorTiles(

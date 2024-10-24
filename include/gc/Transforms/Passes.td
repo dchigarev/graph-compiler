@@ -120,12 +120,15 @@ def GpuTilingAndFusion : Pass<"gpu-tiling", "func::FuncOp"> {
     The tiles calculation is based on the Execution Unit cache size and the number of threads per EU.
   }];
   let options = [
-    Option<"euMem", "eu-mem", "size_t",
+    Option<"numThreads", "num-threads", "size_t",
+           /*default=*/"8",
+           "Number of threads per Execution Unit.">,
+    Option<"cacheSize", "cache-size", "size_t",
            /*default=*/"131072",
            "Execution Unit cache size.">,
-    Option<"euThreads", "eu-threads", "size_t",
-           /*default=*/"8",
-           "Number of threads per EU.">
+    Option<"vectorWidth", "vector-width", "size_t",
+           /*default=*/"512",
+           "The maximum width of EU's vector registers.">
     ];
 }
 
@@ -136,7 +139,7 @@ def GpuLoopTiling : Pass<"gpu-loop-tiling", "func::FuncOp"> {
     Each tile of the outer loop is divided by the number of threads per EU.
   }];
   let options = [
-    Option<"euThreads", "eu-threads", "size_t",
+    Option<"numThreads", "num-threads", "size_t",
            /*default=*/"8",
            "Number of threads per Execution Unit.">
     ];
