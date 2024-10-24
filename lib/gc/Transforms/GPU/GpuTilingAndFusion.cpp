@@ -24,7 +24,7 @@
 #include "gc/Utils/Log.h"
 
 using namespace mlir;
-// using namespace mlir::gc::gpu;
+using namespace mlir::gc;
 
 namespace mlir::gc {
 #define GEN_PASS_DECL_GPUTILINGANDFUSION
@@ -39,33 +39,22 @@ struct GpuTilingAndFusion final
       gc::impl::GpuTilingAndFusionBase<GpuTilingAndFusion> {
   friend struct GpuPass;
   explicit GpuTilingAndFusion()
-      : GpuTilingAndFusion(gc::GpuTilingAndFusionOptions{}) {}
-  explicit GpuTilingAndFusion(const gc::GpuTilingAndFusionOptions &opts)
+      : GpuTilingAndFusion(GpuTilingAndFusionOptions{}) {}
+  explicit GpuTilingAndFusion(const GpuTilingAndFusionOptions &opts)
       : GpuPass(), GpuTilingAndFusionBase(opts) {}
 
   void runOnOperation() override {
     IRRewriter rewriter(&getContext());
     scf::SCFTileAndFuseOptions opts;
-    opts.tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
-    // The outer loop is converted to a GPU kernel and the tile sizes are mapped
-    // to the grid sizes.
+    auto numEus = getNumEus(rewriter);
+    auto numEusPerSlice = getNumEusPerSlice(rewriter);
+    auto numThreadsPerEu = getNumThreadsPerEu(rewriter);
+    auto cacheSize = getCacheSize(rewriter);
+    auto vectorWidth = getVectorWidth(rewriter);
+    auto cachePerThread =
+        std::max(cacheSize / numEusPerSlice / numThreadsPerEu, vectorWidth);
     opts.tilingOptions.setTileSizeComputationFunction(
-        // The tile sizes calculation is based on the following equation:
-        // n * TS0 * TS1 * ... * TSn = euMem
-        // where:
-        // n - an average number of bytes, processed by each iteration
-        // TS0, TS1, ... TSn - the tile sizes for each loop correspondingly
-        // euMem - the physical memory (cache) size of the GPU execution unit
-        //
-        // To calculate the tile size TS, we need to divide the total loop size
-        // S by the ratio r:
-        //
-        // n * (S0/r0) * (S1/r1) * ... * (Sn/rn) = euMem
-        // r0 * r1 * ... * rn = (n * S0 * S1 * ... * Sn) / euMem
-        // If all sizes are equal, then S0 = ... = Sn = S, r0 = ... = rn = r:
-        // r^n = (n * S^n) / euMem
-        // r = (n * S^n / euMem)^(1/n)
-        [euMem = getEuMem(rewriter), euThreads = getEuThreads(rewriter)](
+        [cachePerThread, vectorWidth, numThreads = numEus * numThreadsPerEu](
             OpBuilder &builder, Operation *op) -> SmallVector<OpFoldResult> {
           auto ti = dyn_cast<TilingInterface>(op);
           if (!ti) {
@@ -76,45 +65,66 @@ struct GpuTilingAndFusion final
           auto itDomains = ti.getIterationDomain(builder);
           assert(itTypes.size() == itDomains.size());
 
-          // TODO: Add a parameter to the options?
-          size_t totalSize = calcOperandsSize(op) * euThreads;
-          unsigned loopCount = 0;
-
+          SmallVector<int64_t> tiles;
+          int64_t numIterations = 1;
           for (auto [t, r] : zip(itTypes, itDomains)) {
             if (t == utils::IteratorType::parallel) {
               if (auto v = getConstantIntValue(r.size)) {
-                loopCount++;
-                totalSize *= *v;
+                numIterations *= *v;
+                tiles.emplace_back(*v);
               } else {
-                return calcDynamicSizes(builder, ti, euMem, euThreads);
+                return computeDynamicTiles(builder, ti, numThreads,
+                                           cachePerThread);
               }
             }
           }
 
-          if (loopCount == 0) {
+          if (tiles.empty()) {
             return {};
           }
 
-          // TODO: In case of different sizes, calculate the ratio for each loop
-          double ratio = std::pow(static_cast<double>(totalSize) /
-                                      static_cast<double>(euMem),
-                                  1.0 / loopCount);
-          ratio = std::max(1.0, ratio);
-          SmallVector<OpFoldResult> tiles;
-          tiles.reserve(itDomains.size());
+          auto elementSize = getElementSize(op);
+          auto sizePerThread = numIterations / numThreads * elementSize;
+          auto totalSize = std::max(sizePerThread, cachePerThread);
+          totalSize = std::max(totalSize / elementSize, 64L);
+
+          // If the operation could be lowered to XeGPU, make the tiles
+          // proportional to the vector width.
+          if (canLowerToXeGPU(op)) {
+            totalSize = std::max(totalSize / vectorWidth, 1L) * vectorWidth;
+          }
+
+          adjustTiles(totalSize, tiles);
+
+          unsigned counter = 0;
+          SmallVector<OpFoldResult> result;
+          result.reserve(itDomains.size());
 
           for (auto [t, r] : zip(itTypes, itDomains)) {
             if (t != utils::IteratorType::parallel) {
-              tiles.emplace_back(builder.getIndexAttr(1));
-            } else if (auto v = getConstantIntValue(r.size)) {
-              tiles.emplace_back(ceil(builder, *v, ratio));
+              result.emplace_back(builder.getIndexAttr(0));
             } else {
-              abort(); // Must never get here
+              result.emplace_back(builder.getIndexAttr(tiles[counter++]));
             }
           }
 
-          return tiles;
+          return result;
         });
+    opts.setFusionControlFn(
+        [&](tensor::ExtractSliceOp, OpResult originalProducer, bool)
+            -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
+          Operation *op = originalProducer.getOwner();
+          if (!op) {
+            return std::nullopt;
+          }
+          if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+            if (!linalgOp.hasOnlyProjectedPermutations()) {
+              return std::nullopt;
+            }
+          }
+          return scf::SCFTileAndFuseOptions::ControlFnResult{};
+        });
+    opts.tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
 
     auto fn = getOperation();
     tileAndFuse(fn, rewriter, opts);
@@ -174,7 +184,8 @@ private:
   static std::optional<TilingInterface> findTi(Operation *op) {
     std::optional<TilingInterface> last;
     op->walk<WalkOrder::PreOrder>([&](linalg::LinalgOp linalgOp) {
-      if (!linalgOp->getParentOfType<scf::ForallOp>()) {
+      if (linalgOp.hasOnlyProjectedPermutations() &&
+          !linalgOp->getParentOfType<scf::ForallOp>()) {
         if (auto ti = dyn_cast<TilingInterface>(linalgOp.getOperation())) {
           last = ti;
         }
@@ -184,17 +195,17 @@ private:
     return last;
   }
 
-  static SmallVector<OpFoldResult> calcDynamicSizes(OpBuilder &builder,
-                                                    TilingInterface ti,
-                                                    size_t euMem,
-                                                    size_t euThreads) {
+  static SmallVector<OpFoldResult> computeDynamicTiles(OpBuilder &builder,
+                                                       TilingInterface ti,
+                                                       int64_t numThreads,
+                                                       int64_t cachePerThread) {
     auto itTypes = ti.getLoopIteratorTypes();
     auto itDomains = ti.getIterationDomain(builder);
     assert(itTypes.size() == itDomains.size());
 
     auto loc = ti.getLoc();
     Value dynamicSize;
-    size_t staticSize = calcOperandsSize(ti.getOperation()) * euThreads;
+    auto staticSize = getElementSize(ti.getOperation());
     unsigned loopCount = 0;
 
     for (auto [t, r] : zip(itTypes, itDomains)) {
@@ -219,22 +230,31 @@ private:
           loc, dynamicSize,
           builder.create<arith::ConstantIndexOp>(loc, staticSize));
     }
+    auto i64Type = builder.getI64Type();
     dynamicSize = builder.create<arith::UIToFPOp>(
         loc, builder.getF64Type(),
-        builder.create<arith::IndexCastOp>(loc, builder.getI64Type(),
-                                           dynamicSize));
+        builder.create<arith::IndexCastOp>(loc, i64Type, dynamicSize));
 
-    auto memSize = builder.create<arith::ConstantFloatOp>(
-        loc, APFloat(static_cast<double>(euMem)), builder.getF64Type());
+    // TODO: Call the adjustTiles() function for the tiles calculation.
+
+    auto nt = builder.create<arith::ConstantFloatOp>(
+        loc, APFloat(static_cast<double>(numThreads)), builder.getF64Type());
+    auto cpt = builder.create<arith::ConstantFloatOp>(
+        loc, APFloat(static_cast<double>(cachePerThread)),
+        builder.getF64Type());
+    Value totalSize = builder.create<arith::MaximumFOp>(
+        loc, builder.getF64Type(),
+        builder.create<arith::DivFOp>(loc, dynamicSize, nt), cpt);
     auto pow = builder.create<arith::ConstantFloatOp>(
         loc, APFloat(1.0 / loopCount), builder.getF64Type());
-    Value ratio = builder.create<math::PowFOp>(
-        loc, builder.create<arith::DivFOp>(loc, dynamicSize, memSize), pow);
-    ratio = builder.create<arith::MaximumFOp>(
+    // The average tile size is totalSize^(1 / loopCount)
+    Value avgTileSize = builder.create<math::PowFOp>(loc, totalSize, pow);
+    avgTileSize = builder.create<arith::MaximumFOp>(
         loc, builder.getF64Type(),
         builder.create<arith::ConstantFloatOp>(loc, APFloat(1.0),
                                                builder.getF64Type()),
-        ratio);
+        avgTileSize);
+    avgTileSize = builder.create<arith::FPToSIOp>(loc, i64Type, avgTileSize);
 
     SmallVector<OpFoldResult> tiles;
     tiles.reserve(itDomains.size());
@@ -245,49 +265,78 @@ private:
       } else {
         Value value;
         if (auto v = getConstantIntValue(r.size)) {
-          value = builder.create<arith::ConstantFloatOp>(
-              loc, APFloat(static_cast<double>(*v)), builder.getF64Type());
+          value = builder.create<arith::ConstantIntOp>(loc, *v, i64Type);
         } else {
-          value = builder.create<arith::UIToFPOp>(
-              loc, builder.getF64Type(),
-              builder.create<arith::IndexCastOp>(loc, builder.getI64Type(),
-                                                 r.size.get<Value>()));
+          value = builder.create<arith::IndexCastOp>(loc, i64Type,
+                                                     r.size.get<Value>());
         }
-        auto ts = builder.create<arith::FPToUIOp>(
-            loc, builder.getI64Type(),
-            builder.create<math::CeilOp>(
-                loc, builder.create<arith::DivFOp>(loc, value, ratio)));
+        value =
+            builder.create<arith::MinSIOp>(loc, i64Type, value, avgTileSize);
         tiles.emplace_back(builder.create<arith::IndexCastOp>(
-            loc, builder.getIndexType(), ts));
+            loc, builder.getIndexType(), value));
       }
     }
 
     return tiles;
   }
 
-  static size_t calcOperandsSize(Operation *op) {
-    size_t size = 0;
-    auto typeSize = [](Type t) -> size_t {
-      Type et;
-      if (auto mt = dyn_cast<MemRefType>(t)) {
-        et = mt.getElementType();
-      } else if (auto tt = dyn_cast<TensorType>(t)) {
-        et = tt.getElementType();
-      } else {
-        return 0;
-      }
-      return et.isIntOrFloat() ? et.getIntOrFloatBitWidth() / 8 : 1;
-    };
-    for (auto operand : op->getOperands()) {
-      if (auto defOp = operand.getDefiningOp()) {
-        for (auto t : defOp->getResultTypes()) {
-          size += typeSize(t);
+  static int64_t getElementSize(Operation *op) {
+    int64_t elementSize = 1;
+    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+      if (auto inits = linalgOp.getDpsInits(); !inits.empty()) {
+        if (auto t = getElementTypeOrSelf(inits[0].getType());
+            t.isIntOrFloat()) {
+          elementSize = t.getIntOrFloatBitWidth() / 8;
         }
-      } else {
-        size += typeSize(operand.getType());
       }
     }
-    return size == 0 ? 1 : size;
+    return elementSize;
+  }
+
+  // TODO: Add more checks
+  static bool canLowerToXeGPU(Operation *operation) {
+    auto op = dyn_cast<linalg::LinalgOp>(operation);
+    if (!op) {
+      return false;
+    }
+    if (op.hasDynamicShape()) {
+      return false;
+    }
+
+    auto checkOperand = [&](Value operand, bool isOutput = false) {
+      ShapedType type;
+      if (auto memref = dyn_cast<MemRefType>(operand.getType())) {
+        type = memref;
+      } else if (auto tensor = dyn_cast<RankedTensorType>(operand.getType())) {
+        type = tensor;
+      } else {
+        return false;
+      }
+
+      auto shape = type.getShape();
+      if (isOutput) {
+        if (shape.size() != 2 || shape[0] * shape[1] < 16) {
+          return false;
+        }
+      } else if (shape.size() > 2) {
+        return false;
+      }
+
+      return true;
+    };
+
+    if (auto inits = op.getDpsInits();
+        !inits.empty() && !checkOperand(inits[0], true)) {
+      return false;
+    }
+
+    if (auto inputs = op.getDpsInputs();
+        !std::all_of(inputs.begin(), inputs.end(),
+                     [&](Value v) { return checkOperand(v); })) {
+      return false;
+    }
+
+    return true;
   }
 };
 } // namespace

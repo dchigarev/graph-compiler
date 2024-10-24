@@ -124,29 +124,40 @@ def GpuToGpuOcl : Pass<"gpu-to-gpuocl", "ModuleOp"> {
 def GpuTilingAndFusion : Pass<"gpu-tiling", "func::FuncOp"> {
   let summary = "GPU tiling and fusion path.";
   let description = [{
-    This path tiles linalg operations and wraps into foreach loops.
-    The tiles calculation is based on the Execution Unit cache size and the number of threads per EU.
+    This pass tiles linalg operations and creates an inner loop that is mapped to the block sizes, when converting
+    to gpu.launch. The tiles calculation is based on the GPU device properties, retrieved from the DLTI attributes.
+    If the DLTI attributes are not specified, defaults to the pass options.
   }];
   let options = [
-    Option<"euMem", "eu-mem", "size_t",
+    Option<"numEus", "num-eus", "size_t",
+           /*default=*/"448",
+           "Number of Execution Units.">,
+    Option<"numEusPerSlice", "num-eus-per-slice", "size_t",
+           /*default=*/"8",
+           "Number of Execution Units per slice.">,
+    Option<"numThreadsPerEu", "num-threads-per-eu", "size_t",
+           /*default=*/"8",
+           "Number of threads per Execution Unit.">,
+    Option<"cacheSize", "cache-size", "size_t",
            /*default=*/"131072",
            "Execution Unit cache size.">,
-    Option<"euThreads", "eu-threads", "size_t",
-           /*default=*/"8",
-           "Number of threads per EU.">
+    Option<"vectorWidth", "vector-width", "size_t",
+           /*default=*/"512",
+           "The maximum width of EU's vector registers.">
     ];
 }
 
 def GpuLoopTiling : Pass<"gpu-loop-tiling", "func::FuncOp"> {
   let summary = "Create nested parallel loops to be mapped to GPU.";
   let description = [{
-    This path tiles the loops created by the GpuTilingAndFusion pass and converted to parallel loops.
-    Each tile of the outer loop is divided by the number of threads per EU.
+    This pass tiles the loops created by the GpuTilingAndFusion pass and converted to parallel loops. The tiles
+    calculation is based on the max_work_group_size DLTI attribute. If the attribute is not specified,
+    defaults to the pass options.
   }];
   let options = [
-    Option<"euThreads", "eu-threads", "size_t",
-           /*default=*/"8",
-           "Number of threads per Execution Unit.">
+    Option<"workGroupSize", "work-group-size", "size_t",
+           /*default=*/"64",
+           "The maximum workgroup size.">
     ];
 }
 #endif // GC_USE_IMEX
