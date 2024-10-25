@@ -117,8 +117,8 @@ struct GpuTilingAndFusion final
                         static_cast<double>(calcOperandsSize(op))));
           SmallVector<int64_t> outerTiles;
           SmallVector<int64_t> innerTiles;
-          normaliseTiles(outerTileSize, sizes, outerTiles);
-          normaliseTiles(euThreads, sizes, innerTiles);
+          // normaliseTiles(outerTileSize, sizes, outerTiles);
+          // normaliseTiles(euThreads, sizes, innerTiles);
 
           unsigned counter = 0;
           SmallVector<OpFoldResult> tiles;
@@ -129,7 +129,7 @@ struct GpuTilingAndFusion final
               tiles.emplace_back(builder.getIndexAttr(1));
             } else if (auto v = getConstantIntValue(r.size)) {
               tiles.emplace_back(
-                  ceil(builder, outerTiles[counter], innerTiles[counter]));
+                  ceil(builder, 16, 1));
               counter++;
             } else {
               abort(); // Must never get here
