@@ -714,9 +714,13 @@ createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
                       ArrayRef<int64_t> loadOffsets, ArrayRef<int64_t> descTile,
                       int arrayLength = 1, bool transpose = false) {
   assert(arrayLength == 1 && "Array descriptors are not supported");
+  assert(loadShape.size() == 2 && "Output shape should be 2D");
+  assert(descTile.size() == 1 && "Only 1D tiles are supported for scatter");
 
   auto type = cast<ShapedType>(src.getType());
-  auto descType = getTensorDescType(descTile[0], type.getElementType(), xegpu::MemorySpace::SLM, xegpu::ScatterTensorDescAttr::get(rewriter.getContext(), xegpu::MemorySpace::SLM, chunkSize));
+  auto descType = getTensorDescType(
+    descTile[0], type.getElementType(), xegpu::MemorySpace::SLM,
+    xegpu::ScatterTensorDescAttr::get(rewriter.getContext(), xegpu::MemorySpace::SLM, chunkSize));
 
   // Create the root descriptor.
   //
@@ -724,37 +728,34 @@ createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
   // offsets compared to creating separate descriptors.
   // The original tile is split into contiguous sub-tiles so, the first tile
   // can be used as an anchor.
-  mlir::VectorType vectorType = mlir::VectorType::get({static_cast<int64_t>(loadOffsets.size())}, rewriter.getIndexType());
-  mlir::DenseElementsAttr denseAttr = mlir::DenseIntElementsAttr::get(vectorType, loadOffsets);
+  mlir::VectorType offsetType = mlir::VectorType::get({static_cast<int64_t>(loadOffsets.size())}, rewriter.getIndexType());
+  mlir::DenseElementsAttr denseAttr = mlir::DenseIntElementsAttr::get(offsetType, loadOffsets);
 
   // Create an arith.constant operation with the DenseElementsAttr
-  arith::ConstantOp rootOffset = rewriter.create<mlir::arith::ConstantOp>(loc, vectorType, denseAttr);
+  arith::ConstantOp offset = rewriter.create<mlir::arith::ConstantOp>(loc, offsetType, denseAttr);
 
   auto rootTile =
       rewriter
           .create<xegpu::CreateDescOp>(
-              loc, descType, dyn_cast<TypedValue<MemRefType>>(src), rootOffset.getResult())
+              loc, descType, dyn_cast<TypedValue<MemRefType>>(src), offset.getResult())
           .getResult();
 
   SmallVector<Value> tiles;
-  size_t aaaa = 0;
-  for (int j = 0; j < loadShape[0] * loadShape[1]; j += descTile[0]) {
-    // Value newColOffs = rewriter.create<arith::ConstantIndexOp>(loc, j);
+  for (int j = 0, tileIdx = 0; j < loadShape[0] * loadShape[1]; j += descTile[0], tileIdx++) {
     SmallVector<int64_t> newOffsets;
     for (size_t i = 0; i < loadOffsets.size(); i++) {
-      newOffsets.push_back(loadOffsets[i] + descTile[0] * aaaa);
+      newOffsets.push_back(loadOffsets[i] + descTile[0] * tileIdx);
     }
-    mlir::DenseElementsAttr denseAttrn = mlir::DenseIntElementsAttr::get(vectorType, newOffsets);
+    denseAttr = mlir::DenseIntElementsAttr::get(offsetType, newOffsets);
 
     // Create an arith.constant operation with the DenseElementsAttr
-    arith::ConstantOp rootOffset2 = rewriter.create<mlir::arith::ConstantOp>(loc, vectorType, denseAttrn);
+    offset = rewriter.create<mlir::arith::ConstantOp>(loc, offsetType, denseAttr);
     auto tile = rewriter
                     .create<xegpu::UpdateOffsetOp>(
                         loc, rootTile.getType(), rootTile,
-                        /*offsets=*/rootOffset2.getResult())
+                        /*offsets=*/offset.getResult())
                     .getResult();
     tiles.push_back(tile);
-    aaaa++;
   }
 
   return tiles;
@@ -860,17 +861,17 @@ static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
     sgTile2D.push_back(1);
 
   int64_t maxLoadSize = 32;
-  int64_t sgLoadRows = std::min(maxLoadSize, flatSize);
+  int64_t sgLoadElems = std::min(maxLoadSize, flatSize);
   int64_t arrayLength = 1;
   // NOLINTEND
 
   SmallVector<int64_t> offsets;
-  for (size_t i = 0; i < sgLoadRows; i += chunkSize) {
+  for (size_t i = 0; i < sgLoadElems; i += chunkSize) {
     offsets.push_back(i);
   }
 
   return createScatterDescriptorTiles(rewriter, loc, src, sgTile2D, offsets,
-                               {sgLoadRows}, arrayLength,
+                               {sgLoadElems}, arrayLength,
                                transpose);
 }
 
@@ -917,7 +918,6 @@ loadNdDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTiles,
     if (!transpose_bit) {
       packedAttr = mlir::UnitAttr::get(rewriter.getContext());
     }
-    // packedAttr = mlir::UnitAttr::get(rewriter.getContext());
   }
   SmallVector<Value> loadVec;
   for (auto tile : loadTiles) {
@@ -940,7 +940,7 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
                 std::optional<VnniConfig> vnniConf = std::nullopt,
                 DenseI64ArrayAttr transpose = nullptr,
                 IntegerAttr transpose_bit = nullptr,
-                ArrayRef<int64_t> resultShape = {}) {
+                ArrayRef<int64_t> sgResShape = {}) {
   // Assume all tiles have the same shape.
   auto tileType = cast<xegpu::TensorDescType>(loadTiles[0].getType());
   assert(llvm::all_of(loadTiles,
@@ -951,12 +951,7 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
       VectorType::get({tileType.getShape()[0]}, tileType.getElementType());
   mlir::UnitAttr packedAttr = nullptr;
   if (vnniConf) {
-    vecLoadType = getVnniVector(tileType.getShape(), tileType.getElementType(),
-                                *vnniConf);
-    if (!transpose_bit) {
-      packedAttr = mlir::UnitAttr::get(rewriter.getContext());
-    }
-    // packedAttr = mlir::UnitAttr::get(rewriter.getContext());
+    assert(false && "VNNI not supported for scatter loads");
   }
   SmallVector<Value> loadVec;
 
@@ -992,9 +987,9 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
 
   int64_t maxRows = 32;
   int64_t maxCols = 32;
-  if (resultShape.size()) {
-    maxRows = std::min(maxRows, resultShape[0]);
-    maxCols = std::min(maxCols, resultShape[1]);
+  if (sgResShape.size()) {
+    maxRows = std::min(maxRows, sgResShape[0]);
+    maxCols = std::min(maxCols, sgResShape[1]);
   }
   // }
 
@@ -1011,7 +1006,6 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
     Value tmp = rewriter.create<arith::ConstantOp>(loadTiles[0].getLoc(), vectorType0, zeroAttr);
 
     Value interm = rewriter.create<vector::ShapeCastOp>(loc, vectorType3, tmp);
-
 
     // Value interm;
     int64_t i = 0;
@@ -1031,9 +1025,10 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
       i++;
     }
 
-    if (resultShape.size() == 0) {
+    if (sgResShape.size() == 0) {
       loadVec.push_back(interm);
-      return loadVec;
+      // return loadVec;
+      continue;
     }
 
     int64_t sgLoadRows = maxRows; // resultShape[0];
@@ -1051,21 +1046,6 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
       loadVec.push_back(res);
     }
   }
-
-  //           const int subTileSize = subTile[0] * subTile[1];
-  //         int dpasIdx = i * subTilePerLoadCol + j;
-  //         int offset = dpasIdx * subTileSize;
-
-  //         auto slice = rewriter.create<vector::ExtractStridedSliceOp>(
-  //             loc, castFlat, /*offsets=*/ArrayRef<int64_t>{offset},
-  //             /*sizes=*/ArrayRef<int64_t>{subTileSize},
-  //             /*strides=*/ArrayRef<int64_t>{1});
-
-  // auto vectorTypeRes = mlir::VectorType::get({loadRows, loadCols}, tileType.getElementType());
-  // auto res = rewriter.create<vector::ShapeCastOp>(loc, vectorTypeRes, interm);
-  // loadVec.push_back(res);
-  // TODO: Add split over the array_length > 1.
-  //       The split must preserve row-major ordering of the load tiles.
 
   return loadVec;
 }
