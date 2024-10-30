@@ -953,101 +953,94 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
   if (vnniConf) {
     assert(false && "VNNI not supported for scatter loads");
   }
-  SmallVector<Value> loadVec;
+  SmallVector<Value> normalizedVectors;
 
   int64_t loadSize = tileType.getShape()[0];
+  mlir::VectorType maskVectorType = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
 
-  mlir::VectorType vectorType = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
-
-  // Create a DenseElementsAttr with the values [32, 32, 32, 32]
-  llvm::SmallVector<bool> values;
+  llvm::SmallVector<bool> maskValues;
   for (int i = 0; i < loadSize; i++) {
-    values.push_back(true);
+    maskValues.push_back(true);
   }
-  mlir::DenseElementsAttr denseAttr = mlir::DenseIntElementsAttr::get(vectorType, values);
-
-  // Create an arith.constant operation with the DenseElementsAttr
-  auto mask = rewriter.create<mlir::arith::ConstantOp>(loadTiles[0].getLoc(), vectorType, denseAttr);
-  // TODO: find root
+  mlir::DenseElementsAttr denseMaskAttr = mlir::DenseIntElementsAttr::get(maskVectorType, maskValues);
+  auto mask = rewriter.create<mlir::arith::ConstantOp>(loadTiles[0].getLoc(), maskVectorType, denseMaskAttr);
 
 
-  // Value interm2 = rewriter.create<arith::ConstantOp>(loc, vectorType2, zeroAttr);
-
-  int64_t loadCols;
-  int64_t loadRows;
+  // int64_t loadCols;
+  // int64_t loadRows;
   int64_t totalLoad;
-  // if (resultShape.size()) {
-  //   totalLoad = resultShape[0] * resultShape[1];
-  //   loadRows = resultShape[0];
-  //   loadCols = resultShape[1];
-  // } else {
+
   totalLoad = tileType.getShape()[0] * loadTiles.size();
-  loadCols = 32;
-  loadRows = std::ceil(totalLoad / loadCols);
+  assert(totalLoad % 32 == 0 && "Total load size must be multiple of 32");
+  int64_t elementsPerLoad = 32;
 
-  int64_t maxRows = 32;
-  int64_t maxCols = 32;
+  // loadCols = 32;
+  // loadRows = std::ceil(totalLoad / loadCols);
+
+  int64_t chunkNRows = 32;
+  int64_t chunkNCols = 32;
   if (sgResShape.size()) {
-    maxRows = std::min(maxRows, sgResShape[0]);
-    maxCols = std::min(maxCols, sgResShape[1]);
+    chunkNRows = std::min(chunkNRows, sgResShape[0]);
+    chunkNCols = std::min(chunkNCols, sgResShape[1]);
   }
-  // }
 
-  int64_t numTotals = std::max(std::ceil((totalLoad / 32) / maxRows), 1.0);
-  int64_t totalChunkSize = totalLoad / numTotals;
+  int64_t numChunks = std::max(std::ceil((totalLoad / elementsPerLoad) / chunkNRows), 1.0);
+  int64_t totalChunkSize = totalLoad / numChunks;
 
-  int64_t loadTilesIdx = 0;
+  for (int64_t rowChunk = 0, loadTilesIdx=0; rowChunk < totalLoad / elementsPerLoad; rowChunk += chunkNRows) {
+    int64_t totalLoadCh = std::min(totalChunkSize, totalLoad - rowChunk * elementsPerLoad);
+    mlir::VectorType flatChunkType = mlir::VectorType::get({totalLoadCh}, tileType.getElementType());
+    mlir::VectorType NdChunkType = mlir::VectorType::get({totalLoadCh / 32, 32}, tileType.getElementType());
+    auto zeroAttr = DenseElementsAttr::get(flatChunkType, rewriter.getF16FloatAttr(0.0));
+    Value tmp = rewriter.create<arith::ConstantOp>(loadTiles[0].getLoc(), flatChunkType, zeroAttr);
 
-  for (int64_t ch_sz = 0; ch_sz < totalLoad / 32; ch_sz += maxRows) {
-    int64_t totalLoadCh = std::min(totalChunkSize, totalLoad - ch_sz * 32);
-    mlir::VectorType vectorType0 = mlir::VectorType::get({totalLoadCh}, tileType.getElementType());
-    mlir::VectorType vectorType3 = mlir::VectorType::get({totalLoadCh / 32, 32}, tileType.getElementType());
-    auto zeroAttr = DenseElementsAttr::get(vectorType0, rewriter.getF16FloatAttr(0.0));
-    Value tmp = rewriter.create<arith::ConstantOp>(loadTiles[0].getLoc(), vectorType0, zeroAttr);
+    Value loadAccumulator = rewriter.create<vector::ShapeCastOp>(loc, NdChunkType, tmp);
 
-    Value interm = rewriter.create<vector::ShapeCastOp>(loc, vectorType3, tmp);
-
-    // Value interm;
-    int64_t i = 0;
-    int64_t wtf = loadTilesIdx;
-    for (; loadTilesIdx < wtf + (totalLoadCh / 32); loadTilesIdx++) {
-      auto tile = loadTiles[loadTilesIdx];
-  // build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState, ::mlir::TypeRange resultTypes, ::mlir::Value TensorDesc, ::mlir::Value mask, /*optional*/::mlir::UnitAttr transpose,
+    for (int64_t i = 0; i < totalLoadCh / elementsPerLoad; i++) {
+      auto tile = loadTiles[i + loadTilesIdx];
       auto loadOp = rewriter.create<xegpu::LoadGatherOp>(
-          loc, vecLoadType, tile, /*mask=*/mask, mlir::UnitAttr::get(rewriter.getContext()),
+          loc, vecLoadType, tile, /*mask=*/mask, /*transpose=*/mlir::UnitAttr::get(rewriter.getContext()),
           /*l1_hint=*/hint,
           /*l2_hint=*/hint, /*l3_hint=*/hint);
-      // loadOp.getResult();
-      interm = rewriter.create<vector::InsertOp>(
-          loc, loadOp.getResult(), interm, SmallVector<int64_t>{i});
-      // auto res = rewriter.create<vector::ShapeCastOp>(loc, vectorType2, loadOp);
-      // loadVec.push_back(res);
-      i++;
+
+      loadAccumulator = rewriter.create<vector::InsertOp>(
+          loc, loadOp.getResult(), loadAccumulator, SmallVector<int64_t>{i});
     }
+    loadTilesIdx += totalLoadCh / elementsPerLoad;
 
     if (sgResShape.size() == 0) {
-      loadVec.push_back(interm);
-      // return loadVec;
+      normalizedVectors.push_back(loadAccumulator);
       continue;
     }
 
-    int64_t sgLoadRows = maxRows; // resultShape[0];
-    int64_t sgLoadCols = maxCols; // resultShape[1];
+    int64_t sgLoadRows = chunkNRows;
+    int64_t sgLoadCols = chunkNCols;
     int64_t sgFlat = sgLoadRows * sgLoadCols;
     mlir::VectorType vectorTypeSg = mlir::VectorType::get({sgLoadRows, sgLoadCols}, tileType.getElementType());
     mlir::VectorType vectorTypeFlagSg = mlir::VectorType::get({sgFlat}, tileType.getElementType());
 
-    auto flatLoaded = rewriter.create<vector::ShapeCastOp>(loc, vectorType0, interm);
+    auto flatLoaded = rewriter.create<vector::ShapeCastOp>(loc, flatChunkType, loadAccumulator);
     for (int64_t i = 0; i < totalLoadCh; i+= sgFlat) {
       auto slice = rewriter.create<vector::ExtractStridedSliceOp>(
             loc, flatLoaded, /*offsets=*/ArrayRef<int64_t>{i}, /*sizes=*/ArrayRef<int64_t>{sgFlat},
             /*strides=*/ArrayRef<int64_t>{1});
       auto res = rewriter.create<vector::ShapeCastOp>(loc, vectorTypeSg, slice);
-      loadVec.push_back(res);
+      normalizedVectors.push_back(res);
     }
   }
 
-  return loadVec;
+  // verify correctness
+  int64_t totalLoaded = 0;
+  llvm::dbgs() << "Expected to load: " << totalLoad << "\n";
+  for (auto v : normalizedVectors) {
+    v.dump();
+    auto shape = cast<VectorType>(v.getType()).getShape();
+    totalLoaded += shape[0] * shape[1];
+  }
+  assert(totalLoaded == totalLoad);
+
+
+  return normalizedVectors;
 }
 
 static SmallVector<Value>
@@ -1081,8 +1074,6 @@ storeNdDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value> res
 static SmallVector<Value>
 storeScatterDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value> results, ValueRange loadTiles,
                 xegpu::CachePolicyAttr hint) {
-  // static void build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState, ::mlir::Value value, ::mlir::Value TensorDesc, ::mlir::Value mask, /*optional*/::mlir::UnitAttr transpose,
-
   auto tileType = cast<xegpu::TensorDescType>(loadTiles[0].getType());
   assert(llvm::all_of(loadTiles,
                       [&](Value tile) { return tile.getType() == tileType; }) &&
@@ -1095,17 +1086,16 @@ storeScatterDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value
   SmallVector<Value> res;
   int64_t loadSize = tileType.getShape()[0];
 
-  mlir::VectorType vectorType = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
+  mlir::VectorType maskType = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
 
-  // Create a DenseElementsAttr with the values [32, 32, 32, 32]
-  llvm::SmallVector<bool> values;
+  llvm::SmallVector<bool> maskValues;
   for (int i = 0; i < loadSize; i++) {
-    values.push_back(true);
+    maskValues.push_back(true);
   }
-  mlir::DenseElementsAttr denseAttr = mlir::DenseIntElementsAttr::get(vectorType, values);
+  mlir::DenseElementsAttr maskAttr = mlir::DenseIntElementsAttr::get(maskType, maskValues);
 
   // Create an arith.constant operation with the DenseElementsAttr
-  auto mask = rewriter.create<mlir::arith::ConstantOp>(loc, vectorType, denseAttr);
+  auto mask = rewriter.create<mlir::arith::ConstantOp>(loc, maskType, maskAttr);
 
   SmallVector<Value> chunkedResults;
   for (auto v : results) {
@@ -1125,16 +1115,6 @@ storeScatterDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value
       chunkedResults.push_back(slice);
     }
   }
-  // llvm::dbgs() << "Storing: " << chunkedResults.size() << " " << loadTiles.size() << "\n";
-
-  // for (auto v : chunkedResults) {
-  //   v.dump();
-  // }
-
-  // llvm::dbgs() << "break" << "\n";
-  // for (auto v : loadTiles) {
-  //   v.dump();
-  // }
 
   assert(chunkedResults.size() == loadTiles.size());
 
@@ -1145,7 +1125,6 @@ storeScatterDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value
                                       /*l1_hint=*/hint,
                                       /*l2_hint=*/hint,
                                       /*l3_hint=*/hint);
-    // res.push_back(val);
   }
   return res;
 }
@@ -1557,7 +1536,6 @@ static LogicalResult createDPASKernel(linalg::LinalgOp linalgOp,
   if (vnniFactor == -1)
     return failure();
 
-  VnniConfig vnniConfA{.vnniFactor = vnniFactor, .vnniAxis = 1};
   VnniConfig vnniConfB{.vnniFactor = vnniFactor, .vnniAxis = 0};
 
   // Load A sub-tiles.
@@ -1604,9 +1582,9 @@ static LogicalResult createDPASKernel(linalg::LinalgOp linalgOp,
   }
 
   // Extract DPAS tiles from loaded sub-tiles.
-  TilesArray dpasVecA = extractVecSubTiles(rewriter, loc, loadVecA,
-                                           {dimM, kTile}, tileTypeA.getShape(),
-                                           {dpasTileM, dpasTileK});
+  TilesArray dpasVecA =
+      extractVecSubTiles(rewriter, loc, loadVecA, {dimM, kTile},
+                         tileTypeA.getShape(), {dpasTileM, dpasTileK});
   TilesArray dpasVecB = extractVecSubTiles(rewriter, loc, loadVecB,
                                            {kTile, dimN}, tileTypeB.getShape(),
                                            {dpasTileK, dpasTileN}, vnniConfB);
@@ -1712,7 +1690,8 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
     SmallVector<Value> inputTiles = createCoarseDscTiles(
         rewriter, loc, input, outputShape, /*isVnni=*/false);
     SmallVector<Value> loadedVals =
-        loadDescTiles(rewriter, loc, inputTiles, /*hint=*/nullptr, /*vnniConf=*/std::nullopt, /*transpose=*/nullptr, /*transpose_bit=*/nullptr, outputShape);
+        loadDescTiles(rewriter, loc, inputTiles, /*hint=*/nullptr, /*vnniConf=*/std::nullopt,
+                     /*transpose=*/nullptr, /*transpose_bit=*/nullptr, outputShape);
     for (auto v : loadedVals) {
       v.dump();
     }
@@ -1732,7 +1711,7 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
   //
   // Take at least one whole row plus as many extra rows as can fit into
   // a single SIMD instruction.
-  int64_t subTileCols = std::min(loadShape[1], maxSizeSIMD);
+  int64_t subTileCols = loadShape[1];
   int64_t subTileRows = std::min(loadShape[0], maxSizeSIMD / subTileCols);
 
   SmallVector<SmallVector<Value>> vecSubTiles;
@@ -1767,16 +1746,11 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
     results.push_back(*res);
   }
 
-  // Output descriptors for later stores.
-  // SmallVector<Value> outputTiles = createDescriptorTiles(
-  //     rewriter, loc, output, outputShape, {0, 0}, {subTileRows, subTileCols});
-
-  // TODO: forward {subTileRows, subTileCols}
   SmallVector<Value> outputTiles;
   if (hasSharedMemSpace(output))
     outputTiles = createCoarseDscTiles(rewriter, loc, output, outputShape, /*isVnni=*/false);
   else
-    outputTiles = createDescriptorTiles(
+    outputTiles = createNdDescriptorTiles(
        rewriter, loc, output, outputShape, {0, 0}, {subTileRows, subTileCols});
 
   // Store results.
@@ -1938,12 +1912,12 @@ LogicalResult createMemoryFillKernel(linalg::LinalgOp linalgOp,
   int64_t subTileRows =
       std::min(outputShape[0], std::max(maxSizeSIMD / subTileCols, 1L));
 
-  // Output descriptors for later stores.
-  // SmallVector<Value> outputTiles = createDescriptorTiles(
-  //     rewriter, loc, output, outputShape, {0, 0}, {subTileRows, subTileCols});
-
-  SmallVector<Value> outputTiles = createCoarseDscTiles(
-      rewriter, loc, output, outputShape, /*isVnni=*/false, false, subTileRows);
+  SmallVector<Value> outputTiles;
+  if (hasSharedMemSpace(output))
+    outputTiles = createCoarseDscTiles(rewriter, loc, output, outputShape, /*isVnni=*/false);
+  else
+    outputTiles = createDescriptorTiles(
+      rewriter, loc, output, outputShape, {0, 0}, {subTileRows, subTileCols});
 
   SmallVector<Value> results;
   for (size_t i = 0; i < outputTiles.size(); i++) {
@@ -2049,8 +2023,8 @@ struct LinalgToXeGPU : public gc::impl::LinalgToXeGPUBase<LinalgToXeGPU> {
   using LinalgToXeGPUBase::LinalgToXeGPUBase;
 
   void runOnOperation() override {
-    SmallVector<int64_t> dpasTile{8, 16, 16};
-    LinalgToXeGPUOptions options{kTile, stages, dpasTile};
+    LinalgToXeGPUOptions options{
+        kTile, stages, SmallVector<int64_t>(dpasTile.begin(), dpasTile.end())};
 
     // Run GEMM pattern first to allow fusion with its consumers.
     RewritePatternSet gemmPatterns(&getContext());
