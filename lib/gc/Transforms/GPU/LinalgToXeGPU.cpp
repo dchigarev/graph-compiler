@@ -747,7 +747,7 @@ createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
     mlir::DenseElementsAttr denseAttrn = mlir::DenseIntElementsAttr::get(vectorType, newOffsets);
 
     // Create an arith.constant operation with the DenseElementsAttr
-    arith::ConstantOp rootOffset2 = rewriter.create<mlir::arith::ConstantOp>(loc, vectorType, denseAttr);
+    arith::ConstantOp rootOffset2 = rewriter.create<mlir::arith::ConstantOp>(loc, vectorType, denseAttrn);
     auto tile = rewriter
                     .create<xegpu::UpdateOffsetOp>(
                         loc, rootTile.getType(), rootTile,
@@ -998,7 +998,7 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
   }
   // }
 
-  int64_t numTotals = std::ceil((totalLoad / 32) / maxRows);
+  int64_t numTotals = std::max(std::ceil((totalLoad / 32) / maxRows), 1.0);
   int64_t totalChunkSize = totalLoad / numTotals;
 
   int64_t loadTilesIdx = 0;
