@@ -64,14 +64,15 @@ void populateGPUPipeline(OpPassManager &pm,
 
   pm.addNestedPass<func::FuncOp>(createForallToParallelLoopPass());
   pm.addNestedPass<func::FuncOp>(createGpuLoopTiling());
+  pm.addNestedPass<func::FuncOp>(createGpuMapParallelLoopsPass());
+  pm.addNestedPass<func::FuncOp>(createParallelLoopToGpuPass());
+  pm.addNestedPass<func::FuncOp>(createAllocsToSLM());
   pm.addNestedPass<func::FuncOp>(createLinalgToXeGPU(
       {/*kTile=*/16, /*stages=*/1, /*dpasTiles=*/{8, 16, 16}}));
 
   pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
   pm.addPass(xegpu::createXeGPUFoldAliasOps());
   pm.addPass(memref::createFoldMemRefAliasOpsPass());
-  pm.addNestedPass<func::FuncOp>(createGpuMapParallelLoopsPass());
-  pm.addNestedPass<func::FuncOp>(createParallelLoopToGpuPass());
 
   imex::InsertGPUAllocsOptions insertGPUAllocsOption{
       /*clientAPI*/ "opencl", /*inRegions*/ false,
