@@ -741,21 +741,14 @@ createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
           .getResult();
 
   SmallVector<Value> tiles;
+  Value prevTile = rootTile;
   for (int j = 0, tileIdx = 0; j < loadShape[0] * loadShape[1]; j += descTile[0], tileIdx++) {
-    SmallVector<int64_t> newOffsets;
-    for (size_t i = 0; i < loadOffsets.size(); i++) {
-      newOffsets.push_back(loadOffsets[i] + descTile[0] * tileIdx);
-    }
-    denseAttr = mlir::DenseIntElementsAttr::get(offsetType, newOffsets);
-
-    // Create an arith.constant operation with the DenseElementsAttr
-    offset = rewriter.create<mlir::arith::ConstantOp>(loc, offsetType, denseAttr);
-    auto tile = rewriter
+    prevTile = rewriter
                     .create<xegpu::UpdateOffsetOp>(
-                        loc, rootTile.getType(), rootTile,
+                        loc, prevTile.getType(), prevTile,
                         /*offsets=*/offset.getResult())
                     .getResult();
-    tiles.push_back(tile);
+    tiles.push_back(prevTile);
   }
 
   return tiles;
