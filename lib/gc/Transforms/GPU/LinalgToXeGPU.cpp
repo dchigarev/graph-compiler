@@ -989,53 +989,68 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
   totalLoad = tileType.getShape()[0] * loadTiles.size();
   loadCols = 32;
   loadRows = std::ceil(totalLoad / loadCols);
+
+  int64_t maxRows = 32;
+  int64_t maxCols = 32;
+  if (resultShape.size()) {
+    maxRows = std::min(maxRows, resultShape[0]);
+    maxCols = std::min(maxCols, resultShape[1]);
+  }
   // }
 
-  mlir::VectorType vectorType0 = mlir::VectorType::get({totalLoad}, tileType.getElementType());
-  mlir::VectorType vectorType3 = mlir::VectorType::get({totalLoad / 32, 32}, tileType.getElementType());
-  auto zeroAttr = DenseElementsAttr::get(vectorType0, rewriter.getF16FloatAttr(0.0));
-  Value tmp = rewriter.create<arith::ConstantOp>(loadTiles[0].getLoc(), vectorType0, zeroAttr);
+  int64_t numTotals = std::ceil((totalLoad / 32) / maxRows);
+  int64_t totalChunkSize = totalLoad / numTotals;
 
-  Value interm = rewriter.create<vector::ShapeCastOp>(loc, vectorType3, tmp);
+  int64_t loadTilesIdx = 0;
+
+  for (int64_t ch_sz = 0; ch_sz < totalLoad / 32; ch_sz += maxRows) {
+    int64_t totalLoadCh = std::min(totalChunkSize, totalLoad - ch_sz * 32);
+    mlir::VectorType vectorType0 = mlir::VectorType::get({totalLoadCh}, tileType.getElementType());
+    mlir::VectorType vectorType3 = mlir::VectorType::get({totalLoadCh / 32, 32}, tileType.getElementType());
+    auto zeroAttr = DenseElementsAttr::get(vectorType0, rewriter.getF16FloatAttr(0.0));
+    Value tmp = rewriter.create<arith::ConstantOp>(loadTiles[0].getLoc(), vectorType0, zeroAttr);
+
+    Value interm = rewriter.create<vector::ShapeCastOp>(loc, vectorType3, tmp);
 
 
-  // Value interm;
-  int64_t i = 0;
+    // Value interm;
+    int64_t i = 0;
+    int64_t wtf = loadTilesIdx;
+    for (; loadTilesIdx < wtf + (totalLoadCh / 32); loadTilesIdx++) {
+      auto tile = loadTiles[loadTilesIdx];
+  // build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState, ::mlir::TypeRange resultTypes, ::mlir::Value TensorDesc, ::mlir::Value mask, /*optional*/::mlir::UnitAttr transpose,
+      auto loadOp = rewriter.create<xegpu::LoadGatherOp>(
+          loc, vecLoadType, tile, /*mask=*/mask, mlir::UnitAttr::get(rewriter.getContext()),
+          /*l1_hint=*/hint,
+          /*l2_hint=*/hint, /*l3_hint=*/hint);
+      // loadOp.getResult();
+      interm = rewriter.create<vector::InsertOp>(
+          loc, loadOp.getResult(), interm, SmallVector<int64_t>{i});
+      // auto res = rewriter.create<vector::ShapeCastOp>(loc, vectorType2, loadOp);
+      // loadVec.push_back(res);
+      i++;
+    }
 
-  for (auto tile : loadTiles) {
-// build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState, ::mlir::TypeRange resultTypes, ::mlir::Value TensorDesc, ::mlir::Value mask, /*optional*/::mlir::UnitAttr transpose,
-    auto loadOp = rewriter.create<xegpu::LoadGatherOp>(
-        loc, vecLoadType, tile, /*mask=*/mask, mlir::UnitAttr::get(rewriter.getContext()),
-        /*l1_hint=*/hint,
-        /*l2_hint=*/hint, /*l3_hint=*/hint);
-    // loadOp.getResult();
-    interm = rewriter.create<vector::InsertOp>(
-        loc, loadOp.getResult(), interm, SmallVector<int64_t>{i});
-    // auto res = rewriter.create<vector::ShapeCastOp>(loc, vectorType2, loadOp);
-    // loadVec.push_back(res);
-    i++;
+    if (resultShape.size() == 0) {
+      loadVec.push_back(interm);
+      return loadVec;
+    }
+
+    int64_t sgLoadRows = maxRows; // resultShape[0];
+    int64_t sgLoadCols = maxCols; // resultShape[1];
+    int64_t sgFlat = sgLoadRows * sgLoadCols;
+    mlir::VectorType vectorTypeSg = mlir::VectorType::get({sgLoadRows, sgLoadCols}, tileType.getElementType());
+    mlir::VectorType vectorTypeFlagSg = mlir::VectorType::get({sgFlat}, tileType.getElementType());
+
+    auto flatLoaded = rewriter.create<vector::ShapeCastOp>(loc, vectorType0, interm);
+    for (int64_t i = 0; i < totalLoadCh; i+= sgFlat) {
+      auto slice = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, flatLoaded, /*offsets=*/ArrayRef<int64_t>{i}, /*sizes=*/ArrayRef<int64_t>{sgFlat},
+            /*strides=*/ArrayRef<int64_t>{1});
+      auto res = rewriter.create<vector::ShapeCastOp>(loc, vectorTypeSg, slice);
+      loadVec.push_back(res);
+    }
   }
-
-  if (resultShape.size() == 0) {
-    loadVec.push_back(interm);
-    return loadVec;
-  }
-
-  int64_t sgLoadRows = resultShape[0];
-  int64_t sgLoadCols = resultShape[1];
-  int64_t sgFlat = sgLoadRows * sgLoadCols;
-  mlir::VectorType vectorTypeSg = mlir::VectorType::get({sgLoadRows, sgLoadCols}, tileType.getElementType());
-  mlir::VectorType vectorTypeFlagSg = mlir::VectorType::get({sgFlat}, tileType.getElementType());
-
-  auto flatLoaded = rewriter.create<vector::ShapeCastOp>(loc, vectorType0, interm);
-  for (int64_t i = 0; i < totalLoad; i+= sgFlat) {
-    auto slice = rewriter.create<vector::ExtractStridedSliceOp>(
-          loc, flatLoaded, /*offsets=*/ArrayRef<int64_t>{i}, /*sizes=*/ArrayRef<int64_t>{sgFlat},
-          /*strides=*/ArrayRef<int64_t>{1});
-    auto res = rewriter.create<vector::ShapeCastOp>(loc, vectorTypeSg, slice);
-    loadVec.push_back(res);
-  }
-
 
   //           const int subTileSize = subTile[0] * subTile[1];
   //         int dpasIdx = i * subTilePerLoadCol + j;
@@ -1130,6 +1145,17 @@ storeScatterDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value
       chunkedResults.push_back(slice);
     }
   }
+  // llvm::dbgs() << "Storing: " << chunkedResults.size() << " " << loadTiles.size() << "\n";
+
+  // for (auto v : chunkedResults) {
+  //   v.dump();
+  // }
+
+  // llvm::dbgs() << "break" << "\n";
+  // for (auto v : loadTiles) {
+  //   v.dump();
+  // }
+
   assert(chunkedResults.size() == loadTiles.size());
 
   for (size_t i = 0; i < loadTiles.size(); i++) {
@@ -1375,10 +1401,10 @@ static LogicalResult createDPASKernel(linalg::LinalgOp linalgOp,
   SmallVector<Value> loadVecC =
       loadDescTiles(rewriter, loc, tilesC, readCacheHint, std::nullopt, nullptr, nullptr, dpasTypeC.getShape());
   
-  llvm::dbgs() << "loadVecC.size(): " << loadVecC.size() << "\n";
-  for (auto v : loadVecC) {
-    v.dump();
-  }
+  // llvm::dbgs() << "loadVecC.size(): " << loadVecC.size() << "\n";
+  // for (auto v : loadVecC) {
+  //   v.dump();
+  // }
 
   // DPAS only works with F32 accumulators.
   auto dpasResType =
@@ -1716,7 +1742,7 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
 
   // Extract SIMD sized sub-tiles from loaded tiles.
   // TODO: Fetch SIMD sizes from target descriptor.
-  int maxSizeSIMD = 256;
+  int64_t maxSizeSIMD = 256;
   auto loadShape = cast<VectorType>(loadedInputs[0][0].getType()).getShape();
   // For sake of n-D loads and store, the vectorized operations are kept in 2D
   // shape. The loaded tiles might be larger than what SIMD units can handle.
@@ -1726,15 +1752,20 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
   //
   // Take at least one whole row plus as many extra rows as can fit into
   // a single SIMD instruction.
-  int64_t subTileCols = loadShape[1];
+  int64_t subTileCols = std::min(loadShape[1], maxSizeSIMD);
   int64_t subTileRows = std::min(loadShape[0], maxSizeSIMD / subTileCols);
 
   SmallVector<SmallVector<Value>> vecSubTiles;
   // NOLINTBEGIN
   for (auto inputTiles : loadedInputs) {
+    loadShape = cast<VectorType>(inputTiles[0].getType()).getShape();
     TilesArray subTiles =
         extractVecSubTiles(rewriter, loc, inputTiles, outputShape, loadShape,
                            {subTileRows, subTileCols});
+    llvm::dbgs() << "Input extra sub-tiles:\n";
+    for (auto v : inputTiles) { v.dump(); }
+    llvm::dbgs() << "Output extra sub-tiles:\n";
+    for (auto v : subTiles.toFlatVector()) { v.dump(); }
     vecSubTiles.push_back(subTiles.toFlatVector());
   }
   // NOLINTEND
@@ -1922,8 +1953,8 @@ LogicalResult createMemoryFillKernel(linalg::LinalgOp linalgOp,
   }
 
   // Extract SIMD sized sub-tiles
-  int maxSizeSIMD = hasSharedMemSpace(output) ? 32 : 256;
-  int64_t subTileCols = outputShape[1];
+  int64_t maxSizeSIMD = hasSharedMemSpace(output) ? 32 : 256;
+  int64_t subTileCols = std::min(outputShape[1], maxSizeSIMD);
   int64_t subTileRows =
       std::min(outputShape[0], std::max(maxSizeSIMD / subTileCols, 1L));
 
