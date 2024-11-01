@@ -124,9 +124,10 @@ def GpuToGpuOcl : Pass<"gpu-to-gpuocl", "ModuleOp"> {
 def GpuTilingAndFusion : Pass<"gpu-tiling", "func::FuncOp"> {
   let summary = "GPU tiling and fusion path.";
   let description = [{
-    This pass tiles linalg operations and creates an inner loop that is mapped to the block sizes, when converting
-    to gpu.launch. The tiles calculation is based on the GPU device properties, retrieved from the DLTI attributes.
-    If the DLTI attributes are not specified, defaults to the pass options.
+    This pass tiles linalg operations and creates two nested csf.forall loops. When converting to gpu.launch,
+    the inner loop is mapped to the block sizes and the outer - to grid sizes. The tiles calculation is based
+    on the GPU device properties, retrieved from the DLTI attributes. If the DLTI attributes are not specified,
+    defaults to the pass options.
   }];
   let options = [
     Option<"numEus", "num-eus", "size_t",
@@ -143,18 +144,7 @@ def GpuTilingAndFusion : Pass<"gpu-tiling", "func::FuncOp"> {
            "Execution Unit cache size.">,
     Option<"vectorWidth", "vector-width", "size_t",
            /*default=*/"512",
-           "The maximum width of EU's vector registers.">
-    ];
-}
-
-def GpuLoopTiling : Pass<"gpu-loop-tiling", "func::FuncOp"> {
-  let summary = "Create nested parallel loops to be mapped to GPU.";
-  let description = [{
-    This pass tiles the loops created by the GpuTilingAndFusion pass and converted to parallel loops. The tiles
-    calculation is based on the max_work_group_size DLTI attribute. If the attribute is not specified,
-    defaults to the pass options.
-  }];
-  let options = [
+           "The maximum width of EU's vector registers.">,
     Option<"workGroupSize", "work-group-size", "size_t",
            /*default=*/"64",
            "The maximum workgroup size.">

@@ -8,16 +8,20 @@
 #ifndef GPUUTILS_H
 #define GPUUTILS_H
 
-#include <numeric>
+#include "gc/Utils/Log.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 
-#include <gc/Utils/Log.h>
+#include "llvm/ADT/DenseMap.h"
+
+#include <numeric>
 
 using namespace mlir;
 
@@ -70,26 +74,41 @@ template <typename DerivedT> struct GpuPass {
     return getGpuPropertyAsInt(builder, "max_work_group_size",
                                static_cast<DerivedT *>(this)->workGroupSize);
   }
+};
 
-  static int64_t getConstIdxValue(Value value) {
-    if (auto op = value.getDefiningOp<arith::ConstantIndexOp>()) {
-      return op.value();
-    }
-    if (auto minOp = value.getDefiningOp<affine::AffineMinOp>()) {
-      for (const AffineExpr &result : minOp.getMap().getResults()) {
-        if (auto constExpr = dyn_cast<AffineConstantExpr>(result)) {
-          return constExpr.getValue();
+struct OpRewriter : IRRewriter {
+  Location loc;
+
+  explicit OpRewriter(func::FuncOp &func)
+      : IRRewriter(func.getContext()), loc(func.getLoc()), func(func) {}
+
+  template <typename OpTy, typename... Args> OpTy create(Args &&...args) {
+    return RewriterBase::create<OpTy>(loc, std::forward<Args>(args)...);
+  }
+
+  arith::ConstantIndexOp getConstant(int64_t v) {
+    if (func.empty()) {
+      func.addEntryBlock();
+    } else {
+      // Try to find ConstantIndexOp with the same value in the function.
+      for (auto &op : func.getBody().getOps()) {
+        if (auto constOp = dyn_cast<arith::ConstantIndexOp>(op)) {
+          if (constOp.value() == v) {
+            return constOp;
+          }
         }
       }
     }
-    if (auto minOp = value.getDefiningOp<arith::MinSIOp>()) {
-      for (Value operand : {minOp.getLhs(), minOp.getRhs()}) {
-        if (auto v = getConstIdxValue(operand))
-          return v;
-      }
-    }
-    return 0;
+
+    auto ip = saveInsertionPoint();
+    setInsertionPointToStart(&func.getBody().front());
+    auto op = create<arith::ConstantIndexOp>(v);
+    restoreInsertionPoint(ip);
+    return op;
   }
+
+private:
+  func::FuncOp &func;
 };
 
 // Round to the largest power of 2 that is <= value.
