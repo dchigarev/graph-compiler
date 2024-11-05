@@ -712,7 +712,7 @@ static SmallVector<Value>
 createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
                       ArrayRef<int64_t> loadShape,
                       ArrayRef<int64_t> loadOffsets, ArrayRef<int64_t> descTile,
-                      int arrayLength = 1, bool transpose = false) {
+                      int arrayLength = 1, bool transpose = false, Value initialOffset = nullptr) {
   assert(arrayLength == 1 && "Array descriptors are not supported");
   assert(loadShape.size() == 2 && "Output shape should be 2D");
   assert(descTile.size() == 1 && "Only 1D tiles are supported for scatter");
@@ -734,10 +734,12 @@ createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
   // Create an arith.constant operation with the DenseElementsAttr
   arith::ConstantOp offset = rewriter.create<mlir::arith::ConstantOp>(loc, offsetType, denseAttr);
 
+  Value initToSet = initialOffset ? initialOffset : offset.getResult();
+
   auto rootTile =
       rewriter
           .create<xegpu::CreateDescOp>(
-              loc, descType, dyn_cast<TypedValue<MemRefType>>(src), offset.getResult())
+              loc, descType, dyn_cast<TypedValue<MemRefType>>(src), initToSet)
           .getResult();
 
   SmallVector<Value> tiles;
@@ -826,6 +828,42 @@ static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
   assert(sgTile.size() <= 2 &&
          "Require at most 2D tile size for eltwise lowering");
   
+  auto srcTypeOrig = src.getType().cast<MemRefType>();
+  assert(srcTypeOrig.getRank() == 2 && "Expected a 2D memref");
+  
+  // Get the shape of the original 2D memref
+  ArrayRef<int64_t> srcShapeOrig = srcTypeOrig.getShape();
+
+  // Flatten the 2D memref to 1D
+  int64_t origFlatSize = srcShapeOrig[0] * srcShapeOrig[1];
+
+  auto origSrc = src;
+  Value initialOffsets;
+  if (auto subvw = dyn_cast<memref::SubViewOp>(src.getDefiningOp())) {
+    auto xo = subvw.getOffsets()[0];
+    auto yo = subvw.getOffsets()[1];
+
+    auto srcShape_ = dyn_cast<mlir::MemRefType>(subvw.getOperand(0).getType()).getShape();
+    
+    auto mda = rewriter.create<arith::ConstantIndexOp>(loc, srcShape_[1]).getResult();
+
+    auto res = rewriter.create<arith::MulIOp>(loc, xo, mda).getResult();
+    auto flatOffset = rewriter.create<arith::AddIOp>(loc, res, yo).getResult();
+
+    SmallVector<Value> initialOff;
+    for (size_t i = 0; i < 32; i++) {
+      auto mmm = rewriter.create<arith::ConstantIndexOp>(loc, i).getResult();
+      auto ww = rewriter.create<arith::AddIOp>(loc, flatOffset, mmm).getResult();
+      initialOff.push_back(ww);
+    }
+
+    auto wt = VectorType::get({static_cast<int64_t>(32)}, rewriter.getIndexType());
+    initialOffsets = rewriter.create<vector::FromElementsOp>(loc, wt, initialOff).getResult();
+    // initialOffsets = rewriter.create<arith::ConstantIndexOp>(loc, xo * srcShape[1] + yo);
+    // offset = reinterp.getOffsets()[0];
+    src = subvw.getOperand(0);
+  }
+
   // Assume `src` is a 2D memref
   auto srcType = src.getType().cast<MemRefType>();
   assert(srcType.getRank() == 2 && "Expected a 2D memref");
@@ -838,9 +876,13 @@ static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
 
   // Create the reinterpret_cast parameters: 
   // Offset is 0, Size is the total number of elements, Stride is 1
+
+
   Value offset = rewriter.create<arith::ConstantIndexOp>(loc, 0);
   Value size = rewriter.create<arith::ConstantIndexOp>(loc, flatSize);
   Value stride = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+
 
   // Use memref.reinterpret_cast to flatten the memref
   auto flatMemRefType = MemRefType::get({flatSize}, srcType.getElementType(), nullptr, srcType.getMemorySpace());
@@ -854,7 +896,7 @@ static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
     sgTile2D.push_back(1);
 
   int64_t maxLoadSize = 32;
-  int64_t sgLoadElems = std::min(maxLoadSize, flatSize);
+  int64_t sgLoadElems = std::min(maxLoadSize, origFlatSize);
   int64_t arrayLength = 1;
   // NOLINTEND
 
@@ -863,9 +905,11 @@ static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
     offsets.push_back(i);
   }
 
+
+
   return createScatterDescriptorTiles(rewriter, loc, src, sgTile2D, offsets,
                                {sgLoadElems}, arrayLength,
-                               transpose);
+                               transpose, initialOffsets);
 }
 
 static SmallVector<Value> createCoarseDscTiles(PatternRewriter &rewriter,

@@ -30,43 +30,48 @@ namespace mlir::gc {
 
 void populateGPUPipeline(OpPassManager &pm,
                          const GPUPipelineOptions &pipelineOpts) {
+  // if (pipelineOpts.useGpuRuntime) {
+  //   // Add an argument for the GPU context
+  //   pm.addNestedPass<func::FuncOp>(createAddContextArg());
+  // }
+
+  // pm.addNestedPass<func::FuncOp>(createGpuTilingAndFusion());
+
+  // pm.addPass(bufferization::createEmptyTensorEliminationPass());
+  // pm.addPass(bufferization::createEmptyTensorToAllocTensorPass());
+
+  // bufferization::OneShotBufferizationOptions options;
+  // options.bufferizeFunctionBoundaries = true;
+  // options.setFunctionBoundaryTypeConversion(
+  //     bufferization::LayoutMapOption::IdentityLayoutMap);
+  // pm.addPass(bufferization::createOneShotBufferizePass(options));
+
+  // pm.addPass(bufferization::createDropEquivalentBufferResultsPass());
+  // pm.addNestedPass<func::FuncOp>(
+  //     bufferization::createFinalizingBufferizePass());
+  // pm.addPass(createCanonicalizerPass());
+  // pm.addPass(createCSEPass());
+  // pm.addPass(bufferization::createDropEquivalentBufferResultsPass());
+  // pm.addPass(memref::createExpandReallocPass());
+  // pm.addPass(createCanonicalizerPass());
+  // pm.addPass(bufferization::createOwnershipBasedBufferDeallocationPass());
+  // pm.addPass(createCanonicalizerPass());
+  // pm.addPass(bufferization::createBufferDeallocationSimplificationPass());
+  // pm.addPass(bufferization::createLowerDeallocationsPass());
+  // pm.addPass(createCSEPass());
+  // pm.addPass(createCanonicalizerPass());
+  // pm.addPass(createBufferizationToMemRefPass());
+
+  // pm.addNestedPass<func::FuncOp>(createForallToParallelLoopPass());
+  // pm.addNestedPass<func::FuncOp>(createGpuLoopTiling());
+  // pm.addNestedPass<func::FuncOp>(createGpuMapParallelLoopsPass());
+  // pm.addNestedPass<func::FuncOp>(createParallelLoopToGpuPass());
+  // pm.addPass(createCanonicalizerPass());
+  // pm.addNestedPass<func::FuncOp>(createAllocsToSLM());
   if (pipelineOpts.useGpuRuntime) {
     // Add an argument for the GPU context
     pm.addNestedPass<func::FuncOp>(createAddContextArg());
   }
-
-  pm.addNestedPass<func::FuncOp>(createGpuTilingAndFusion());
-
-  pm.addPass(bufferization::createEmptyTensorEliminationPass());
-  pm.addPass(bufferization::createEmptyTensorToAllocTensorPass());
-
-  bufferization::OneShotBufferizationOptions options;
-  options.bufferizeFunctionBoundaries = true;
-  options.setFunctionBoundaryTypeConversion(
-      bufferization::LayoutMapOption::IdentityLayoutMap);
-  pm.addPass(bufferization::createOneShotBufferizePass(options));
-
-  pm.addPass(bufferization::createDropEquivalentBufferResultsPass());
-  pm.addNestedPass<func::FuncOp>(
-      bufferization::createFinalizingBufferizePass());
-  pm.addPass(createCanonicalizerPass());
-  pm.addPass(createCSEPass());
-  pm.addPass(bufferization::createDropEquivalentBufferResultsPass());
-  pm.addPass(memref::createExpandReallocPass());
-  pm.addPass(createCanonicalizerPass());
-  pm.addPass(bufferization::createOwnershipBasedBufferDeallocationPass());
-  pm.addPass(createCanonicalizerPass());
-  pm.addPass(bufferization::createBufferDeallocationSimplificationPass());
-  pm.addPass(bufferization::createLowerDeallocationsPass());
-  pm.addPass(createCSEPass());
-  pm.addPass(createCanonicalizerPass());
-  pm.addPass(createBufferizationToMemRefPass());
-
-  pm.addNestedPass<func::FuncOp>(createForallToParallelLoopPass());
-  pm.addNestedPass<func::FuncOp>(createGpuLoopTiling());
-  pm.addNestedPass<func::FuncOp>(createGpuMapParallelLoopsPass());
-  pm.addNestedPass<func::FuncOp>(createParallelLoopToGpuPass());
-  pm.addNestedPass<func::FuncOp>(createAllocsToSLM());
   pm.addNestedPass<func::FuncOp>(createLinalgToXeGPU(
       {/*kTile=*/16, /*stages=*/1, /*dpasTiles=*/{8, 16, 16}}));
 
