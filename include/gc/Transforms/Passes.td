@@ -101,6 +101,13 @@ def AddContextArg : Pass<"add-ctx-arg", "func::FuncOp"> {
   }];
 }
 
+def HackyMaskPass : Pass<"hacky-mask-pass", "ModuleOp"> {
+  let summary = "Add a context argument.";
+  let description = [{
+    Add a new memref argument to the function, that could be used to pass some context.
+  }];
+}
+
 def AllocsToSLM : Pass<"allocs-to-slm", "func::FuncOp"> {
   let summary = "Add 'shared' memory space to memrefs allocated inside a gpu.block.";
   let description = [{Add 'shared' memory space to memrefs allocated inside a gpu.block.}];

@@ -15,6 +15,7 @@ gc_add_mlir_library(GcGpuPasses
   GpuLoopTiling.cpp
   GpuTilingAndFusion.cpp
   AllocsToSLM.cpp
+  HackyMaskPass.cpp
   GpuToGpuOcl.cpp
   LinalgToXeGPU.cpp
   Pipeline.cpp

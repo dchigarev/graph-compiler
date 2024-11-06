@@ -744,7 +744,8 @@ createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
 
   SmallVector<Value> tiles;
   Value prevTile = rootTile;
-  for (int j = 0, tileIdx = 0; j < loadShape[0] * loadShape[1]; j += descTile[0], tileIdx++) {
+  tiles.push_back(prevTile);
+  for (int j = descTile[0], tileIdx = 0; j < loadShape[0] * loadShape[1]; j += descTile[0], tileIdx++) {
     prevTile = rewriter
                     .create<xegpu::UpdateOffsetOp>(
                         loc, prevTile.getType(), prevTile,
@@ -848,7 +849,9 @@ static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
     auto mda = rewriter.create<arith::ConstantIndexOp>(loc, srcShape_[1]).getResult();
 
     auto res = rewriter.create<arith::MulIOp>(loc, xo, mda).getResult();
-    auto flatOffset = rewriter.create<arith::AddIOp>(loc, res, yo).getResult();
+    auto r2 = rewriter.create<arith::MulIOp>(loc, yo, rewriter.create<arith::ConstantIndexOp>(loc, 16).getResult()).getResult();
+
+    auto flatOffset = rewriter.create<arith::AddIOp>(loc, res, r2).getResult();
 
     SmallVector<Value> initialOff;
     for (size_t i = 0; i < 32; i++) {
@@ -994,6 +997,7 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
 
   int64_t loadSize = tileType.getShape()[0];
   mlir::VectorType maskVectorType = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
+  // mlir::VectorType maskVectorType2 = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
 
   llvm::SmallVector<bool> maskValues;
   for (int i = 0; i < loadSize; i++) {
@@ -1001,6 +1005,8 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
   }
   mlir::DenseElementsAttr denseMaskAttr = mlir::DenseIntElementsAttr::get(maskVectorType, maskValues);
   auto mask = rewriter.create<mlir::arith::ConstantOp>(loadTiles[0].getLoc(), maskVectorType, denseMaskAttr);
+
+  // mask = rewriter.create<vector::ShapeCastOp>(loc, maskVectorType2, mask);
 
 
   // int64_t loadCols;
@@ -1036,7 +1042,7 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
     for (int64_t i = 0; i < totalLoadCh / elementsPerLoad; i++) {
       auto tile = loadTiles[i + loadTilesIdx];
       auto loadOp = rewriter.create<xegpu::LoadGatherOp>(
-          loc, vecLoadType, tile, /*mask=*/mask, /*transpose=*/mlir::UnitAttr::get(rewriter.getContext()),
+          loc, vecLoadType, tile, /*mask=*/mask, /*transpose=*/nullptr,// mlir::UnitAttr::get(rewriter.getContext()),
           /*l1_hint=*/hint,
           /*l2_hint=*/hint, /*l3_hint=*/hint);
 
@@ -1124,6 +1130,7 @@ storeScatterDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value
   int64_t loadSize = tileType.getShape()[0];
 
   mlir::VectorType maskType = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
+  // mlir::VectorType maskType2 = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
 
   llvm::SmallVector<bool> maskValues;
   for (int i = 0; i < loadSize; i++) {
