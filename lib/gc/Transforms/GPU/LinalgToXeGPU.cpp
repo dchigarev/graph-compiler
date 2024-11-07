@@ -745,11 +745,15 @@ createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
   SmallVector<Value> tiles;
   Value prevTile = rootTile;
   tiles.push_back(prevTile);
+  
+  mlir::DenseElementsAttr shiftDenseAttr = mlir::DenseIntElementsAttr::get(offsetType, static_cast<int64_t>(32));
+  auto shiftOffset = rewriter.create<mlir::arith::ConstantOp>(loc, offsetType, shiftDenseAttr).getResult();
+
   for (int j = descTile[0], tileIdx = 0; j < loadShape[0] * loadShape[1]; j += descTile[0], tileIdx++) {
     prevTile = rewriter
                     .create<xegpu::UpdateOffsetOp>(
                         loc, prevTile.getType(), prevTile,
-                        /*offsets=*/offset.getResult())
+                        /*offsets=*/shiftOffset)
                     .getResult();
     tiles.push_back(prevTile);
   }
@@ -1042,9 +1046,9 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
     for (int64_t i = 0; i < totalLoadCh / elementsPerLoad; i++) {
       auto tile = loadTiles[i + loadTilesIdx];
       auto loadOp = rewriter.create<xegpu::LoadGatherOp>(
-          loc, vecLoadType, tile, /*mask=*/mask, /*transpose=*/nullptr,// mlir::UnitAttr::get(rewriter.getContext()),
-          /*l1_hint=*/hint,
-          /*l2_hint=*/hint, /*l3_hint=*/hint);
+          loc, vecLoadType, tile, /*mask=*/mask, /*transpose=*/mlir::UnitAttr::get(rewriter.getContext())
+          , nullptr, nullptr, nullptr
+          );
 
       loadAccumulator = rewriter.create<vector::InsertOp>(
           loc, loadOp.getResult(), loadAccumulator, SmallVector<int64_t>{i});
@@ -1166,9 +1170,7 @@ storeScatterDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value
     auto val = rewriter.create<xegpu::StoreScatterOp>(loc, chunkedResults[i], loadTiles[i],
                                       /*mask=*/mask,
                                       /*transpose=*/mlir::UnitAttr::get(rewriter.getContext()),
-                                      /*l1_hint=*/hint,
-                                      /*l2_hint=*/hint,
-                                      /*l3_hint=*/hint);
+                                      nullptr, nullptr, nullptr);
   }
   return res;
 }

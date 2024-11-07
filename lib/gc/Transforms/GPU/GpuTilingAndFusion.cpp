@@ -110,7 +110,7 @@ struct GpuTilingAndFusion final
           result.reserve(itDomains.size());
 
           for (auto [t, r] : zip(itTypes, itDomains)) {
-            result.emplace_back(builder.getIndexAttr(32));
+            result.emplace_back(builder.getIndexAttr(16));
             // if (t != utils::IteratorType::parallel) {
             //   result.emplace_back(builder.getIndexAttr(1));
             // } else {
