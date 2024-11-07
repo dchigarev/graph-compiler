@@ -96,7 +96,7 @@ void populateGPUPipeline(OpPassManager &pm,
     pm.addNestedPass<func::FuncOp>(
         imex::createInsertGPUAllocsPass(insertGPUAllocsOption));
     pm.addPass(createGpuKernelOutliningPass());
-    pm.addPass(createCanonicalizerPass());
+    // pm.addPass(createCanonicalizerPass());
     pm.addPass(createHackyMaskPass());
   }
 

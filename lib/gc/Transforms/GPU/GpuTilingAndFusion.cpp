@@ -34,6 +34,18 @@ namespace mlir::gc {
 
 namespace {
 
+int getIntFromEnv(const std::string &envVarName) {
+    const char* envValue = std::getenv(envVarName.c_str());
+    if (envValue == nullptr) {
+        return 16;  // Default to false if the variable is not set
+    }
+
+    std::string valueStr(envValue);
+    std::transform(valueStr.begin(), valueStr.end(), valueStr.begin(), ::tolower);
+
+    return std::stoi(valueStr);
+}
+
 struct GpuTilingAndFusion final
     : GpuPass<GpuTilingAndFusion>,
       gc::impl::GpuTilingAndFusionBase<GpuTilingAndFusion> {
@@ -109,13 +121,19 @@ struct GpuTilingAndFusion final
           SmallVector<OpFoldResult> result;
           result.reserve(itDomains.size());
 
+          auto chunkSize = getIntFromEnv("GC_CHUNK_SIZE");
           for (auto [t, r] : zip(itTypes, itDomains)) {
-            result.emplace_back(builder.getIndexAttr(16));
-            // if (t != utils::IteratorType::parallel) {
-            //   result.emplace_back(builder.getIndexAttr(1));
-            // } else {
-            //   result.emplace_back(builder.getIndexAttr(tiles[counter++]));
-            // }
+            if (chunkSize > 0) {
+              llvm::dbgs() << "Inserting chunk size: " << chunkSize << "\n";
+              result.emplace_back(builder.getIndexAttr(chunkSize));
+              continue;
+            }
+            llvm::dbgs() << "Auto chunk size: " << chunkSize << "\n";
+            if (t != utils::IteratorType::parallel) {
+              result.emplace_back(builder.getIndexAttr(1));
+            } else {
+              result.emplace_back(builder.getIndexAttr(tiles[counter++]));
+            }
           }
 
           return result;

@@ -856,16 +856,29 @@ static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
     auto r2 = rewriter.create<arith::MulIOp>(loc, yo, rewriter.create<arith::ConstantIndexOp>(loc, 16).getResult()).getResult();
 
     auto flatOffset = rewriter.create<arith::AddIOp>(loc, res, r2).getResult();
-
-    SmallVector<Value> initialOff;
-    for (size_t i = 0; i < 32; i++) {
-      auto mmm = rewriter.create<arith::ConstantIndexOp>(loc, i).getResult();
-      auto ww = rewriter.create<arith::AddIOp>(loc, flatOffset, mmm).getResult();
-      initialOff.push_back(ww);
-    }
-
+    SmallVector<Value> initialFlat(32, flatOffset);
     auto wt = VectorType::get({static_cast<int64_t>(32)}, rewriter.getIndexType());
-    initialOffsets = rewriter.create<vector::FromElementsOp>(loc, wt, initialOff).getResult();
+    auto initialOffs = rewriter.create<vector::FromElementsOp>(loc, wt, initialFlat).getResult();
+
+    SmallVector<int64_t> offShifts;
+    for (size_t i = 0; i < 32; i++) {
+      offShifts.push_back(i);
+    }
+    mlir::DenseElementsAttr denseAttr = mlir::DenseIntElementsAttr::get(wt, offShifts);
+    arith::ConstantOp offset = rewriter.create<mlir::arith::ConstantOp>(loc, wt, denseAttr);
+
+
+    initialOffsets = rewriter.create<arith::AddIOp>(loc, initialOffs, offset).getResult();
+
+    // SmallVector<Value> initialOff;
+    // for (size_t i = 0; i < 32; i++) {
+    //   auto mmm = rewriter.create<arith::ConstantIndexOp>(loc, i).getResult();
+    //   auto ww = rewriter.create<arith::AddIOp>(loc, flatOffset, mmm).getResult();
+    //   initialOff.push_back(ww);
+    // }
+
+
+    // initialOffsets = rewriter.create<vector::FromElementsOp>(loc, wt, initialOff).getResult();
     // initialOffsets = rewriter.create<arith::ConstantIndexOp>(loc, xo * srcShape[1] + yo);
     // offset = reinterp.getOffsets()[0];
     src = subvw.getOperand(0);
