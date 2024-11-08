@@ -54,6 +54,18 @@ struct VnniConfig {
   int vnniAxis;
 };
 
+int getIntFromEnv(const std::string &envVarName) {
+    const char* envValue = std::getenv(envVarName.c_str());
+    if (envValue == nullptr) {
+        return 16;  // Default to false if the variable is not set
+    }
+
+    std::string valueStr(envValue);
+    std::transform(valueStr.begin(), valueStr.end(), valueStr.begin(), ::tolower);
+
+    return std::stoi(valueStr);
+}
+
 // Helper struct to keep track of tiles' position with respect to whole matrix.
 struct TilesArray {
   TilesArray() = delete;
@@ -853,7 +865,7 @@ static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
     auto mda = rewriter.create<arith::ConstantIndexOp>(loc, srcShape_[1]).getResult();
 
     auto res = rewriter.create<arith::MulIOp>(loc, xo, mda).getResult();
-    auto r2 = rewriter.create<arith::MulIOp>(loc, yo, rewriter.create<arith::ConstantIndexOp>(loc, 16).getResult()).getResult();
+    auto r2 = rewriter.create<arith::MulIOp>(loc, yo, rewriter.create<arith::ConstantIndexOp>(loc, getIntFromEnv("GC_CHUNK_SIZE")).getResult()).getResult();
 
     auto flatOffset = rewriter.create<arith::AddIOp>(loc, res, r2).getResult();
     SmallVector<Value> initialFlat(32, flatOffset);
@@ -1059,7 +1071,7 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
     for (int64_t i = 0; i < totalLoadCh / elementsPerLoad; i++) {
       auto tile = loadTiles[i + loadTilesIdx];
       auto loadOp = rewriter.create<xegpu::LoadGatherOp>(
-          loc, vecLoadType, tile, /*mask=*/mask, /*transpose=*/mlir::UnitAttr::get(rewriter.getContext())
+          loc, vecLoadType, tile, /*mask=*/mask, nullptr// /*transpose=*/mlir::UnitAttr::get(rewriter.getContext())
           , nullptr, nullptr, nullptr
           );
 
@@ -1182,7 +1194,7 @@ storeScatterDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value
   for (size_t i = 0; i < loadTiles.size(); i++) {
     auto val = rewriter.create<xegpu::StoreScatterOp>(loc, chunkedResults[i], loadTiles[i],
                                       /*mask=*/mask,
-                                      /*transpose=*/mlir::UnitAttr::get(rewriter.getContext()),
+                                      nullptr, // /*transpose=*/mlir::UnitAttr::get(rewriter.getContext()),
                                       nullptr, nullptr, nullptr);
   }
   return res;
