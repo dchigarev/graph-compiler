@@ -720,57 +720,130 @@ createNdDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
   return tiles;
 }
 
+static Value createIndexVector(PatternRewriter &rewriter, Location loc,
+                               ArrayRef<int64_t> values) {
+  mlir::VectorType vectorType = mlir::VectorType::get({static_cast<int64_t>(values.size())}, rewriter.getIndexType());
+  mlir::DenseElementsAttr denseAttr = mlir::DenseIntElementsAttr::get(vectorType, values);
+  auto vector = rewriter.create<mlir::arith::ConstantOp>(loc, vectorType, denseAttr).getResult();
+  return vector;
+}
+
+static Value createIndexConstant(PatternRewriter &rewriter, Location loc,
+                                 int64_t value) {
+  return rewriter.create<arith::ConstantIndexOp>(loc, value);
+}
+
 static SmallVector<Value>
-createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
-                      ArrayRef<int64_t> loadShape,
-                      ArrayRef<int64_t> loadOffsets, ArrayRef<int64_t> descTile,
-                      int arrayLength = 1, bool transpose = false, Value initialOffset = nullptr) {
-  assert(arrayLength == 1 && "Array descriptors are not supported");
-  assert(loadShape.size() == 2 && "Output shape should be 2D");
-  assert(descTile.size() == 1 && "Only 1D tiles are supported for scatter");
-
-  auto type = cast<ShapedType>(src.getType());
-  auto descType = getTensorDescType(
-    descTile[0], type.getElementType(), xegpu::MemorySpace::SLM,
-    xegpu::ScatterTensorDescAttr::get(rewriter.getContext(), xegpu::MemorySpace::SLM, chunkSize));
-
-  // Create the root descriptor.
-  //
-  // It is more efficient to create remainig descriptors by only updating its
-  // offsets compared to creating separate descriptors.
-  // The original tile is split into contiguous sub-tiles so, the first tile
-  // can be used as an anchor.
-  mlir::VectorType offsetType = mlir::VectorType::get({static_cast<int64_t>(loadOffsets.size())}, rewriter.getIndexType());
-  mlir::DenseElementsAttr denseAttr = mlir::DenseIntElementsAttr::get(offsetType, loadOffsets);
-
-  // Create an arith.constant operation with the DenseElementsAttr
-  arith::ConstantOp offset = rewriter.create<mlir::arith::ConstantOp>(loc, offsetType, denseAttr);
-
-  Value initToSet = initialOffset ? initialOffset : offset.getResult();
-
-  auto rootTile =
-      rewriter
-          .create<xegpu::CreateDescOp>(
-              loc, descType, dyn_cast<TypedValue<MemRefType>>(src), initToSet)
-          .getResult();
-
-  SmallVector<Value> tiles;
-  Value prevTile = rootTile;
-  tiles.push_back(prevTile);
+createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value flatMemref,
+                      ArrayRef<int64_t> loadShape2D, ArrayRef<int64_t> descTile2D,
+                      ArrayRef<int64_t> memrefStrides, Value slmBlockOffset) {
+  int64_t maxLoadSize = 32;
   
-  mlir::DenseElementsAttr shiftDenseAttr = mlir::DenseIntElementsAttr::get(offsetType, static_cast<int64_t>(32));
-  auto shiftOffset = rewriter.create<mlir::arith::ConstantOp>(loc, offsetType, shiftDenseAttr).getResult();
+  assert(memrefStrides.size() == 2 && "Strides must be 2D");
+  assert(memrefStrides[1] == 1 && "Only row-major strides are supported");
+  assert(loadShape2D.size() == 2 && "Load shape must be 2D");
+  assert(loadShape2D[0] * loadShape2D[1] % maxLoadSize == 0 && "Load shape must be divisible by max load size");
+  assert(descTile2D.size() == 2 && "Descriptor tile must be 2D");
+  assert(maxLoadSize % descTile2D[1] == 0 && "Descriptor tile must be divisible by max load size");
 
-  for (int j = descTile[0], tileIdx = 0; j < loadShape[0] * loadShape[1]; j += descTile[0], tileIdx++) {
-    prevTile = rewriter
-                    .create<xegpu::UpdateOffsetOp>(
-                        loc, prevTile.getType(), prevTile,
-                        /*offsets=*/shiftOffset)
-                    .getResult();
-    tiles.push_back(prevTile);
+  int64_t numLoadsPerTile = descTile2D[0] * descTile2D[1] / maxLoadSize;
+  int64_t rowsPerLoad = maxLoadSize / descTile2D[1];
+  int64_t numColTiles = loadShape2D[1] / descTile2D[1];
+
+  auto memrefType = dyn_cast<MemRefType>(flatMemref.getType());
+
+  SmallVector<SmallVector<int64_t>> offsetsShiftValues;
+  for (int colTile = 0; colTile < numColTiles; colTile++) {
+    offsetsShiftValues.push_back(SmallVector<int64_t>());
+    for (int i = 0; i < rowsPerLoad; i++) {
+      int64_t offset = i * memrefStrides[0];
+      for (int j = 0; j < maxLoadSize / rowsPerLoad; j++) {
+        offsetsShiftValues[colTile].push_back(offset + j + colTile * descTile2D[1]);
+      }
+    }
   }
 
-  return tiles;
+  int64_t skipPerLoad = memrefStrides[0] * rowsPerLoad;
+  auto offsetPerLoad = createIndexVector(rewriter, loc, SmallVector<int64_t>(32, skipPerLoad));
+
+  auto offsetVecType = VectorType::get({maxLoadSize}, rewriter.getIndexType());
+  auto descType = getTensorDescType(
+    {maxLoadSize}, memrefType.getElementType(), xegpu::MemorySpace::SLM,
+    xegpu::ScatterTensorDescAttr::get(rewriter.getContext(), xegpu::MemorySpace::SLM, /*chunkSize=*/1));
+
+  
+  SmallVector<Value> tiles;
+  for (int i = 0; i < numColTiles; i++) {
+    SmallVector<Value> slmBlockOffsetValues(32, slmBlockOffset);
+    auto slmBlockOffsetV = rewriter.create<vector::FromElementsOp>(loc, offsetVecType, slmBlockOffsetValues);
+    auto offsetsShift = createIndexVector(rewriter, loc, offsetsShiftValues[i]);
+
+    auto offsets0 = rewriter.create<arith::AddIOp>(loc, slmBlockOffsetV, offsetsShift);
+
+    auto desc = rewriter.create<xegpu::CreateDescOp>(loc, descType, flatMemref, offsets0).getResult();
+    tiles.push_back(desc);
+    for (int j = maxLoadSize; j < loadShape2D[0] * loadShape2D[1] / numColTiles; j+=maxLoadSize) {
+      auto newTile = rewriter.create<xegpu::UpdateOffsetOp>(loc, descType, tiles.back(), offsetPerLoad).getResult();
+      tiles.push_back(newTile);
+    }
+  }
+
+  SmallVector<Value> transposedTiles;
+  int numRowTiles = tiles.size() / numColTiles;
+  llvm::dbgs() << "tiles.size() " << tiles.size() << "\n";
+  llvm::dbgs() << "numColTiles " << numColTiles << "\n";
+  llvm::dbgs() << "numRowTiles " << numRowTiles << "\n";
+  for (int i = 0; i < numRowTiles; i++) {
+    for (int j = 0; j < numColTiles; j++) {
+      transposedTiles.push_back(tiles[i + j * numRowTiles]);
+    }
+  }
+  llvm::dbgs() << "transposed.size() " << transposedTiles.size() << "\n";
+  return transposedTiles;
+
+
+  // auto type = cast<ShapedType>(src.getType());
+  // auto descType = getTensorDescType(
+  //   descTile[0], type.getElementType(), xegpu::MemorySpace::SLM,
+  //   xegpu::ScatterTensorDescAttr::get(rewriter.getContext(), xegpu::MemorySpace::SLM, chunkSize));
+
+  // // Create the root descriptor.
+  // //
+  // // It is more efficient to create remainig descriptors by only updating its
+  // // offsets compared to creating separate descriptors.
+  // // The original tile is split into contiguous sub-tiles so, the first tile
+  // // can be used as an anchor.
+  // mlir::VectorType offsetType = mlir::VectorType::get({static_cast<int64_t>(loadOffsets.size())}, rewriter.getIndexType());
+  // mlir::DenseElementsAttr denseAttr = mlir::DenseIntElementsAttr::get(offsetType, loadOffsets);
+
+  // // Create an arith.constant operation with the DenseElementsAttr
+  // arith::ConstantOp offset = rewriter.create<mlir::arith::ConstantOp>(loc, offsetType, denseAttr);
+
+  // Value initToSet = initialOffset ? initialOffset : offset.getResult();
+
+  // auto rootTile =
+  //     rewriter
+  //         .create<xegpu::CreateDescOp>(
+  //             loc, descType, dyn_cast<TypedValue<MemRefType>>(src), initToSet)
+  //         .getResult();
+
+  // SmallVector<Value> tiles;
+  // Value prevTile = rootTile;
+  // tiles.push_back(prevTile);
+  
+  // mlir::DenseElementsAttr shiftDenseAttr = mlir::DenseIntElementsAttr::get(offsetType, static_cast<int64_t>(32));
+  // auto shiftOffset = rewriter.create<mlir::arith::ConstantOp>(loc, offsetType, shiftDenseAttr).getResult();
+
+  // for (int j = descTile[0], tileIdx = 0; j < loadShape[0] * loadShape[1]; j += descTile[0], tileIdx++) {
+  //   prevTile = rewriter
+  //                   .create<xegpu::UpdateOffsetOp>(
+  //                       loc, prevTile.getType(), prevTile,
+  //                       /*offsets=*/shiftOffset)
+  //                   .getResult();
+  //   tiles.push_back(prevTile);
+  // }
+
+  // return tiles;
 }
 
 
@@ -781,8 +854,9 @@ createDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
                       int arrayLength = 1, bool transpose = false) {
   
   if (hasSharedMemSpace(src)) {
-    return createScatterDescriptorTiles(rewriter, loc, src, loadShape, loadOffsets,
-                                   descTile, arrayLength, transpose);
+    assert(false && "Shared memory is not supported yet");
+    // return createScatterDescriptorTiles(rewriter, loc, src, loadShape, loadOffsets,
+    //                                descTile, arrayLength, transpose);
   }
   return createNdDescriptorTiles(rewriter, loc, src, loadShape, loadOffsets,
                                  descTile, arrayLength, transpose);
@@ -837,16 +911,36 @@ static SmallVector<Value> createCoarseNdDscTiles(PatternRewriter &rewriter,
                                transpose);
 }
 
-static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
+static Value flattenMemref(PatternRewriter &rewriter, Location loc, Value srcMemref) {
+  auto srcType = cast<MemRefType>(srcMemref.getType());
+
+  assert(srcType && "Expected a memref type");
+  assert(srcType.getRank() == 2 && "Expected a 2D memref");
+  
+  int64_t flatSize = srcType.getShape()[0] * srcType.getShape()[1];
+
+  Value offset = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+  Value size = rewriter.create<arith::ConstantIndexOp>(loc, flatSize);
+  Value stride = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+  // Use memref.reinterpret_cast to flatten the memref
+  auto flatMemRefType = MemRefType::get({flatSize}, srcType.getElementType(), nullptr, srcType.getMemorySpace());
+  auto flatMemref = rewriter.create<memref::ReinterpretCastOp>(
+      loc, flatMemRefType, srcMemref, offset, size, stride).getResult();
+  return flatMemref;
+}
+
+
+static SmallVector<Value> createSLMDescTiles(PatternRewriter &rewriter,
                                                Location loc, Value src,
-                                               ArrayRef<int64_t> sgTile,
-                                               bool isVnni,
-                                               bool transpose = false, int64_t rowTiles=-1) {
-  assert(sgTile.size() <= 2 &&
+                                               ArrayRef<int64_t> loadShape,
+                                               ArrayRef<int64_t> descTile) {
+  assert(loadShape.size() <= 2 &&
          "Require at most 2D tile size for eltwise lowering");
   
   auto srcTypeOrig = src.getType().cast<MemRefType>();
   assert(srcTypeOrig.getRank() == 2 && "Expected a 2D memref");
+  auto elemByteWidth = srcTypeOrig.getElementType().getIntOrFloatBitWidth() / 8;
   
   // Get the shape of the original 2D memref
   ArrayRef<int64_t> srcShapeOrig = srcTypeOrig.getShape();
@@ -856,92 +950,64 @@ static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
 
   auto origSrc = src;
   Value initialOffsets;
-  if (auto subvw = dyn_cast<memref::SubViewOp>(src.getDefiningOp())) {
-    auto xo = subvw.getOffsets()[0];
-    auto yo = subvw.getOffsets()[1];
 
-    auto srcShape_ = dyn_cast<mlir::MemRefType>(subvw.getOperand(0).getType()).getShape();
-    
-    auto mda = rewriter.create<arith::ConstantIndexOp>(loc, srcShape_[1]).getResult();
+  SmallVector<int64_t> memrefStrides;
+  Value slmOffset;
+  if (auto subView = dyn_cast<memref::SubViewOp>(src.getDefiningOp())) {
+    auto xIntOffs = subView.getOffsets()[0];
+    auto yIntOffs = subView.getOffsets()[1];
 
-    auto res = rewriter.create<arith::MulIOp>(loc, xo, mda).getResult();
-    auto r2 = rewriter.create<arith::MulIOp>(loc, yo, rewriter.create<arith::ConstantIndexOp>(loc, getIntFromEnv("GC_CHUNK_SIZE")).getResult()).getResult();
+    // compute slm_offset (begining of the subview block in the original flat memref)
+    auto slmBigWidthValue = cast<MemRefType>(subView.getOperand(0).getType()).getShape()[1];
+    auto slmBigWidth = rewriter.create<arith::ConstantIndexOp>(loc, slmBigWidthValue);
 
-    auto flatOffset = rewriter.create<arith::AddIOp>(loc, res, r2).getResult();
-    SmallVector<Value> initialFlat(32, flatOffset);
-    auto wt = VectorType::get({static_cast<int64_t>(32)}, rewriter.getIndexType());
-    auto initialOffs = rewriter.create<vector::FromElementsOp>(loc, wt, initialFlat).getResult();
+    auto slmOffAdd0 = rewriter.create<arith::MulIOp>(loc, xIntOffs, slmBigWidth).getResult();
+    slmOffset = rewriter.create<arith::AddIOp>(loc, slmOffAdd0, yIntOffs).getResult();
 
-    SmallVector<int64_t> offShifts;
-    for (size_t i = 0; i < 32; i++) {
-      offShifts.push_back(i);
-    }
-    mlir::DenseElementsAttr denseAttr = mlir::DenseIntElementsAttr::get(wt, offShifts);
-    arith::ConstantOp offset = rewriter.create<mlir::arith::ConstantOp>(loc, wt, denseAttr);
-
-
-    initialOffsets = rewriter.create<arith::AddIOp>(loc, initialOffs, offset).getResult();
-
-    // SmallVector<Value> initialOff;
-    // for (size_t i = 0; i < 32; i++) {
-    //   auto mmm = rewriter.create<arith::ConstantIndexOp>(loc, i).getResult();
-    //   auto ww = rewriter.create<arith::AddIOp>(loc, flatOffset, mmm).getResult();
-    //   initialOff.push_back(ww);
-    // }
-
-
-    // initialOffsets = rewriter.create<vector::FromElementsOp>(loc, wt, initialOff).getResult();
-    // initialOffsets = rewriter.create<arith::ConstantIndexOp>(loc, xo * srcShape[1] + yo);
-    // offset = reinterp.getOffsets()[0];
-    src = subvw.getOperand(0);
+    memrefStrides = {slmBigWidthValue, 1};
+    src = subView.getOperand(0);
+  } else {
+    // If the source is not a subview, then the slm_offset is 0
+    slmOffset = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    memrefStrides = {srcShapeOrig[1], 1};
   }
 
-  // Assume `src` is a 2D memref
-  auto srcType = src.getType().cast<MemRefType>();
-  assert(srcType.getRank() == 2 && "Expected a 2D memref");
+  src = flattenMemref(rewriter, loc, src);
+
+  return createScatterDescriptorTiles(rewriter, loc, /*flatMemref=*/src, /*loadShape2D=*/loadShape,
+                               /*descTile2D=*/descTile, /*memrefStrides=*/memrefStrides,
+                               /*slmBlockOffset=*/slmOffset);
+}
+
+static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
+                                               Location loc, Value src,
+                                               ArrayRef<int64_t> loadShape,
+                                               bool isVnni,
+                                               bool transpose = false, int64_t rowTiles=-1) {
+  assert(loadShape.size() <= 2 &&
+         "Require at most 2D tile size for eltwise lowering");
+  
+  auto srcTypeOrig = src.getType().cast<MemRefType>();
+  assert(srcTypeOrig.getRank() == 2 && "Expected a 2D memref");
+  auto elemByteWidth = srcTypeOrig.getElementType().getIntOrFloatBitWidth() / 8;
   
   // Get the shape of the original 2D memref
-  ArrayRef<int64_t> srcShape = srcType.getShape();
+  ArrayRef<int64_t> srcShapeOrig = srcTypeOrig.getShape();
 
   // Flatten the 2D memref to 1D
-  int64_t flatSize = srcShape[0] * srcShape[1];
+  int64_t origFlatSize = srcShapeOrig[0] * srcShapeOrig[1];
 
-  // Create the reinterpret_cast parameters: 
-  // Offset is 0, Size is the total number of elements, Stride is 1
+  auto origSrc = src;
+  Value initialOffsets;
 
+  int64_t maxHeight = rowTiles == -1 ? 32 : rowTiles;
+  int64_t maxWidth = 64 / elemByteWidth;
 
-  Value offset = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-  Value size = rewriter.create<arith::ConstantIndexOp>(loc, flatSize);
-  Value stride = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+  int64_t sgLoadRows = std::min(loadShape[0], maxHeight);
+  int64_t sgLoadCols = std::min(loadShape[1], maxWidth);
 
-
-
-  // Use memref.reinterpret_cast to flatten the memref
-  auto flatMemRefType = MemRefType::get({flatSize}, srcType.getElementType(), nullptr, srcType.getMemorySpace());
-  src = rewriter.create<memref::ReinterpretCastOp>(
-      loc, flatMemRefType, src, offset, size, stride).getResult();
-
-  // Ensure that load is 2D.
-  // TODO: Add support for 1D loads.
-  SmallVector<int64_t, 2> sgTile2D{sgTile};
-  if (sgTile.size() == 1)
-    sgTile2D.push_back(1);
-
-  int64_t maxLoadSize = 32;
-  int64_t sgLoadElems = std::min(maxLoadSize, origFlatSize);
-  int64_t arrayLength = 1;
-  // NOLINTEND
-
-  SmallVector<int64_t> offsets;
-  for (size_t i = 0; i < sgLoadElems; i += chunkSize) {
-    offsets.push_back(i);
-  }
-
-
-
-  return createScatterDescriptorTiles(rewriter, loc, src, sgTile2D, offsets,
-                               {sgLoadElems}, arrayLength,
-                               transpose, initialOffsets);
+  return createSLMDescTiles(rewriter, loc, /*flatMemref=*/src, /*loadShape2D=*/loadShape,
+                               /*descTile2D=*/{sgLoadRows, sgLoadCols});
 }
 
 static SmallVector<Value> createCoarseDscTiles(PatternRewriter &rewriter,
@@ -1421,7 +1487,8 @@ static LogicalResult createDPASKernel(linalg::LinalgOp linalgOp,
   SmallVector<Value> tilesC;
   
   if (hasSharedMemSpace(matC))
-    tilesC = createCoarseDscTiles(rewriter, loc, matC, typeC.getShape(), /*isVnni=*/true);
+    tilesC = createSLMDescTiles(rewriter, loc, matC, typeC.getShape(), dpasTypeC.getShape());
+    // tilesC = createCoarseDscTiles(rewriter, loc, matC, typeC.getShape(), /*isVnni=*/true);
   else
     tilesC = createDescriptorTiles(
        rewriter, loc, matC, typeC.getShape(), {0, 0}, dpasTypeC.getShape());
@@ -1819,7 +1886,8 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
 
   SmallVector<Value> outputTiles;
   if (hasSharedMemSpace(output))
-    outputTiles = createCoarseDscTiles(rewriter, loc, output, outputShape, /*isVnni=*/false);
+    outputTiles = createSLMDescTiles(rewriter, loc, output, outputShape, {subTileRows, subTileCols});
+    // outputTiles = createCoarseDscTiles(rewriter, loc, output, outputShape, /*isVnni=*/false);
   else
     outputTiles = createNdDescriptorTiles(
        rewriter, loc, output, outputShape, {0, 0}, {subTileRows, subTileCols});
