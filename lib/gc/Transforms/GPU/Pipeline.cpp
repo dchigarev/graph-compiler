@@ -62,14 +62,16 @@ void populateGPUPipeline(OpPassManager &pm,
   pm.addPass(createBufferizationToMemRefPass());
 
   pm.addNestedPass<func::FuncOp>(createForallToParallelLoopPass());
+  pm.addNestedPass<func::FuncOp>(createGpuMapParallelLoopsPass());
+  pm.addNestedPass<func::FuncOp>(createParallelLoopToGpuPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addNestedPass<func::FuncOp>(createAllocsToSLM());
   pm.addNestedPass<func::FuncOp>(createLinalgToXeGPU(
       {/*kTile=*/16, /*stages=*/1, /*dpasTiles=*/{8, 16, 16}}));
 
   pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
   pm.addPass(xegpu::createXeGPUFoldAliasOps());
   pm.addPass(memref::createFoldMemRefAliasOpsPass());
-  pm.addNestedPass<func::FuncOp>(createGpuMapParallelLoopsPass());
-  pm.addNestedPass<func::FuncOp>(createParallelLoopToGpuPass());
 
   imex::InsertGPUAllocsOptions insertGPUAllocsOption{
       /*clientAPI*/ "opencl", /*inRegions*/ false,
@@ -77,7 +79,7 @@ void populateGPUPipeline(OpPassManager &pm,
   pm.addNestedPass<func::FuncOp>(
       imex::createInsertGPUAllocsPass(insertGPUAllocsOption));
   pm.addPass(createGpuKernelOutliningPass());
-  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createHackyMaskPass());
   pm.addPass(imex::createSetSPIRVCapabilitiesPass());
   pm.addNestedPass<gpu::GPUModuleOp>(
       imex::createSetSPIRVAbiAttributePass("opencl"));
