@@ -793,11 +793,30 @@ createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value flat
   llvm::dbgs() << "tiles.size() " << tiles.size() << "\n";
   llvm::dbgs() << "numColTiles " << numColTiles << "\n";
   llvm::dbgs() << "numRowTiles " << numRowTiles << "\n";
-  for (int i = 0; i < numRowTiles; i++) {
-    for (int j = 0; j < numColTiles; j++) {
-      transposedTiles.push_back(tiles[i + j * numRowTiles]);
+  // for (int group = 0; group < numColTiles ; group++) {
+  //   for (int k = 0; k < numRowTiles / numLoadsPerTile; k++) {
+  //     for (int loadOffset = 0; loadOffset < numLoadsPerTile; loadOffset++) {
+  //       transposedTiles.push_back(tiles[group * numRowTiles + k * numLoadsPerTile + loadOffset]);
+  //       llvm::dbgs() << "IDX " << group * numRowTiles + k * numLoadsPerTile + loadOffset << "\n";
+  //     }
+  //   }
+  // }
+
+  for (int rowTile = 0; rowTile < numRowTiles; rowTile+=numLoadsPerTile) {
+    for (int colTile = 0; colTile < numColTiles; colTile++) {
+      for (int loadOffset = 0; loadOffset < numLoadsPerTile; loadOffset++) {
+        int newIdx = rowTile + colTile * numRowTiles + loadOffset;
+        transposedTiles.push_back(tiles[newIdx]);
+        // llvm::dbgs() << "IDX " << newIdx << "\n";
+      }
     }
   }
+
+  // for (int i = 0; i < numRowTiles; i++) {
+  //   for (int j = 0; j < numColTiles; j++) {
+  //     transposedTiles.push_back(tiles[i * numColTiles + j]);
+  //   }
+  // }
   llvm::dbgs() << "transposed.size() " << transposedTiles.size() << "\n";
   return transposedTiles;
 

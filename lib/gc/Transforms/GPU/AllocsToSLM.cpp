@@ -81,6 +81,7 @@ struct ConvertAlloc : public OpRewritePattern<memref::AllocOp> {
     int64_t zI = zSz.value();
 
     if (zI != 1) {
+      assert(false && "Only support 2D shared memory for now");
       return rewriter.notifyMatchFailure(
           allocOp, "Only support 2D shared memory for now");
     }
