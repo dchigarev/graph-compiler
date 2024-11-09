@@ -31,7 +31,7 @@ namespace mlir::gc {
 bool getBoolFromEnv(const std::string &envVarName) {
     const char* envValue = std::getenv(envVarName.c_str());
     if (envValue == nullptr) {
-        return false;  // Default to false if the variable is not set
+        return true;  // Default to false if the variable is not set
     }
 
     std::string valueStr(envValue);
