@@ -109,6 +109,13 @@ def AllocsToSLM : Pass<"allocs-to-slm", "func::FuncOp"> {
   ];
 }
 
+def HackyMaskPass : Pass<"hacky-mask-pass", "ModuleOp"> {
+  let summary = "Add a context argument.";
+  let description = [{
+    Add a new memref argument to the function, that could be used to pass some context.
+  }];
+}
+
 def GpuToGpuOcl : Pass<"gpu-to-gpuocl", "ModuleOp"> {
   let summary = "Convert the GPU operations to GpuOclRuntime calls.";
   let description = [{

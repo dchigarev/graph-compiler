@@ -62,22 +62,108 @@ struct ConvertAlloc : public OpRewritePattern<memref::AllocOp> {
                                          "Only support allocs in GPU regions");
     }
 
+
+    auto launchOp = allocOp->getParentOfType<gpu::LaunchOp>();
+    // launchOp.getBlockSizeX().dump();
+    // Value vl = launchOp.getBlockSizeX();
+    // dyn_cast<arith::ConstantIndexOp>(vl.getDefiningOp()).value()
+    auto xSz = dyn_cast<arith::ConstantIndexOp>(launchOp.getBlockSizeX().getDefiningOp());
+    auto ySz = dyn_cast<arith::ConstantIndexOp>(launchOp.getBlockSizeY().getDefiningOp());
+    auto zSz = dyn_cast<arith::ConstantIndexOp>(launchOp.getBlockSizeZ().getDefiningOp());
+
+    if (!xSz || !ySz || !zSz) {
+      return rewriter.notifyMatchFailure(
+          allocOp, "Only support constant block sizes for now");
+    }
+
+    int64_t xI = xSz.value();
+    int64_t yI = ySz.value();
+    int64_t zI = zSz.value();
+
+    if (zI != 1) {
+      assert(false && "Only support 2D shared memory for now");
+      return rewriter.notifyMatchFailure(
+          allocOp, "Only support 2D shared memory for now");
+    }
+
+    int64_t totalWorkGroupSize = xI * yI * zI;
+    // // launchOp.getBlockSizeY().dump();
+    // // launchOp.getBlockSizeZ().dump();
+    // // launchOp.getGridSizeX().dump();
+    // // launchOp.getGridSizeY().dump();
+    // // launchOp.getGridSizeZ().dump();
+    // // launchOp.getClusterSizeX().dump();
+    // // launchOp.getClusterSizeY().dump();
+    // // launchOp.getClusterSizeZ().dump();
+
+
     Value memref = allocOp->getResult(0);
+
+    for (auto user : memref.getUsers()) {
+      user->dump();
+      if (auto deallocOp = dyn_cast<memref::DeallocOp>(user)) {
+        deallocOp->erase();
+      }
+    }
+
+
     MemRefType originalMemRefType = cast<MemRefType>(memref.getType());
+
+    int64_t newX = originalMemRefType.getShape()[0] * xI;
+    int64_t newY = originalMemRefType.getShape()[1] * yI;
+
+    SmallVector<int64_t> newShape = {newX, newY};
 
     IntegerAttr sharedAddressSpace =
         IntegerAttr::get(rewriter.getIntegerType(64),
                          static_cast<int64_t>(gpu::AddressSpace::Private));
 
     // Create a new MemRefType with the desired address space
-    MemRefType newMemRefType = MemRefType::get(
+    MemRefType newRootMemRefType = MemRefType::get(
+        newShape, originalMemRefType.getElementType(),
+        originalMemRefType.getLayout(), sharedAddressSpace);
+
+    Value newRootMemRef = rewriter.create<memref::AllocOp>(
+        allocOp.getLoc(), newRootMemRefType, allocOp.getOperands()).getResult();
+    
+    auto oneConst = rewriter.create<arith::ConstantIndexOp>(allocOp.getLoc(), 1);
+    auto origXConst = rewriter.create<arith::ConstantIndexOp>(allocOp.getLoc(), originalMemRefType.getShape()[0]);
+    auto origYConst = rewriter.create<arith::ConstantIndexOp>(allocOp.getLoc(), originalMemRefType.getShape()[1]);
+
+    auto threadIds = launchOp.getThreadIds();
+
+    auto offX = rewriter.create<arith::MulIOp>(allocOp.getLoc(), threadIds.x, origXConst).getResult();
+    auto offY = rewriter.create<arith::MulIOp>(allocOp.getLoc(), threadIds.y, origYConst).getResult();
+
+
+    // SmallVector<Value> offsets({offX, offY}); /*[thread_x_idx * origMemrefX, thread_y_idx * origMemrefY] */
+    // auto sizes = originalMemRefType.getShape();/*[16, 16] -> origMemrefX, origMemrefY*/
+    // SmallVector<Value> strides({oneConst, oneConst}); /*[1, 1]*/
+
+    auto offsets = getMixedValues({ShapedType::kDynamic, ShapedType::kDynamic}, {offX, offY}, rewriter);
+    auto sizes = getMixedValues(originalMemRefType.getShape(), {}, rewriter);
+    auto strides = getMixedValues({1, 1}, {}, rewriter);
+
+    MemRefType slicedMemrefType = MemRefType::get(
         originalMemRefType.getShape(), originalMemRefType.getElementType(),
         originalMemRefType.getLayout(), sharedAddressSpace);
 
-    Value newMemRef = rewriter.create<memref::AllocOp>(
-        allocOp.getLoc(), newMemRefType, allocOp.getOperands());
+    auto newSlice = rewriter.create<memref::SubViewOp>(
+        allocOp.getLoc(), newRootMemRef, offsets, sizes, strides).getResult();
+// Value source, ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes, ArrayRef<OpFoldResult> strides
+    memref.replaceAllUsesWith(newSlice);
 
-    memref.replaceAllUsesWith(newMemRef);
+    // for (auto user : memref.getUsers()) {
+    //   if (auto deallocOp = dyn_cast<memref::DeallocOp>(user)) {
+    //     deallocOp->erase();
+    //   }
+    // }
+
+    // for (auto user : newRootMemRef.getUsers()) {
+    //   if (auto deallocOp = dyn_cast<memref::DeallocOp>(user)) {
+    //     deallocOp->erase();
+    //   }
+    // }
 
     return success();
   }
