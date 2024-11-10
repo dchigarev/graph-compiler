@@ -881,6 +881,21 @@ createDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
                                  descTile, arrayLength, transpose);
 }
 
+SmallVector<int64_t> determine2DTileSize(ArrayRef<int64_t> totalShape, bool isVnni, int64_t elemByteWidth, int64_t rowTiles=-1) {
+  // TODO: Fetch actual list of supported load configs.
+  int64_t maxHeight = rowTiles == -1 ? 32 : rowTiles;
+  int64_t maxWidth = 64 / elemByteWidth;
+  // Assumes VNNI-factor 2.
+  // TODO: Make the VNNI-factor flexible.
+  if (isVnni)
+    maxWidth /= 2;
+
+  int64_t sgLoadRows = std::min(totalShape[0], maxHeight);
+  int64_t sgLoadCols = std::min(totalShape[1], maxWidth);
+  
+  return SmallVector<int64_t>{sgLoadRows, sgLoadCols};
+}
+
 // Create coarse sub-tiles to be loaded by the current subgroup.
 //
 // The shape to be loaded is split into the largest 2D loads supported
@@ -904,29 +919,14 @@ static SmallVector<Value> createCoarseNdDscTiles(PatternRewriter &rewriter,
 
   auto type = cast<ShapedType>(src.getType());
   auto elemByteWidth = type.getElementType().getIntOrFloatBitWidth() / 8;
-
-  // TODO: Fetch actual list of supported load configs.
-  int64_t maxHeight = rowTiles == -1 ? 32 : rowTiles;
-  int64_t maxWidth = 64 / elemByteWidth;
-  // Assumes VNNI-factor 2.
-  // TODO: Make the VNNI-factor flexible.
-  if (isVnni)
-    maxWidth /= 2;
-  int64_t maxArrayLength = 4;
-  int64_t sgLoadRows = std::min(sgTile2D[0], maxHeight);
-  int64_t sgLoadCols = std::min(sgTile2D[1], maxWidth);
-  int64_t arrayLength = std::min(maxWidth / sgLoadCols, maxArrayLength);
-  // In case of partial fit, load only single tile.
-  // NOLINTBEGIN
-  if (maxWidth % sgLoadCols != 0 || arrayLength != 4 || arrayLength != 2)
-    arrayLength = 1;
+  auto tileSize = determine2DTileSize(sgTile, isVnni, elemByteWidth, rowTiles);
 
   // TODO: Add variable array_length support.
-  arrayLength = 1;
+  int64_t arrayLength = 1;
   // NOLINTEND
 
   return createNdDescriptorTiles(rewriter, loc, src, sgTile2D, {0, 0},
-                               {sgLoadRows, sgLoadCols}, arrayLength,
+                               tileSize, arrayLength,
                                transpose);
 }
 
@@ -1148,7 +1148,7 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
     int64_t totalLoadCh = std::min(totalChunkSize, totalLoad - rowChunk * elementsPerLoad);
     mlir::VectorType flatChunkType = mlir::VectorType::get({totalLoadCh}, tileType.getElementType());
     mlir::VectorType NdChunkType = mlir::VectorType::get({totalLoadCh / 32, 32}, tileType.getElementType());
-    auto zeroAttr = DenseElementsAttr::get(flatChunkType, rewriter.getF16FloatAttr(0.0));
+    auto zeroAttr = DenseElementsAttr::get(flatChunkType, tileType.getElementTypeBitWidth() == 16 ? rewriter.getF16FloatAttr(0.0) : rewriter.getF32FloatAttr(0.0));
     Value tmp = rewriter.create<arith::ConstantOp>(loadTiles[0].getLoc(), flatChunkType, zeroAttr);
 
     Value loadAccumulator = rewriter.create<vector::ShapeCastOp>(loc, NdChunkType, tmp);
@@ -1839,7 +1839,9 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
   auto ctx = linalgOp.getContext();
 
   auto output = linalgOp.getDpsInits()[0];
-  auto outputShape = cast<ShapedType>(output.getType()).getShape();
+  auto outputType = cast<ShapedType>(output.getType());
+  auto outputShape = outputType.getShape();
+  auto outputBitWidth = outputType.getElementTypeBitWidth();
 
   // Create descriptors and load values for all inputs.
   SmallVector<SmallVector<Value>> loadedInputs;
@@ -1848,7 +1850,7 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
         rewriter, loc, input, outputShape, /*isVnni=*/false);
     SmallVector<Value> loadedVals =
         loadDescTiles(rewriter, loc, inputTiles, /*hint=*/nullptr, /*vnniConf=*/std::nullopt,
-                     /*transpose=*/nullptr, /*transpose_bit=*/nullptr, outputShape);
+                     /*transpose=*/nullptr, /*transpose_bit=*/nullptr, determine2DTileSize(outputShape, /*isVnni=*/false, outputBitWidth));
     for (auto v : loadedVals) {
       v.dump();
     }
