@@ -1841,16 +1841,17 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
   auto output = linalgOp.getDpsInits()[0];
   auto outputType = cast<ShapedType>(output.getType());
   auto outputShape = outputType.getShape();
-  auto outputBitWidth = outputType.getElementTypeBitWidth();
+  auto outputByteWidth = outputType.getElementTypeBitWidth() / 8;
 
   // Create descriptors and load values for all inputs.
   SmallVector<SmallVector<Value>> loadedInputs;
   for (auto input : linalgOp.getDpsInputs()) {
     SmallVector<Value> inputTiles = createCoarseDscTiles(
         rewriter, loc, input, outputShape, /*isVnni=*/false);
+    auto loadSh = determine2DTileSize(outputShape, /*isVnni=*/false, outputByteWidth);
     SmallVector<Value> loadedVals =
         loadDescTiles(rewriter, loc, inputTiles, /*hint=*/nullptr, /*vnniConf=*/std::nullopt,
-                     /*transpose=*/nullptr, /*transpose_bit=*/nullptr, determine2DTileSize(outputShape, /*isVnni=*/false, outputBitWidth));
+                     /*transpose=*/nullptr, /*transpose_bit=*/nullptr, loadSh);
     for (auto v : loadedVals) {
       v.dump();
     }
@@ -1877,6 +1878,7 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
   // NOLINTBEGIN
   for (auto inputTiles : loadedInputs) {
     loadShape = cast<VectorType>(inputTiles[0].getType()).getShape();
+    llvm::dbgs() << "loadShape: " << loadShape[0] << " " << loadShape[1] << "\n";
     TilesArray subTiles =
         extractVecSubTiles(rewriter, loc, inputTiles, outputShape, loadShape,
                            {subTileRows, subTileCols});
