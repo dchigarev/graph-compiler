@@ -1089,6 +1089,13 @@ loadNdDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTiles,
   return loadVec;
 }
 
+static Value createFullMask(PatternRewriter &rewriter, Location loc, int64_t size) {
+  auto maskVal = createIndexConstant(rewriter, loc, 32);
+  mlir::VectorType maskVectorType = mlir::VectorType::get({size}, rewriter.getI1Type());
+  auto res = rewriter.create<vector::CreateMaskOp>(loc, maskVectorType, SmallVector<Value>({maskVal}));
+  return res.getResult();
+}
+
 static SmallVector<Value>
 loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTiles,
                 xegpu::CachePolicyAttr hint,
@@ -1111,18 +1118,7 @@ loadScatterDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTil
   SmallVector<Value> normalizedVectors;
 
   int64_t loadSize = tileType.getShape()[0];
-  mlir::VectorType maskVectorType = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
-  // mlir::VectorType maskVectorType2 = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
-
-  llvm::SmallVector<bool> maskValues;
-  for (int i = 0; i < loadSize; i++) {
-    maskValues.push_back(true);
-  }
-  mlir::DenseElementsAttr denseMaskAttr = mlir::DenseIntElementsAttr::get(maskVectorType, maskValues);
-  auto mask = rewriter.create<mlir::arith::ConstantOp>(loadTiles[0].getLoc(), maskVectorType, denseMaskAttr);
-
-  // mask = rewriter.create<vector::ShapeCastOp>(loc, maskVectorType2, mask);
-
+  auto mask = createFullMask(rewriter, loc, loadSize);
 
   // int64_t loadCols;
   // int64_t loadRows;
@@ -1244,17 +1240,7 @@ storeScatterDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value
   SmallVector<Value> res;
   int64_t loadSize = tileType.getShape()[0];
 
-  mlir::VectorType maskType = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
-  // mlir::VectorType maskType2 = mlir::VectorType::get({loadSize}, rewriter.getI1Type());
-
-  llvm::SmallVector<bool> maskValues;
-  for (int i = 0; i < loadSize; i++) {
-    maskValues.push_back(true);
-  }
-  mlir::DenseElementsAttr maskAttr = mlir::DenseIntElementsAttr::get(maskType, maskValues);
-
-  // Create an arith.constant operation with the DenseElementsAttr
-  auto mask = rewriter.create<mlir::arith::ConstantOp>(loc, maskType, maskAttr);
+  auto mask = createFullMask(rewriter, loc, loadSize);
 
   SmallVector<Value> chunkedResults;
   for (auto v : results) {

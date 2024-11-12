@@ -79,7 +79,7 @@ void populateGPUPipeline(OpPassManager &pm,
   pm.addNestedPass<func::FuncOp>(
       imex::createInsertGPUAllocsPass(insertGPUAllocsOption));
   pm.addPass(createGpuKernelOutliningPass());
-  pm.addPass(createHackyMaskPass());
+  // pm.addPass(createHackyMaskPass());
   pm.addPass(imex::createSetSPIRVCapabilitiesPass());
   pm.addNestedPass<gpu::GPUModuleOp>(
       imex::createSetSPIRVAbiAttributePass("opencl"));
