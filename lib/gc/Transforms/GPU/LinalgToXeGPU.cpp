@@ -143,7 +143,6 @@ struct TilesArray {
   SmallVector<SmallVector<Value>> tileMatrix;
 };
 
-
 static xegpu::TensorDescType getTensorDescType(llvm::ArrayRef<int64_t> shape,
                                                mlir::Type elementType,
                                                std::optional<mlir::Attribute> sgMap = std::nullopt) {
@@ -826,76 +825,18 @@ createScatterDescriptorTiles(PatternRewriter &rewriter, Location loc, Value flat
   gcRunD(llvm::dbgs() << "tiles.size() " << tiles.size() << "\n";);
   gcRunD(llvm::dbgs() << "numColTiles " << numColTiles << "\n";);
   gcRunD(llvm::dbgs() << "numRowTiles " << numRowTiles << "\n";);
-  // for (int group = 0; group < numColTiles ; group++) {
-  //   for (int k = 0; k < numRowTiles / numLoadsPerTile; k++) {
-  //     for (int loadOffset = 0; loadOffset < numLoadsPerTile; loadOffset++) {
-  //       transposedTiles.push_back(tiles[group * numRowTiles + k * numLoadsPerTile + loadOffset]);
-  //       llvm::dbgs() << "IDX " << group * numRowTiles + k * numLoadsPerTile + loadOffset << "\n";
-  //     }
-  //   }
-  // }
 
   for (int rowTile = 0; rowTile < numRowTiles; rowTile+=numLoadsPerTile) {
     for (int colTile = 0; colTile < numColTiles; colTile++) {
       for (int loadOffset = 0; loadOffset < numLoadsPerTile; loadOffset++) {
         int newIdx = rowTile + colTile * numRowTiles + loadOffset;
         transposedTiles.push_back(tiles[newIdx]);
-        // llvm::dbgs() << "IDX " << newIdx << "\n";
       }
     }
   }
 
-  // for (int i = 0; i < numRowTiles; i++) {
-  //   for (int j = 0; j < numColTiles; j++) {
-  //     transposedTiles.push_back(tiles[i * numColTiles + j]);
-  //   }
-  // }
   gcRunD(llvm::dbgs() << "transposed.size() " << transposedTiles.size() << "\n";);
   return transposedTiles;
-
-
-  // auto type = cast<ShapedType>(src.getType());
-  // auto descType = getTensorDescType(
-  //   descTile[0], type.getElementType(), xegpu::MemorySpace::SLM,
-  //   xegpu::ScatterTensorDescAttr::get(rewriter.getContext(), xegpu::MemorySpace::SLM, chunkSize));
-
-  // // Create the root descriptor.
-  // //
-  // // It is more efficient to create remainig descriptors by only updating its
-  // // offsets compared to creating separate descriptors.
-  // // The original tile is split into contiguous sub-tiles so, the first tile
-  // // can be used as an anchor.
-  // mlir::VectorType offsetType = mlir::VectorType::get({static_cast<int64_t>(loadOffsets.size())}, rewriter.getIndexType());
-  // mlir::DenseElementsAttr denseAttr = mlir::DenseIntElementsAttr::get(offsetType, loadOffsets);
-
-  // // Create an arith.constant operation with the DenseElementsAttr
-  // arith::ConstantOp offset = rewriter.create<mlir::arith::ConstantOp>(loc, offsetType, denseAttr);
-
-  // Value initToSet = initialOffset ? initialOffset : offset.getResult();
-
-  // auto rootTile =
-  //     rewriter
-  //         .create<xegpu::CreateDescOp>(
-  //             loc, descType, dyn_cast<TypedValue<MemRefType>>(src), initToSet)
-  //         .getResult();
-
-  // SmallVector<Value> tiles;
-  // Value prevTile = rootTile;
-  // tiles.push_back(prevTile);
-  
-  // mlir::DenseElementsAttr shiftDenseAttr = mlir::DenseIntElementsAttr::get(offsetType, static_cast<int64_t>(32));
-  // auto shiftOffset = rewriter.create<mlir::arith::ConstantOp>(loc, offsetType, shiftDenseAttr).getResult();
-
-  // for (int j = descTile[0], tileIdx = 0; j < loadShape[0] * loadShape[1]; j += descTile[0], tileIdx++) {
-  //   prevTile = rewriter
-  //                   .create<xegpu::UpdateOffsetOp>(
-  //                       loc, prevTile.getType(), prevTile,
-  //                       /*offsets=*/shiftOffset)
-  //                   .getResult();
-  //   tiles.push_back(prevTile);
-  // }
-
-  // return tiles;
 }
 
 
@@ -963,9 +904,9 @@ createDescriptorTiles(PatternRewriter &rewriter, Location loc, Value src,
                                  descTile, arrayLength, transpose);
 }
 
-SmallVector<int64_t> determine2DTileSize(ArrayRef<int64_t> totalShape, bool isVnni, int64_t elemByteWidth, int64_t rowTiles=-1) {
+SmallVector<int64_t> determine2DTileSize(ArrayRef<int64_t> totalShape, bool isVnni, int64_t elemByteWidth) {
   // TODO: Fetch actual list of supported load configs.
-  int64_t maxHeight = rowTiles == -1 ? 32 : rowTiles;
+  int64_t maxHeight = 32;
   int64_t maxWidth = 64 / elemByteWidth;
   // Assumes VNNI-factor 2.
   // TODO: Make the VNNI-factor flexible.
@@ -985,73 +926,15 @@ SmallVector<int64_t> determine2DTileSize(ArrayRef<int64_t> totalShape, bool isVn
 //
 // The load subgroup tiles are ordered in row-major fashion with respect to the
 // source shape.
-static SmallVector<Value> createCoarseNdDscTiles(PatternRewriter &rewriter,
-                                               Location loc, Value src,
-                                               ArrayRef<int64_t> sgTile,
-                                               bool isVnni,
-                                               bool transpose = false, int64_t rowTiles=-1) {
-  assert(sgTile.size() <= 2 &&
-         "Require at most 2D tile size for eltwise lowering");
-
-  // Ensure that load is 2D.
-  // TODO: Add support for 1D loads.
-  SmallVector<int64_t, 2> sgTile2D{sgTile};
-  if (sgTile.size() == 1)
-    sgTile2D.push_back(1);
-
-  auto type = cast<ShapedType>(src.getType());
-  auto elemByteWidth = type.getElementType().getIntOrFloatBitWidth() / 8;
-  auto tileSize = determine2DTileSize(sgTile, isVnni, elemByteWidth, rowTiles);
-
-  // TODO: Add variable array_length support.
-  int64_t arrayLength = 1;
-  // NOLINTEND
-
-  return createNdDescriptorTiles(rewriter, loc, src, sgTile2D, {0, 0},
-                               tileSize, arrayLength,
-                               transpose);
-}
-
-static SmallVector<Value> createCoarseScatterDscTiles(PatternRewriter &rewriter,
-                                               Location loc, Value src,
-                                               ArrayRef<int64_t> loadShape,
-                                               bool isVnni,
-                                               bool transpose = false, int64_t rowTiles=-1) {
-  assert(loadShape.size() <= 2 &&
-         "Require at most 2D tile size for eltwise lowering");
-  
-  auto srcTypeOrig = src.getType().cast<MemRefType>();
-  assert(srcTypeOrig.getRank() == 2 && "Expected a 2D memref");
-  auto elemByteWidth = srcTypeOrig.getElementType().getIntOrFloatBitWidth() / 8;
-  
-  // Get the shape of the original 2D memref
-  ArrayRef<int64_t> srcShapeOrig = srcTypeOrig.getShape();
-
-  // Flatten the 2D memref to 1D
-  int64_t origFlatSize = srcShapeOrig[0] * srcShapeOrig[1];
-
-  auto origSrc = src;
-  Value initialOffsets;
-
-  int64_t maxHeight = rowTiles == -1 ? 32 : rowTiles;
-  int64_t maxWidth = 64 / elemByteWidth;
-
-  int64_t sgLoadRows = std::min(loadShape[0], maxHeight);
-  int64_t sgLoadCols = std::min(loadShape[1], maxWidth);
-
-  return createSLMDescTiles(rewriter, loc, /*flatMemref=*/src, /*loadShape2D=*/loadShape,
-                               /*descTile2D=*/{sgLoadRows, sgLoadCols});
-}
-
 static std::tuple<SmallVector<Value>, SmallVector<int64_t>> createCoarseDscTiles(PatternRewriter &rewriter,
                                                Location loc, Value src,
                                                ArrayRef<int64_t> sgTile,
                                                bool isVnni,
-                                               bool transpose = false, int64_t rowTiles=-1) {
+                                               bool transpose = false) {
   auto type = cast<ShapedType>(src.getType());
   auto elemByteWidth = type.getElementType().getIntOrFloatBitWidth() / 8;
 
-  auto tileSize = determine2DTileSize(sgTile, isVnni, /*elementByteWidth=*/elemByteWidth, rowTiles);
+  auto tileSize = determine2DTileSize(sgTile, isVnni, /*elementByteWidth=*/elemByteWidth);
   auto descriptors = createDescriptorTiles(
     rewriter, loc, src, sgTile, tileSize, std::nullopt, /*array_length=*/1, transpose
   );
@@ -1860,15 +1743,9 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
   SmallVector<SmallVector<Value>> vecSubTiles;
   // NOLINTBEGIN
   for (auto inputTiles : loadedInputs) {
-    loadShape = cast<VectorType>(inputTiles[0].getType()).getShape();
-    gcRunD(llvm::dbgs() << "loadShape: " << loadShape[0] << " " << loadShape[1] << "\n";);
     TilesArray subTiles =
         extractVecSubTiles(rewriter, loc, inputTiles, outputShape, loadShape,
                            {subTileRows, subTileCols});
-    gcRunD(llvm::dbgs() << "Input extra sub-tiles:\n";);
-    gcRunD(for (auto v : inputTiles) { v.dump(); });
-    gcRunD(llvm::dbgs() << "Output extra sub-tiles:\n";);
-    gcRunD(for (auto v : subTiles.toFlatVector()) { v.dump(); });
     vecSubTiles.push_back(subTiles.toFlatVector());
   }
   // NOLINTEND
@@ -1890,8 +1767,8 @@ LogicalResult createEltwiseKernel(linalg::LinalgOp linalgOp,
     results.push_back(*res);
   }
 
-  SmallVector<Value> outputTiles;
-  outputTiles = createDescriptorTiles(
+  // Output descriptors for later stores.
+  SmallVector<Value> outputTiles = createDescriptorTiles(
       rewriter, loc, output, outputShape, {subTileRows, subTileCols});
 
   // Store results.
@@ -2045,11 +1922,7 @@ LogicalResult createMemoryFillKernel(linalg::LinalgOp linalgOp,
   int64_t subTileRows =
       std::min(outputShape[0], std::max(maxSizeSIMD / subTileCols, 1L));
 
-  SmallVector<Value> outputTiles;
-  // if (hasSharedMemSpace(output))
-  //   outputTiles = createCoarseDscTiles(rewriter, loc, output, outputShape, /*isVnni=*/false);
-  // else
-  outputTiles = createDescriptorTiles(
+  SmallVector<Value> outputTiles = createDescriptorTiles(
     rewriter, loc, output, outputShape, {subTileRows, subTileCols});
 
   SmallVector<Value> results;
@@ -2073,13 +1946,6 @@ LogicalResult createMemoryFillKernel(linalg::LinalgOp linalgOp,
       xegpu::CachePolicyAttr::get(ctx, xegpu::CachePolicy::WRITE_BACK);
   
   storeDescTiles(rewriter, loc, results, outputTiles, writeCacheHint);
-
-  // for (size_t i = 0; i < outputTiles.size(); i++) {
-  //   rewriter.create<xegpu::StoreNdOp>(loc, results[i], outputTiles[i],
-  //                                     /*l1_hint=*/writeCacheHint,
-  //                                     /*l2_hint=*/writeCacheHint,
-  //                                     /*l3_hint=*/writeCacheHint);
-  // }
 
   rewriter.eraseOp(linalgOp);
 
