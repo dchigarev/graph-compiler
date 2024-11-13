@@ -1088,67 +1088,59 @@ loadDescTiles(PatternRewriter &rewriter, Location loc, ValueRange loadTiles,
   return loadNdDescTiles(rewriter, loc, loadTiles, hint, resultShape, vnniConf, transpose, transpose_bit);
 }
 
-static SmallVector<Value>
+static void
 storeNdDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value> results, ValueRange loadTiles,
                 xegpu::CachePolicyAttr hint) {
-  SmallVector<Value> res;
   for (size_t i = 0; i < loadTiles.size(); i++) {
-    auto val = rewriter.create<xegpu::StoreNdOp>(loc, results[i], loadTiles[i],
+    rewriter.create<xegpu::StoreNdOp>(loc, results[i], loadTiles[i],
                                       /*l1_hint=*/hint,
                                       /*l2_hint=*/hint,
                                       /*l3_hint=*/hint);
   }
-  return res;
 }
 
-static SmallVector<Value>
+static void
 storeScatterDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value> results, ValueRange loadTiles,
                 xegpu::CachePolicyAttr hint) {
+  int64_t elementsPerStore = 32;
+
   auto tileType = cast<xegpu::TensorDescType>(loadTiles[0].getType());
   assert(llvm::all_of(loadTiles,
                       [&](Value tile) { return tile.getType() == tileType; }) &&
          "All load tiles must have the same type.");
+  assert(tileType.getShape().size() == 1 && "Scatter tiles must be 1D");
+  assert(tileType.getShape()[0] == elementsPerStore && "Scatter tiles must have 32 elements");
 
-  VectorType vecStoreType =
-      VectorType::get({tileType.getShape()[0]}, tileType.getElementType());
+  auto mask = createFullMask(rewriter, loc, elementsPerStore);
+  int64_t descIdx = 0;
 
+  for (auto vec : results) {
+    auto vecType = dyn_cast<VectorType>(vec.getType());
+    auto vecShape = vecType.getShape();
+    assert(vecShape.size() == 2 && "Expected 2D vector");
+    assert(vecShape[0] * vecShape[1] % elementsPerStore == 0 && "Vector shape must be divisible by load size");
 
-  SmallVector<Value> res;
-  int64_t loadSize = tileType.getShape()[0];
-
-  auto mask = createFullMask(rewriter, loc, loadSize);
-
-  SmallVector<Value> chunkedResults;
-  for (auto v : results) {
-    auto resType = cast<VectorType>(v.getType());
-    auto shape = resType.getShape();
-    if (shape.size() == 1) {
-      assert(shape[0] == 32);
-      chunkedResults.push_back(v);
-      continue;
-    }
-    if (shape[1] != 32) {
-      v = rewriter.create<vector::ShapeCastOp>(loc, VectorType::get({(shape[0] * shape[1]) / 32, 32}, resType.getElementType()), v);
-      shape = cast<VectorType>(v.getType()).getShape();
-    }
-    for (int i = 0; i < shape[0]; i++) {
-      auto slice = rewriter.create<vector::ExtractOp>(loc, v, i);
-      chunkedResults.push_back(slice);
-    }
-  }
-
-  assert(chunkedResults.size() == loadTiles.size());
-
-  for (size_t i = 0; i < loadTiles.size(); i++) {
-    auto val = rewriter.create<xegpu::StoreScatterOp>(loc, chunkedResults[i], loadTiles[i],
+    // flatVec = flatten(vec)
+    auto flatVec = rewriter.create<vector::ShapeCastOp>(loc, VectorType::get({vecShape[0] * vecShape[1]}, vecType.getElementType()), vec);
+    for (int64_t loadChunkIdx = 0; loadChunkIdx < vecShape[0] * vecShape[1]; loadChunkIdx += elementsPerStore) {
+      // flatChunk = flatVec.extract(idx=loadChunkIdx, size=32)
+      // store(flatChunk, loadTiles[descIdx])
+      auto toStore = rewriter.create<vector::ExtractStridedSliceOp>(
+              loc, flatVec, /*offsets=*/SmallVector<int64_t>({loadChunkIdx}),
+              /*sizes=*/SmallVector<int64_t>({elementsPerStore}),
+              /*strides=*/SmallVector<int64_t>({1}));
+      rewriter.create<xegpu::StoreScatterOp>(loc, toStore, loadTiles[descIdx],
                                       /*mask=*/mask,
-                                      nullptr, // /*transpose=*/mlir::UnitAttr::get(rewriter.getContext()),
-                                      nullptr, nullptr, nullptr);
+                                      /*transpose=*/nullptr,
+                                      /*l1_hint=*/hint,
+                                      /*l2_hint=*/hint,
+                                      /*l3_hint=*/hint);
+      descIdx++;
+    }
   }
-  return res;
 }
 
-static SmallVector<Value>
+static void
 storeDescTiles(PatternRewriter &rewriter, Location loc, SmallVector<Value> results, ValueRange loadTiles,
                 xegpu::CachePolicyAttr hint) {
   auto tens = dyn_cast<xegpu::TensorDescType>(loadTiles[0].getType());
