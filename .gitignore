@@ -2,5 +2,6 @@
 !.github/
 build/
 externals/
+python/graph_compiler.egg-info/
 compile_commands.json
 __pycache__
