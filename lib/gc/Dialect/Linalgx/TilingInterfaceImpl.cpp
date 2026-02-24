@@ -152,13 +152,29 @@ SmallVector<Range> AttentionOp::getIterationDomain(OpBuilder &b) {
   SmallVector<Value> shapedValues = {getQuery(), getKey(), getValue()};
   SmallVector<AffineMap> indexingMaps = {getQueryMap(), getKeyMap(),
                                          getValueMap()};
-  return getAttentionIterationDomain(getLoc(), b, getIterationDomainRank(),
+  auto res = getAttentionIterationDomain(getLoc(), b, getIterationDomainRank(),
                                      shapedValues, indexingMaps);
+  llvm::dbgs() << "AttentionOp iteration domain: " << "\n";
+  for (auto [i, bound] : llvm::enumerate(res)) {
+    llvm::dbgs() << "  Dim " << i << ": offset=" << bound.offset
+                 << ", size=" << bound.size << ", stride=" << bound.stride
+                 << "\n";
+  }
+  llvm::dbgs() << "indexing maps: " << getQueryMap() << ", " << getKeyMap() << ", "
+               << getValueMap() << ", " << getOutputMap() << "\n";
+
+  return res;
 }
 
 SmallVector<utils::IteratorType> AttentionOp::getLoopIteratorTypes() {
-  return getAttentionIteratorTypes(getIterationDomainRank(), getQueryMap(),
+  auto res = getAttentionIteratorTypes(getIterationDomainRank(), getQueryMap(),
                                    getKeyMap(), getValueMap(), getOutputMap());
+  llvm::dbgs() << "AttentionOp iterator types: " << "\n";
+  for (auto [i, it] : llvm::enumerate(res)) {
+    llvm::dbgs() << "  Dim " << i << ": " << (it == utils::IteratorType::parallel ? "parallel" : "reduction") << "\n";
+  }
+
+  return res;
 }
 
 FailureOr<TilingResult>

@@ -31,10 +31,16 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "mlir/Transforms/Passes.h"
+<<<<<<< HEAD
 
 #include "gc/Dialect/Linalgx/LinalgxDialect.h"
 #include "gc/Transforms/Passes.h"
 #include "gc/Utils/Transform.h"
+=======
+#include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/TargetSelect.h"
+#include "mlir/Dialect/Transform/Transforms/Passes.h"
+>>>>>>> 11fd4a36 (debugging)
 
 namespace mlir::gc {
 
