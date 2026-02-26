@@ -80,6 +80,13 @@ def RemoveAllocs : Pass<"remove-allocs", "func::FuncOp"> {
   }];
 }
 
+def HoistForLoopTransferRead : Pass<"hoist-for-loop-transfer-read", "func::FuncOp"> {
+  let summary = "Hoist transfer read operations out of for loops.";
+  let description = [{
+    Hoist transfer read operations out of for loops to improve memory access patterns.
+  }];
+}
+
 def GpuKernelOutline : Pass<"gpu-kernel-outline", "ModuleOp"> {
   let summary = "Outline GPU kernels.";
   let description = [{

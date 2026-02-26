@@ -22,6 +22,10 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OperationSupport.h"
 
+#include "gc/Dialect/Linalgx/LinalgxOps.h"
+
+#include "llvm/ADT/ArrayRef.h"
+
 namespace mlir::gc {
 
 // ------------------- Attribute utilities ------------------ //
@@ -412,6 +416,10 @@ static inline bool isMatmulOp(Operation *op) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
   return linalgOp && linalg::isaContractionOpInterface(linalgOp);
   // TODO: Check matmul like generics
+}
+
+static inline bool isAttentionOp(Operation *op) {
+  return isa<linalgx::AttentionOp>(op);
 }
 
 } // namespace mlir::gc

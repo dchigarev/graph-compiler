@@ -47,7 +47,7 @@ struct GpuTilingAndFusion final
 
     OpRewriter rw(fn);
     tileAndFuseLinalgOps(rw, fn, /*reduction=*/false);
-    tileAndFuseLinalgOps(rw, fn, /*reduction=*/true);
+    // tileAndFuseLinalgOps(rw, fn, /*reduction=*/true);
   }
 
 private:
@@ -187,6 +187,19 @@ private:
     }
   }
 
+  static bool isTileableLoop(TilingInterface ti, utils::IteratorType itType,
+                            unsigned i, bool reduction) {
+    auto itTypes = ti.getLoopIteratorTypes();
+
+    bool base = ((itTypes[i] == utils::IteratorType::reduction) == reduction);
+    if (!base) return false;
+
+    if (!reduction && isAttentionOp(ti.getOperation()) && i == 4)
+      return false;
+
+    return true;
+  }
+
   static void getTiles(SmallVector<size_t> &tiles, OpBuilder &builder,
                        TilingInterface ti, KernelAttrs &kernelAttrs,
                        size_t wgSize, size_t &sgSize, size_t vectorWidth,
@@ -206,23 +219,27 @@ private:
     }
 
     SmallVector<size_t> sizes;
+    SmallVector<size_t> tileableDims;
     auto itTypes = ti.getLoopIteratorTypes();
     auto itDomains = ti.getIterationDomain(builder);
     size_t maxSize = 0;
     size_t numIterations = 1;
 
-    for (auto [t, r] : zip(itTypes, itDomains)) {
-      if (auto opt = getConstantIntValue(r.size)) {
-        if ((t == utils::IteratorType::reduction) == reduction) {
-          auto v = static_cast<size_t>(*opt);
-          numIterations *= v;
-          sizes.emplace_back(v);
-          maxSize = std::max(maxSize, v);
-        }
-      } else {
+    for (size_t i = 0; i < itTypes.size(); ++i) {
+      if (!isTileableLoop(ti, itTypes[i], i, reduction))
+        continue;
+      
+      auto opt = getConstantIntValue(itDomains[i].size);
+      if (!opt) {
         gcLogE("Dynamic tiles are not supported!");
         return;
       }
+
+      size_t v = (size_t)*opt;
+      numIterations *= v;
+      sizes.push_back(v);
+      tileableDims.push_back(i);
+      maxSize = std::max(maxSize, v);
     }
 
     if (reduction && isMatmulOp(ti)) {
@@ -240,7 +257,8 @@ private:
     }
 
     auto adjusted = sizes;
-    adjustTiles(totalSize, adjusted);
+    // adjustTiles(totalSize, adjusted);
+    adjustTiles(totalSize, adjusted.begin(), adjusted.end(), AdjustTilesMode::Sort);
 
     if (adjusted == sizes) {
       // Split the largest tile.
@@ -278,14 +296,8 @@ private:
       }
     }
 
-    unsigned tc = 0;
-    unsigned ac = 0;
-    for (auto t : itTypes) {
-      if ((t == utils::IteratorType::reduction) == reduction) {
-        tiles[tc++] = adjusted[ac++];
-      } else {
-        ++tc;
-      }
+    for (size_t i = 0; i < tileableDims.size(); ++i) {
+      tiles[tileableDims[i]] = adjusted[i];
     }
 
     if (!reduction && !kernelAttrs.getThreads().has_value()) {
@@ -293,7 +305,7 @@ private:
           numIterations * sgSize / vectorWidth / workPerTile / 2;
       auto itTypes = ti.getLoopIteratorTypes();
       for (unsigned i = 0; i < itTypes.size(); ++i) {
-        if (itTypes[i] == utils::IteratorType::parallel) {
+        if (itTypes[i] == utils::IteratorType::parallel && tiles[i] > 0) {
           numThreads /= tiles[i];
         }
       }

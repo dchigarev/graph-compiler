@@ -12,6 +12,7 @@ gc_add_mlir_library(GcGpuPasses
   GpuKernelOutline.cpp
   Vectorize.cpp
   RemoveAllocs.cpp
+  HoistForLoopTransferRead.cpp
   Pipeline.cpp
 
   DEPENDS
