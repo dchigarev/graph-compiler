@@ -15,7 +15,6 @@ module attributes { transform.with_named_sequence } {
 #mapV = affine_map<(batch, m, k1, k2, n) -> (batch, k2, n)>
 #mapS = affine_map<(batch, m, k1, k2, n) -> ()>
 #mapO = affine_map<(batch, m, k1, k2, n) -> (batch, m, n)>
-#mapR = affine_map<(batch, m, k1, k2, n) -> (batch, m)>
 
 func.func @attention_f16(%query: tensor<4x4096x64xf16>,
                          %key: tensor<4x4096x64xf16>,
