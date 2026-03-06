@@ -20,7 +20,7 @@ def compile():
             env.pop("PYTHONPATH")
     script_path = os.path.join(PROJ_DIR, "scripts", "compile.sh")
     print(f"Running build script: {script_path}", file=os.sys.stderr)
-    subprocess.check_call(["/bin/sh", script_path], env=env)
+    # subprocess.check_call(["/bin/sh", script_path], env=env)
 
 
 class BuildPyCommand(build_py):

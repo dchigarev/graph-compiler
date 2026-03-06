@@ -4,7 +4,7 @@ if (NOT GC_ENABLE_PYTHON_BINDINGS)
 endif()
 
 
-find_package(Python 3.9 COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(Python 3.12 COMPONENTS Interpreter Development.Module REQUIRED)
 
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir

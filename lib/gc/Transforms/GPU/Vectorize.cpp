@@ -49,6 +49,62 @@ struct VectorizationPattern : public RewritePattern {
   }
 };
 
+/// Replaces broadcast + transpose with shape_cast + broadcast.
+/// Example:
+///   %0 = vector.broadcast %src : vector<128xf32> to vector<64x128xf32>
+///   %1 = vector.transpose %0, [1, 0] : vector<64x128xf32> to vector<128x64xf32>
+/// Becomes:
+///   %0 = vector.shape_cast %src : vector<128xf32> to vector<128x1xf32>
+///   %1 = vector.broadcast %0 : vector<128x1xf32> to vector<128x64xf32>
+struct BroadcastTransposeToShapeCastBroadcast
+    : public OpRewritePattern<vector::TransposeOp> {
+  using OpRewritePattern<vector::TransposeOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::TransposeOp transposeOp,
+                                PatternRewriter &rewriter) const override {
+    // Check that the input to the transpose is a broadcast.
+    auto broadcastOp =
+        transposeOp.getVector().getDefiningOp<vector::BroadcastOp>();
+    if (!broadcastOp)
+      return failure();
+
+    // Get the source of the broadcast.
+    Value broadcastSrc = broadcastOp.getSource();
+    auto srcType = dyn_cast<VectorType>(broadcastSrc.getType());
+    if (!srcType)
+      return failure();
+
+    // We handle the case where source is 1D and broadcast result is 2D.
+    auto broadcastResultType =
+        cast<VectorType>(broadcastOp.getResult().getType());
+    auto transposeResultType =
+        cast<VectorType>(transposeOp.getResult().getType());
+
+    if (srcType.getRank() != 1 || broadcastResultType.getRank() != 2)
+      return failure();
+
+    // Check the permutation is [1, 0].
+    auto perm = transposeOp.getPermutation();
+    if (perm.size() != 2 || perm[0] != 1 || perm[1] != 0)
+      return failure();
+
+    // Source shape is [N], broadcast to [M, N], transposed to [N, M].
+    // Replace with: shape_cast [N] -> [N, 1], broadcast [N, 1] -> [N, M].
+    int64_t N = srcType.getShape()[0];
+    Type elemType = srcType.getElementType();
+
+    auto shapeCastType = VectorType::get({N, 1}, elemType);
+    Value shapeCast = rewriter.create<vector::ShapeCastOp>(
+        transposeOp.getLoc(), shapeCastType, broadcastSrc);
+
+    Value newBroadcast = rewriter.create<vector::BroadcastOp>(
+        transposeOp.getLoc(), transposeResultType, shapeCast);
+
+    rewriter.replaceOp(transposeOp, newBroadcast);
+    return success();
+  }
+};
+
 struct Vectorize final : gc::impl::VectorizeBase<Vectorize> {
 
   void runOnOperation() override {
@@ -77,6 +133,8 @@ struct Vectorize final : gc::impl::VectorizeBase<Vectorize> {
     linalg::populateDecomposePadPatterns(patterns);
 
     vector::populateVectorStepLoweringPatterns(patterns);
+
+    patterns.add<BroadcastTransposeToShapeCastBroadcast>(ctx);
 
     if (failed(applyPatternsGreedily(funcOp, std::move(patterns),
                                      GreedyRewriteConfig()))) {
