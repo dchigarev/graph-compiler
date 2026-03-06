@@ -37,6 +37,13 @@ def TileContraction : Pass<"tile-contract", "func::FuncOp"> {
   }];
 }
 
+def TileAttention : Pass<"tile-attention", "func::FuncOp"> {
+  let summary = "Tile attention operations.";
+  let description = [{
+    Tile contraction operations and fuse their producers.
+  }];
+}
+
 def TileParallel : Pass<"tile-parallel", "func::FuncOp"> {
   let summary = "Tile parallel operations.";
   let description = [{
@@ -48,6 +55,13 @@ def AddContextArg : Pass<"add-ctx-arg", "func::FuncOp"> {
   let summary = "Add a context argument.";
   let description = [{
     Add a new memref argument to the function, that could be used to pass some context.
+  }];
+}
+
+def Decomposition : Pass<"decomposition", "func::FuncOp"> {
+  let summary = "Decompose complex operations.";
+  let description = [{
+    Decompose complex operations into simpler ones for easier optimization and code generation.
   }];
 }
 

@@ -75,39 +75,41 @@ void populateGPUPipeline(OpPassManager &pm,
   phase("Tiling", [&]() {
     pm.addNestedPass<func::FuncOp>(createLinalgElementwiseOpFusionPass());
     pm.addNestedPass<func::FuncOp>(createTileContraction());
+    pm.addNestedPass<func::FuncOp>(createTileAttention());
     pm.addNestedPass<func::FuncOp>(createTileParallel());
   });
 
-  // phase("Vectorization", [&]() {
-  //   pm.addNestedPass<func::FuncOp>(createVectorize());
-  //   pm.addNestedPass<func::FuncOp>(createLoopInvariantCodeMotionPass());
-  //   pm.addNestedPass<func::FuncOp>(createLoopInvariantSubsetHoistingPass());
-  // });
+  phase("Vectorization", [&]() {
+    pm.addNestedPass<func::FuncOp>(createDecomposition());
+    pm.addNestedPass<func::FuncOp>(createVectorize());
+    pm.addNestedPass<func::FuncOp>(createLoopInvariantCodeMotionPass());
+    pm.addNestedPass<func::FuncOp>(createLoopInvariantSubsetHoistingPass());
+  });
 
-  // // Bufferization
-  // phase("Bufferization", [&]() {
-  //   bufferization::OneShotBufferizePassOptions opts;
-  //   opts.allowReturnAllocsFromLoops = true;
-  //   opts.bufferizeFunctionBoundaries = true;
-  //   opts.functionBoundaryTypeConversion =
-  //       bufferization::LayoutMapOption::IdentityLayoutMap;
-  //   pm.addPass(bufferization::createOneShotBufferizePass(opts));
-  //   opts.allowReturnAllocsFromLoops = false;
-  //   pm.addPass(bufferization::createOneShotBufferizePass(opts));
+  // Bufferization
+  phase("Bufferization", [&]() {
+    bufferization::OneShotBufferizePassOptions opts;
+    opts.allowReturnAllocsFromLoops = true;
+    opts.bufferizeFunctionBoundaries = true;
+    opts.functionBoundaryTypeConversion =
+        bufferization::LayoutMapOption::IdentityLayoutMap;
+    pm.addPass(bufferization::createOneShotBufferizePass(opts));
+    opts.allowReturnAllocsFromLoops = false;
+    pm.addPass(bufferization::createOneShotBufferizePass(opts));
 
-  //   pm.addPass(bufferization::createEmptyTensorEliminationPass());
-  //   pm.addPass(bufferization::createEmptyTensorToAllocTensorPass());
-  //   pm.addPass(bufferization::createDropEquivalentBufferResultsPass());
-  //   pm.addPass(bufferization::createBufferResultsToOutParamsPass(
-  //       {true, true, true, true}));
-  //   pm.addPass(memref::createFoldMemRefAliasOpsPass());
-  //   pm.addNestedPass<func::FuncOp>(createRemoveAllocs());
-  // });
+    pm.addPass(bufferization::createEmptyTensorEliminationPass());
+    pm.addPass(bufferization::createEmptyTensorToAllocTensorPass());
+    pm.addPass(bufferization::createDropEquivalentBufferResultsPass());
+    pm.addPass(bufferization::createBufferResultsToOutParamsPass(
+        {true, true, true, true}));
+    pm.addPass(memref::createFoldMemRefAliasOpsPass());
+    pm.addNestedPass<func::FuncOp>(createRemoveAllocs());
+  });
 
-  // phase("KernelOutlining", [&]() {
-  //   pm.addPass(createGpuKernelOutline());
-  //   pm.addNestedPass<func::FuncOp>(createAddContextArg());
-  // });
+  phase("KernelOutlining", [&]() {
+    pm.addPass(createGpuKernelOutline());
+    pm.addNestedPass<func::FuncOp>(createAddContextArg());
+  });
 
   phase("VectorToXegpu", [&]() {
     pm.addPass(createConvertVectorToXeGPU());
