@@ -136,7 +136,7 @@ void populateGPUPipeline(OpPassManager &pm,
     opts.use64bitIndex = true;
     opts.binaryFormat = "binary";
     opts.zebinChip = deviceProps.arch;
-    opts.cmdOptions = "-ze-opt-large-register-file";
+    opts.cmdOptions = pipelineOpts.igcCmdOptions;
     opts.optLevel = 3;
     gpu::buildLowerToXeVMPassPipeline(pm, opts);
   });

@@ -44,6 +44,10 @@ struct GPUPipelineOptions : PassPipelineOptions<GPUPipelineOptions> {
       *this, "enable-attention-prefetch",
       llvm::cl::desc("Enable the SetAttentionPrefetch pass."),
       llvm::cl::init(false)};
+  Option<std::string> igcCmdOptions{
+      *this, "igc-cmd-options",
+      llvm::cl::desc("Command options to pass to IGC compiler."),
+      llvm::cl::init("")};
   const GpuDevicePropsOptions *deviceProps = nullptr;
 };
 
