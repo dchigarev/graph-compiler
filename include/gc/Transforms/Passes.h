@@ -40,6 +40,10 @@ struct GPUPipelineOptions : PassPipelineOptions<GPUPipelineOptions> {
           "Call finish() after each GPU kernel launch. This option is passed "
           "to the GpuToGpuOcl path, if use-gpu-ocl is true."),
       llvm::cl::init(false)};
+  Option<bool> enableAttentionPrefetch{
+      *this, "enable-attention-prefetch",
+      llvm::cl::desc("Enable the SetAttentionPrefetch pass."),
+      llvm::cl::init(false)};
   const GpuDevicePropsOptions *deviceProps = nullptr;
 };
 
