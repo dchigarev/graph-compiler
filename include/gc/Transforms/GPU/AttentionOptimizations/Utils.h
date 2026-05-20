@@ -14,12 +14,8 @@
 
 namespace mlir::gc::attention {
 
-// ===== Attention pattern matching ==========================================
-
 /// Collect all xegpu.dpas operations in the loop body.
 SmallVector<xegpu::DpasOp> collectDpasOps(scf::ForOp forOp);
-
-// ===== Dependency analysis =================================================
 
 /// Recursively collect all operations inside `region` that `value`
 /// transitively depends on. Returns them in topological order
@@ -30,8 +26,6 @@ void collectDepsInRegion(Value value, Region *region,
 
 /// Check if any operation in `deps` uses `value` as an operand.
 bool usesValue(const SmallVectorImpl<Operation *> &deps, Value value);
-
-// ===== Layout helpers ======================================================
 
 /// Compute sg_data = shape / sg_layout element-wise.
 /// Returns failure if any dimension is not evenly divisible.

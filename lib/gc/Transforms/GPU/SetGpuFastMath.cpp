@@ -21,8 +21,7 @@ namespace mlir::gc {
 
 namespace {
 
-struct SetGpuFastMath final
-    : gc::impl::SetGpuFastMathBase<SetGpuFastMath> {
+struct SetGpuFastMath final : gc::impl::SetGpuFastMathBase<SetGpuFastMath> {
 
   void runOnOperation() override {
     auto moduleOp = getOperation();

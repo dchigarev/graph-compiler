@@ -106,8 +106,8 @@ static LogicalResult setStoreLayout(xegpu::StoreNdOp store) {
 }
 
 // Set layout on a LoadNdOp.
-// isLhs = true  → Q-like load:  sg_layout = [shape[0]/16, 1], inst_data = [16, 32]
-// isLhs = false → K/V load:     sg_layout = [1, 1]
+// isLhs = true  → Q-like load:  sg_layout = [shape[0]/16, 1], inst_data = [16,
+// 32] isLhs = false → K/V load:     sg_layout = [1, 1]
 //   K (has transpose user): order = [0, 1]
 //   V (no transpose user):  inst_data = [32, 32]
 static LogicalResult setLoadLayout(xegpu::LoadNdOp load, bool isLhs) {
@@ -137,10 +137,9 @@ static LogicalResult setLoadLayout(xegpu::LoadNdOp load, bool isLhs) {
     sgLayout = {1, 1};
 
     // K path is consumed by vector.transpose and uses ordered layout.
-    bool hasTransposeUser =
-        llvm::any_of(load->getUsers(), [](Operation *user) {
-          return isa<vector::TransposeOp>(user);
-        });
+    bool hasTransposeUser = llvm::any_of(load->getUsers(), [](Operation *user) {
+      return isa<vector::TransposeOp>(user);
+    });
     if (hasTransposeUser) {
       order = {0, 1};
     } else {
@@ -154,7 +153,8 @@ static LogicalResult setLoadLayout(xegpu::LoadNdOp load, bool isLhs) {
   if (failed(sgData))
     return failure();
 
-  load.setLayoutAttr(gc::attention::makeLayout(ctx, sgLayout, *sgData, instData, order));
+  load.setLayoutAttr(
+      gc::attention::makeLayout(ctx, sgLayout, *sgData, instData, order));
   return success();
 }
 
@@ -178,7 +178,8 @@ static LogicalResult setPrefetchLayout(xegpu::PrefetchNdOp prefetch) {
 
   // inst_data = sg_data for prefetch operations.
   SmallVector<int32_t> instData = *sgData;
-  prefetch.setLayoutAttr(gc::attention::makeLayout(ctx, sgLayout, *sgData, instData));
+  prefetch.setLayoutAttr(
+      gc::attention::makeLayout(ctx, sgLayout, *sgData, instData));
   return success();
 }
 

@@ -42,7 +42,8 @@ findVLoadChain(xegpu::DpasOp secondDpas, Region *loopBodyRegion) {
   // Collect the full backward slice of the load operation
   DenseSet<Operation *> visited;
   SmallVector<Operation *> chain;
-  gc::attention::collectDepsInRegion(vLoad.getResult(), loopBodyRegion, chain, visited);
+  gc::attention::collectDepsInRegion(vLoad.getResult(), loopBodyRegion, chain,
+                                     visited);
   return chain;
 }
 
@@ -98,7 +99,7 @@ static bool dependsOnOpsAfterKLoad(const SmallVector<Operation *> &vLoadChain,
 
 /// Hoist the V-load chain right after the K-load.
 static bool hoistVLoadChain(xegpu::DpasOp firstDpas,
-                           const SmallVector<Operation *> &vLoadChain) {
+                            const SmallVector<Operation *> &vLoadChain) {
   // Find K load operation
   auto kLoad = findKLoad(firstDpas);
   if (!kLoad) {

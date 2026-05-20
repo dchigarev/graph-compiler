@@ -56,8 +56,9 @@ DialectRegistry &getDialectRegistry() {
   return registry;
 }
 
-static void addAttentionOptimizationPasses(
-    OpPassManager &pm, const GPUPipelineOptions &pipelineOpts) {
+static void
+addAttentionOptimizationPasses(OpPassManager &pm,
+                               const GPUPipelineOptions &pipelineOpts) {
   pm.addPass(createHoistAttentionVLoad());
   if (pipelineOpts.enableAttentionPrefetch)
     pm.addPass(createSetAttentionPrefetch());

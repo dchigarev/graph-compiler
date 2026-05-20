@@ -28,11 +28,12 @@ namespace {
 
 /// Collect the full transitive dependency chain inside the loop body for a
 /// create_nd_tdesc op. Returns ops in topological order.
-static SmallVector<Operation *>
-collectDescDeps(xegpu::CreateNdDescOp descOp, Region *loopBodyRegion) {
+static SmallVector<Operation *> collectDescDeps(xegpu::CreateNdDescOp descOp,
+                                                Region *loopBodyRegion) {
   SmallVector<Operation *> deps;
   DenseSet<Operation *> visited;
-  gc::attention::collectDepsInRegion(descOp.getResult(), loopBodyRegion, deps, visited);
+  gc::attention::collectDepsInRegion(descOp.getResult(), loopBodyRegion, deps,
+                                     visited);
   return deps;
 }
 
@@ -57,7 +58,7 @@ static void emitPrefetch(OpBuilder &builder, Location loc, Value tdesc) {
   SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(0),
                                        builder.getIndexAttr(0)};
   xegpu::PrefetchNdOp::create(builder, loc, tdesc, offsets, cachedHint,
-                               cachedHint, cachedHint, /*layout=*/nullptr);
+                              cachedHint, cachedHint, /*layout=*/nullptr);
 }
 
 struct LoadInfo {

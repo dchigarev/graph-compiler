@@ -12,8 +12,7 @@ namespace mlir::gc::attention {
 
 SmallVector<xegpu::DpasOp> collectDpasOps(scf::ForOp forOp) {
   SmallVector<xegpu::DpasOp> dpasOps;
-  forOp.getBody()->walk(
-      [&](xegpu::DpasOp dpas) { dpasOps.push_back(dpas); });
+  forOp.getBody()->walk([&](xegpu::DpasOp dpas) { dpasOps.push_back(dpas); });
   return dpasOps;
 }
 
