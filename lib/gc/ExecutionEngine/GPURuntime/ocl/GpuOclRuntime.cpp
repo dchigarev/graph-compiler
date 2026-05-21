@@ -24,6 +24,83 @@
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+
+namespace {
+class ScopedProfiler {
+  const char *funcName;
+  std::chrono::high_resolution_clock::time_point startTime;
+  bool enabled;
+
+  static bool isEnabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+      const char *env = std::getenv("GC_GPU_PROFILE");
+      enabled = (env && (std::strcmp(env, "1") == 0 || 
+                         std::strcmp(env, "ON") == 0 || 
+                         std::strcmp(env, "on") == 0)) ? 1 : 0;
+      if (enabled) {
+        std::cerr << "[GC_GPU_PROFILE] Profiling enabled\n" << std::flush;
+      }
+    }
+    return enabled == 1;
+  }
+
+  static std::mutex &getMutex() {
+    static std::mutex m;
+    return m;
+  }
+
+  static std::ostream &getOutputStream() {
+    static std::ostream *os = nullptr;
+    static std::ofstream fileStream;
+    if (!os) {
+      const char *output = std::getenv("GC_GPU_PROFILE_OUTPUT");
+      if (output && std::strlen(output) > 0) {
+        fileStream.open(output, std::ios::app);
+        if (fileStream.is_open()) {
+          os = &fileStream;
+        } else {
+          std::cerr << "[GC_GPU_PROFILE] Warning: Failed to open file '"
+                    << output << "', using stdout instead.\n";
+          os = &std::cout;
+        }
+      } else {
+        os = &std::cout;
+      }
+    }
+    return *os;
+  }
+
+public:
+  explicit ScopedProfiler(const char *name)
+      : funcName(name),
+        startTime(std::chrono::high_resolution_clock::now()),
+        enabled(isEnabled()) {}
+
+  ~ScopedProfiler() {
+    if (!enabled) return;
+    
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
+                        endTime - startTime)
+                        .count();
+
+    std::lock_guard<std::mutex> lock(getMutex());
+    getOutputStream() << "[GC_GPU_PROFILE] " << funcName << ": " << duration
+                      << " us\n"
+                      << std::flush;
+  }
+};
+
+#define GC_PROFILE_FUNC() ScopedProfiler _profiler(__FUNCTION__)
+} // namespace
+
 namespace mlir::gc::gpu {
 
 #define makeClErrPref(code) "OpenCL error ", code, ": "
@@ -237,22 +314,29 @@ struct OclRuntime::Exports {
 
 private:
   // Stubs for mgpu functions (not used in OpenCL runtime)
-  static void *mgpuModuleLoadStub(const void *, size_t) { return nullptr; }
-  static void mgpuModuleUnloadStub(void *) {}
+  static void *mgpuModuleLoadStub(const void *, size_t) {
+    GC_PROFILE_FUNC();
+    return nullptr;
+  }
+  static void mgpuModuleUnloadStub(void *) { GC_PROFILE_FUNC(); }
 
   static void *allocDev(const OclContext *ctx, size_t size) {
+    GC_PROFILE_FUNC();
     return gcGetOrReport(ctx->runtime.usmAllocDev(size));
   }
 
   static void *allocShared(const OclContext *ctx, size_t size) {
+    GC_PROFILE_FUNC();
     return gcGetOrReport(ctx->runtime.usmAllocShared(size));
   }
 
   static void dealloc(const OclContext *ctx, const void *ptr) {
+    GC_PROFILE_FUNC();
     gcGetOrReport(ctx->runtime.usmFree(ptr));
   }
 
   static void memcpy(OclContext *ctx, const void *src, void *dst, size_t size) {
+    GC_PROFILE_FUNC();
     gcGetOrReport(ctx->runtime.usmCpy(*ctx, src, dst, size));
   }
 
@@ -260,6 +344,7 @@ private:
                               const unsigned char *spirv, const char *name,
                               const size_t *gridSize, const size_t *blockSize,
                               size_t argNum, const size_t *argSize) {
+    GC_PROFILE_FUNC();
     cl_int err;
     auto program =
         clCreateProgramWithIL(ctx->runtime.ext.context, spirv, spirvLen, &err);
@@ -296,6 +381,7 @@ private:
   }
 
   static void kernelDestroy(size_t count, Kernel **kernels) {
+    GC_PROFILE_FUNC();
     gcLogD("Destroying kernels.");
     for (size_t i = 0; i < count; i++) {
       if (kernels[i]) {
@@ -305,6 +391,7 @@ private:
   }
 
   static void kernelLaunch(OclContext *ctx, Kernel *kernel, ...) {
+    GC_PROFILE_FUNC();
     struct ClonedKernel {
       cl_kernel kernel;
 
@@ -391,7 +478,10 @@ private:
     gcLogD("Enqueued kernel execution: ", cloned.kernel);
   }
 
-  static void finish(OclContext *ctx) { gcGetOrReport(ctx->finish()); }
+  static void finish(OclContext *ctx) {
+    GC_PROFILE_FUNC();
+    gcGetOrReport(ctx->finish());
+  }
 };
 
 OclRuntime::OclRuntime(const Ext &ext) : ext(ext) {}
