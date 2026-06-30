@@ -23,7 +23,7 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/XeGPU/uArch/IntelGpuXe2.h"
+#include "mlir/Dialect/XeGPU/uArch/uArchCommon.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/Value.h"
@@ -221,9 +221,9 @@ struct DevAttrs : public GcAttrs<const char *> {
     this->arch = nullptr;
   }
 
-  const uArch *getUarch() {
+  const xegpu::uArch::uArch *getUarch() {
     if (!arch) {
-      arch = getUArch(getArch().value_or("bmg"));
+      arch = xegpu::uArch::getUArch(getArch().value_or("bmg"));
     }
     return arch;
   }
@@ -287,7 +287,7 @@ private:
   static constexpr char DEVICE_ARCH[] = "arch";
   static constexpr char MAX_WG_SIZE[] = "max_wg_size";
   static constexpr char SG_SIZES[] = "sg_sizes";
-  const uArch *arch = nullptr;
+  const xegpu::uArch::uArch *arch = nullptr;
 };
 
 struct KernelAttrs : public GcAttrs<const char *, StringRef> {
