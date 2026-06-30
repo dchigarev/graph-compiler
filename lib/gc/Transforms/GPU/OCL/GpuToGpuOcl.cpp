@@ -616,17 +616,19 @@ struct GpuToGpuOcl final : gc::impl::GpuToGpuOclBase<GpuToGpuOcl> {
       return false;
     };
     mod.walk([&](LLVM::CallOp call) {
-      if (call.getCallee() == "mgpuStreamCreate") {
-        for (auto u : call.getOperation()->getUsers()) toErase.insert(u);
-        toErase.insert(call);
-      } else if (isMgpu(call.getCallee().value_or(""))) {
-        toErase.insert(call);
-      }
+      if (isMgpu(call.getCallee().value_or(""))) toErase.insert(call);
       return WalkResult::skip();
     });
     for (auto fn : mod.getOps<LLVM::LLVMFuncOp>())
       if (isMgpu(fn.getSymName())) toErase.insert(fn);
-    for (auto op : toErase) op->erase();
+    for (int i = 0; i < 2 && !toErase.empty(); ++i)
+      toErase.remove_if([](Operation *op) {
+        if (op->use_empty()) {
+          op->erase();
+          return true;
+        }
+        return false;
+      });
 
     if (!helper.kernelNames.size()) return;
 

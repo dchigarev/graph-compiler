@@ -4,14 +4,23 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/RegionUtils.h"
 
 #include "gc/Utils/Log.h"
 #include "gc/Utils/Misc.h"
 #include "gc/Utils/Transform.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/iterator_range.h"
+#include "llvm/Support/Casting.h"
+#include <cmath>
+#include <utility>
 
 using namespace mlir;
 using namespace mlir::gc;
@@ -124,14 +133,6 @@ inline void tagTileAndFuseResult(Operation *origConsumer,
   }
 }
 
-inline bool isParallel(Operation *op) {
-  auto ti = dyn_cast<TilingInterface>(op);
-  return ti &&
-         llvm::all_of(ti.getLoopIteratorTypes(), [](utils::IteratorType t) {
-           return t == utils::IteratorType::parallel;
-         });
-}
-
 inline bool hasIterator(Operation *op, utils::IteratorType type) {
   auto ti = dyn_cast<TilingInterface>(op);
   return ti &&
@@ -139,25 +140,19 @@ inline bool hasIterator(Operation *op, utils::IteratorType type) {
                       [type](utils::IteratorType t) { return t == type; });
 }
 
-// If a slice inside the loop is created from an external empty tensor and
-// the tensor is not passed to the loop's shared_outs, but referenced
-// directly, replace the slice with an empty tensor of the same size.
-inline void replaceEmptySlices(OpRewriter &rw, LoopLikeOpInterface loop) {
-  loop.walk([&](tensor::ExtractSliceOp slice) {
-    if (auto empty = slice.getSource().getDefiningOp<tensor::EmptyOp>();
-        empty && empty->getParentOfType<LoopLikeOpInterface>() != loop) {
-      auto type = slice.getType();
-      rw.setInsertionPointAfter(slice);
-      SmallVector<Value> dynDims;
-      for (int64_t i = 0, r = type.getRank(); i < r; ++i) {
-        if (type.isDynamicDim(i)) {
-          dynDims.push_back(rw.create<tensor::DimOp>(slice, i));
-        }
-      }
-      rw.replaceOp(slice, rw.create<tensor::EmptyOp>(
-                              type.getShape(), type.getElementType(), dynDims));
-    }
-  });
+inline bool allIterators(Operation *op, utils::IteratorType type) {
+  auto ti = dyn_cast<TilingInterface>(op);
+  return ti &&
+         llvm::all_of(ti.getLoopIteratorTypes(),
+                      [type](utils::IteratorType t) { return t == type; });
+}
+
+inline bool isParallel(Operation *op) {
+  return allIterators(op, utils::IteratorType::parallel);
+}
+
+inline bool isReduction(Operation *op) {
+  return allIterators(op, utils::IteratorType::reduction);
 }
 
 enum class Level : char { WG, SG };
@@ -202,6 +197,8 @@ public:
         kernelAttrs = KernelAttrs(fn, kernelName);
         ++numKernels;
       }
+      if (!kernelAttrs.getSgSize())
+        kernelAttrs.setSgSize(devAttrs.getUarch()->getSubgroupSize());
       fn->setDiscardableAttr(
           GC_ATTR_NUM_KERNELS,
           createAttr<unsigned>(fn->getContext(), numKernels));
@@ -347,7 +344,7 @@ protected:
     size_t dummy = 1;
     auto &wTile = wgTiles.back();
     auto &hTile = unit ? dummy : wgTiles[wgTiles.size() - 2];
-
+    adjustMaxTileSizes(tg, reduction, wTile, hTile);
     // TODO: parameterize sgMul and wgMul in kernel attributes so they can
     // be used for auto tuning.
     auto [widths, heights, counts, sgMul, wgMul] =
@@ -374,7 +371,6 @@ protected:
               auto sgw = w * c * sm, sgh = h * sm;
               auto wgw = sgw * wm, wgh = sgh * wm;
               if (wTile % wgw || (!unit && hTile % wgh)) continue;
-              if (wTile == wgw && (unit || hTile == wgh)) continue;
               wTile = wgw;
               hTile = wgh;
               sgTiles.back() = sgw;
@@ -388,6 +384,70 @@ protected:
     sgTiles.back() = 1;
     if (!unit) sgTiles[wgTiles.size() - 2] = 1;
     tg.setTiles(wgTiles, sgTiles, reduction);
+  }
+
+  // If there is a reshape in the fusible subgraph, that reshapes one or both of
+  // the last 2 dims (height x width), adjust the height and width maximum
+  // values, so that they could be properly reshaped.
+  virtual void adjustMaxTileSizes(Target &tg, bool reduction, size_t &width,
+                                  size_t &height) {
+    auto canFuse = [&](Operation *user) {
+      return user->getBlock() == tg.op->getBlock() && isParallel(user);
+    };
+    // BFS over fusible consumers; for each reshape op, check if it touches
+    // the last two dims and clamp width/height to the innerProd of that group.
+    SmallVector<Operation *> stack{tg.op.getOperation()};
+    llvm::SmallSet<Operation *, 16> visited;
+    while (!stack.empty()) {
+      auto *cur = stack.pop_back_val();
+      if (!visited.insert(cur).second) continue;
+      for (auto res : cur->getResults()) {
+        for (auto *user : res.getUsers()) {
+          // For expand_shape: inner dims of a multi-dim group give innerProd.
+          if (auto expand = dyn_cast<tensor::ExpandShapeOp>(user)) {
+            auto dstType = expand.getResultType();
+            auto rank = expand.getSrcType().getRank();
+            for (auto [gi, group] :
+                 llvm::enumerate(expand.getReassociationIndices())) {
+              if (group.size() <= 1) continue;
+              auto srcDim = expand.getCorrespondingSourceDim(group[0]);
+              int64_t ip = 1;
+              for (size_t i = 1; i < group.size(); ++i)
+                ip *= dstType.getDimSize(group[i]);
+              if (srcDim == rank - 1) width = std::min(width, (size_t)ip);
+              else if (srcDim == rank - 2)
+                height = std::min(height, (size_t)ip);
+            }
+            stack.push_back(user);
+          } else if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(user)) {
+            auto srcType = collapse.getSrcType();
+            size_t rank = collapse.getResultType().getRank();
+            for (auto [dstDim, group] :
+                 llvm::enumerate(collapse.getReassociationIndices())) {
+              if (group.size() <= 1) continue;
+              int64_t ip = 1;
+              for (auto d : group) ip *= srcType.getDimSize(d);
+              if (dstDim == rank - 1) width = std::min(width, (size_t)ip);
+              else if (dstDim == rank - 2)
+                height = std::min(height, (size_t)ip);
+            }
+            stack.push_back(user);
+          } else if (auto pack = dyn_cast<linalg::PackOp>(user)) {
+            auto tiles = pack.getMixedTiles();
+            auto n = tiles.size();
+            if (n >= 1)
+              if (auto v = getConstantIntValue(tiles[n - 1]))
+                width = std::min(width, (size_t)*v);
+            if (n >= 2)
+              if (auto v = getConstantIntValue(tiles[n - 2]))
+                height = std::min(height, (size_t)*v);
+            stack.push_back(user);
+          } else if (canFuse(user)) {
+            stack.push_back(user);
+          }
+        }
+      }
+    }
   }
 
   // Get the supported block sizes, that can be used for tiling of the specified
@@ -459,11 +519,15 @@ protected:
 
   virtual SmallVector<size_t> computeThreads(Target &tg) {
     size_t threads = getSgSize(tg);
-    for (auto [wg, sg, r] : llvm::zip(tg.tiles, tg.sgTiles, tg.reductions)) {
+    size_t maxThreads = 1;
+    for (auto [wg, sg, s, r] :
+         llvm::zip(tg.tiles, tg.sgTiles, tg.sizes, tg.reductions)) {
       if (!r) {
         threads *= wg / sg;
+        maxThreads *= s / sg;
       }
     }
+    threads = std::min(threads, maxThreads);
 
     auto wgSize = getWgSize(tg);
     assert(threads <= wgSize && "wg/sg tiling exceeds max wg size");
@@ -529,22 +593,12 @@ protected:
     LoopLikeOpInterface opReplacement = nullptr;
     SmallVector<Operation *> opsToReplace{tg.op.getOperation()};
     append_range(opsToReplace, result->fusedProducers);
-    auto ctx = tg.op->getContext();
-    RewritePatternSet patterns(ctx);
     for (auto toReplace : opsToReplace) {
       for (auto res : toReplace->getResults()) {
         if (auto repl = result->replacements.lookup(res)) {
           tg.mark(repl.getDefiningOp());
           tg.rw.replaceAllUsesWith(res, repl);
           if (auto loop = dyn_cast<LoopLikeOpInterface>(repl.getDefiningOp())) {
-            if (isa<scf::ForallOp>(loop.getOperation())) {
-              scf::ForallOp::getCanonicalizationPatterns(patterns, ctx);
-            } else if (isa<scf::ForOp>(loop.getOperation())) {
-              scf::ForOp::getCanonicalizationPatterns(patterns, ctx);
-            }
-            if (tg.level == Level::WG && !fuseConsumers(tg, loop)) {
-              return nullptr;
-            }
             if (!opReplacement && tg.op == toReplace) {
               opReplacement = loop;
             }
@@ -563,81 +617,29 @@ protected:
       return nullptr;
     }
 
-    static size_t stamp = 0;
-    auto st = ++stamp;
-    // The loop's operation can be replaced by the patterns. Using a stamp
-    // to find it again.
-    opReplacement->setDiscardableAttr("gc.tiling.stamp", createAttr(ctx, st));
-    if (failed(applyPatternsGreedily(tg.fn, std::move(patterns)))) {
-      return nullptr;
+    if (tg.level == Level::WG) {
+      if (!fuseConsumers(tg, opReplacement)) return nullptr;
+      else fuseProducers(tg, opReplacement);
     }
+
+    canonicalizeLoop(opReplacement);
     if (failed(simplifyRegions(tg.rw, tg.fn->getRegions()))) {
       // Not simplified
     }
-    tg.fn.walk([&](LoopLikeOpInterface loop) {
-      if (getDiscardableAttr<size_t>(loop, "gc.tiling.stamp", 0) == st) {
-        opReplacement = loop;
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-
+    tg.mark(opReplacement);
     return opReplacement;
-  }
-
-  inline bool fuseConsumers(Target &tg, LoopLikeOpInterface &loop) {
-    for (bool fused = true; fused;) {
-      fused = false;
-      for (auto res : loop->getResults()) {
-        if (!res.hasOneUse()) {
-          continue;
-        }
-        auto &uses_begin = *res.use_begin();
-        auto user = uses_begin.getOwner();
-        if (user->getBlock() == loop->getBlock() && isParallel(user) &&
-            user->getNumResults() == 1 && user->getResult(0).hasOneUse()) {
-          AffineMap userMap;
-          if (auto userIdx = dyn_cast<IndexingMapOpInterface>(user))
-            userMap = userIdx.getMatchingIndexingMap(&uses_begin);
-          auto result = tileAndFuseConsumer(tg.rw, user, {loop});
-          if (failed(result)) {
-            tg.op->emitError() << "Failed to fuse consumers";
-            return false;
-          }
-          fused = true;
-          tg.rw.replaceAllOpUsesWith(user, res);
-          user->erase();
-          tg.mark(loop);
-          AffineMap prodMap = getResultIndexingMap(tg.op.getOperation(), 0);
-          for (auto tiled : result->tiledOps) {
-            tg.mark(tiled);
-            if (auto ti = dyn_cast<TilingInterface>(tiled);
-                ti && userMap && prodMap) {
-              mergeWgTileSizesAttr(
-                  tiled, remapTiles(tg.tiles, prodMap, userMap,
-                                    ti.getLoopIteratorTypes().size()));
-            }
-          }
-        }
-      }
-    }
-    return true;
   }
 
   virtual std::optional<SCFTileAndFuseOptions::ControlFnResult>
   fusionControl(Target &tg, tensor::ExtractSliceOp candidateSliceOp,
                 OpResult originalProducer, bool isDestinationOperand) {
     Operation *op = originalProducer.getOwner();
-    if (!op) {
-      return std::nullopt;
-    }
+    if (!op) return std::nullopt;
+    if (isDestinationOperand && tg.level == Level::SG) return std::nullopt;
 
-    if (isDestinationOperand && tg.level == Level::SG) {
-      return std::nullopt;
-    }
-
-    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
-        linalgOp && !linalgOp.hasOnlyProjectedPermutations()) {
+    if (LoopLikeOpInterface loop = llvm::dyn_cast_or_null<LoopLikeOpInterface>(
+            candidateSliceOp->getParentOp());
+        loop && !canFuse(loop, op, false)) {
       return std::nullopt;
     }
 
@@ -649,6 +651,463 @@ protected:
     }
 
     return SCFTileAndFuseOptions::ControlFnResult{};
+  }
+
+  static bool fuseConsumers(Target &tg, LoopLikeOpInterface &loop) {
+    AffineMap prodMap = getResultIndexingMap(tg.op.getOperation(), 0);
+    auto isFusible = [&](Operation *op) {
+      return canFuse(loop, op) ||
+             isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp>(op);
+    };
+
+    for (bool fused = true; fused;) {
+      fused = false;
+      for (auto res : loop->getResults()) {
+        if (res.use_empty()) {
+          loop->emitWarning()
+              << "Result " << res.getResultNumber() << " is unused";
+          continue;
+        }
+
+        auto forall = dyn_cast<scf::ForallOp>(loop.getOperation());
+        Operation *user = nullptr;
+        OpOperand *operand = nullptr;
+        {
+          for (auto &use : res.getUses()) {
+            auto u = use.getOwner();
+            if (!isFusible(u) || u->hasTrait<OpTrait::ReturnLike>() ||
+                hasDiamondDep(res, u))
+              continue;
+            // We can fuse a single consumer with a single result
+            if ((!res.hasNUsesOrMore(2) && u->getNumResults() <= 1) ||
+                // or the subgraphs if they have a common intersection.
+                (forall && // For WG level only
+                 allUsersIntersect(res, isFusible))) {
+              user = u;
+              operand = &use;
+              break;
+            }
+          }
+        }
+
+        if (!user) continue;
+
+        if (forall) {
+          if (isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp>(user)) {
+            bool ok;
+            if (auto expand = dyn_cast<tensor::ExpandShapeOp>(user))
+              ok = fuseExpandShape(tg.rw, forall, res, expand);
+            else
+              ok = fuseCollapseShape(tg.rw, forall, res,
+                                     cast<tensor::CollapseShapeOp>(user));
+            if (!ok) {
+              user->emitWarning() << "Failed to fuse reshape op into " << loop;
+              continue;
+            }
+            loop = forall;
+            canonicalizeLoop(loop);
+            tg.mark(loop);
+            fused = true;
+            break;
+          }
+        }
+
+        if (!fuseConsumer(tg, loop, res, user, operand, prodMap)) continue;
+        canonicalizeLoop(loop);
+        tg.mark(loop);
+        fused = true;
+        break;
+      }
+    }
+    return true;
+  }
+
+  // Fuse producers of extract_slice ops inside the loop
+  static void fuseProducers(Target &tg, LoopLikeOpInterface &loop) {
+    SmallVector<tensor::ExtractSliceOp> candidates;
+    loop->walk([&](tensor::ExtractSliceOp slice) {
+      auto producer = slice.getSource().getDefiningOp();
+      if (producer && canFuse(loop, producer, false))
+        candidates.push_back(slice);
+    });
+    SmallVector<LoopLikeOpInterface> loops = {loop};
+    for (auto slice : candidates)
+      if (!tileAndFuseProducerOfSlice(tg.rw, slice, loops))
+        slice->emitWarning() << "Failed to fuse producer of slice";
+    loop = loops[0];
+  }
+
+private:
+  static bool canFuse(LoopLikeOpInterface loop, Operation *op,
+                      bool isConsumer = true) {
+    if (op->getBlock() != loop->getBlock()) return false;
+    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+        linalgOp && !linalgOp.hasOnlyProjectedPermutations()) {
+      return false;
+    }
+    if (isParallel(op)) return true;
+    if (isa<linalg::PackOp, linalg::UnPackOp>(loop)) return true;
+    if (isa<scf::ForOp>(loop)) return false;
+    if (hasIterator(op, utils::IteratorType::reduction)) {
+      // We can fuse reductions if the reduction dim is not tiled.
+      if (!isConsumer) return true;
+      auto forall = dyn_cast<scf::ForallOp>(loop.getOperation());
+      auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+      if (!forall || !linalgOp) return false;
+      for (auto *operand : linalgOp.getDpsInputOperands()) {
+        auto opRes = dyn_cast<OpResult>(operand->get());
+        if (!opRes || opRes.getDefiningOp() != loop.getOperation()) continue;
+        auto ins = findParallelInsertSlice(forall, opRes);
+        if (!ins) return false;
+        auto srcType = cast<RankedTensorType>(opRes.getType());
+        auto sliceSizes = ins.getMixedSizes();
+        auto map = linalgOp.getMatchingIndexingMap(operand);
+        for (auto [i, iterType] :
+             llvm::enumerate(linalgOp.getIteratorTypesArray())) {
+          if (iterType != utils::IteratorType::reduction) continue;
+          for (unsigned d = 0, nd = map.getNumResults(); d < nd; ++d) {
+            auto dim = dyn_cast<AffineDimExpr>(map.getResult(d));
+            if (!dim || dim.getPosition() != i) continue;
+            auto sz = getConstantIntValue(sliceSizes[d]);
+            if (!sz || *sz != srcType.getDimSize(d)) return false;
+          }
+        }
+        return true;
+      }
+      return false;
+    }
+    return false;
+  }
+
+  // Fuse `user` into `loop` via tileAndFuseConsumer.
+  // If `user` has multiple operands that are loop results (diamond dep from
+  // the same loop), all extras are temporarily replaced with tensor.empty so
+  // tileAndFuseConsumer sees a single producer. After fusion the
+  // extract_slice(empty) operands inside the tiled op are replaced with the
+  // actual tile values from the loop's parallel_insert_slices.
+  static bool fuseConsumer(Target &tg, LoopLikeOpInterface &loop,
+                           OpResult loopRes, Operation *user,
+                           OpOperand *operand, AffineMap &prodMap) {
+    // (empty, tile, originalLoopRes)
+    SmallVector<std::tuple<Value, Value, Value>> emptyToTile;
+    auto loopOp = loop.getOperation();
+    if (auto forall = dyn_cast<scf::ForallOp>(loopOp)) {
+      for (auto &operand : user->getOpOperands()) {
+        auto res = dyn_cast<OpResult>(operand.get());
+        if (!res || res == loopRes || res.getDefiningOp() != loopOp) continue;
+        auto ins = findParallelInsertSlice(forall, res);
+        if (!ins) continue;
+        auto type = cast<RankedTensorType>(res.getType());
+        tg.rw.setInsertionPoint(loop);
+        auto empty =
+            tg.rw
+                .create<tensor::EmptyOp>(type.getShape(), type.getElementType())
+                .getResult();
+        emptyToTile.push_back({empty, ins.getSource(), res});
+        operand.set(empty);
+      }
+    }
+
+    AffineMap userMap;
+    if (auto userIdx = dyn_cast<IndexingMapOpInterface>(user))
+      userMap = userIdx.getMatchingIndexingMap(operand);
+
+    SmallVector<LoopLikeOpInterface> loops = {loop};
+    auto result = tileAndFuseConsumer(tg.rw, user, loops);
+    if (failed(result)) { // Restore original operands
+      for (auto &[empty, tile, orig] : emptyToTile) {
+        empty.use_begin()->set(orig);
+        tg.rw.eraseOp(empty.getDefiningOp());
+      }
+      loop->emitWarning() << "Failed to tile and fuse consumer: " << *user;
+      return false;
+    }
+
+    // Fuse producers of slices and replace extract_slice(tensor.empty) with
+    // actual tile values.
+    for (auto tiled : result->tiledOps) {
+      for (auto &operand : tiled->getOpOperands()) {
+        auto slice = operand.get().getDefiningOp<tensor::ExtractSliceOp>();
+        if (!slice) continue;
+        for (auto &[empty, tile, orig] : emptyToTile) {
+          if (slice.getSource() == empty) {
+            operand.set(tile);
+            if (empty.use_empty()) tg.rw.eraseOp(empty.getDefiningOp());
+            break;
+          }
+        }
+        if (slice.use_empty()) tg.rw.eraseOp(slice);
+      }
+      tg.mark(tiled);
+      if (auto ti = dyn_cast<TilingInterface>(tiled);
+          ti && userMap && prodMap) {
+        mergeWgTileSizesAttr(tiled,
+                             remapTiles(tg.tiles, prodMap, userMap,
+                                        ti.getLoopIteratorTypes().size()));
+      }
+    }
+
+    loop = loops[0];
+    tg.rw.eraseOp(user);
+    return true;
+  }
+
+  static scf::ForallOp rebuildForall(OpRewriter &rw, scf::ForallOp forall,
+                                     unsigned resIdx, Value newOut) {
+    SmallVector<Value> newOutputs(forall.getOutputs());
+    newOutputs[resIdx] = newOut;
+    auto mapping = forall.getMappingAttr();
+    auto newForall = rw.create<scf::ForallOp>(
+        forall.getMixedLowerBound(), forall.getMixedUpperBound(),
+        forall.getMixedStep(), newOutputs,
+        mapping ? std::optional(mapping) : std::nullopt);
+    newForall.getBody()->erase();
+    newForall.getRegion().takeBody(forall.getRegion());
+    return newForall;
+  }
+
+  static bool fuseCollapseShape(OpRewriter &rw, scf::ForallOp &forall,
+                                OpResult loopRes,
+                                tensor::CollapseShapeOp collapseOp) {
+    tensor::ParallelInsertSliceOp ins =
+        findParallelInsertSlice(forall, loopRes);
+    if (!ins) return false;
+
+    auto srcType = collapseOp.getSrcType();
+    auto dstType = collapseOp.getResultType();
+    auto reassoc = collapseOp.getReassociationIndices();
+    unsigned resIdx = loopRes.getResultNumber();
+    auto insOffsets = ins.getMixedOffsets();
+    auto insSizes = ins.getMixedSizes();
+
+    for (auto [gi, group] : llvm::enumerate(reassoc)) {
+      if (group.size() <= 1) continue;
+      auto sz0 = getConstantIntValue(insSizes[group[0]]);
+      if (!sz0) return false;
+      if (*sz0 == 1) continue;
+      for (size_t i = 1; i < group.size(); ++i) {
+        int64_t dimSz = srcType.getDimSize(group[i]);
+        if (dimSz == 1) continue;
+        auto off = getConstantIntValue(insOffsets[group[i]]);
+        auto sz = getConstantIntValue(insSizes[group[i]]);
+        if (!off || *off != 0 || !sz || *sz != dimSz) return false;
+      }
+    }
+
+    // sum_i(off[group[i]] * stride_i), skipping unit dims (they contribute 0).
+    auto linearOffset = [&](const ReassociationIndices &group,
+                            ArrayRef<OpFoldResult> offs) -> OpFoldResult {
+      Value acc = nullptr;
+      int64_t stride = 1;
+      for (int i = (int)group.size() - 1; i >= 0; --i) {
+        int64_t dimSz = srcType.getDimSize(group[i]);
+        if (dimSz != 1) {
+          if (auto cst = getConstantIntValue(offs[group[i]]);
+              !cst || *cst != 0) {
+            Value v = dyn_cast<Value>(offs[group[i]]);
+            if (!v)
+              v = rw.create<arith::ConstantIndexOp>(
+                  *getConstantIntValue(offs[group[i]]));
+            if (stride != 1)
+              v = rw.create<arith::MulIOp>(
+                  v, rw.create<arith::ConstantIndexOp>(stride));
+            acc = acc ? (Value)rw.create<arith::AddIOp>(acc, v) : v;
+          }
+        }
+        if (i > 0) stride *= dimSz;
+      }
+      return acc ? (OpFoldResult)acc : rw.getIndexAttr(0);
+    };
+
+    // Build collapsed (offsets, sizes) from per-dim offsets/sizes.
+    auto colParams = [&](ArrayRef<OpFoldResult> offs,
+                         ArrayRef<OpFoldResult> szs)
+        -> std::pair<SmallVector<OpFoldResult>, SmallVector<OpFoldResult>> {
+      SmallVector<OpFoldResult> colOffs, colSzs;
+      for (auto &group : reassoc) {
+        colOffs.push_back(linearOffset(group, offs));
+        int64_t sz = 1;
+        for (auto d : group) sz *= *getConstantIntValue(szs[d]);
+        colSzs.push_back(rw.getIndexAttr(sz));
+      }
+      return {colOffs, colSzs};
+    };
+
+    auto colType = [&](ArrayRef<OpFoldResult> szs, Type elem) {
+      return RankedTensorType::get(
+          llvm::map_to_vector(
+              szs, [](OpFoldResult r) { return *getConstantIntValue(r); }),
+          elem);
+    };
+
+    SmallVector<OpFoldResult> unitStrides(reassoc.size(), rw.getIndexAttr(1));
+
+    rw.setInsertionPoint(forall);
+    rw.loc = forall.getLoc();
+    Value newOut = rw.create<tensor::CollapseShapeOp>(
+        dstType, forall.getOutputs()[resIdx], reassoc);
+    auto newForall = rebuildForall(rw, forall, resIdx, newOut);
+
+    BlockArgument newOutArg =
+        newForall.getTiedBlockArgument(newForall->getResult(resIdx));
+    newOutArg.setType(dstType);
+
+    for (auto *user : llvm::make_early_inc_range(newOutArg.getUsers())) {
+      auto slice = dyn_cast<tensor::ExtractSliceOp>(user);
+      if (!slice) continue;
+      rw.setInsertionPoint(slice);
+      rw.loc = slice.getLoc();
+      auto [colOffs, colSzs] =
+          colParams(slice.getMixedOffsets(), slice.getMixedSizes());
+      auto colSlice = rw.create<tensor::ExtractSliceOp>(
+          colType(colSzs, srcType.getElementType()), newOutArg, colOffs, colSzs,
+          unitStrides);
+      rw.replaceOp(slice, rw.create<tensor::ExpandShapeOp>(slice.getType(),
+                                                           colSlice, reassoc)
+                              .getResult());
+    }
+
+    rw.setInsertionPoint(newForall.getTerminator());
+    rw.loc = ins.getLoc();
+    auto [newOffs, newSzs] = colParams(insOffsets, insSizes);
+    auto collapsedTile = rw.create<tensor::CollapseShapeOp>(
+        colType(
+            newSzs,
+            cast<RankedTensorType>(ins.getSource().getType()).getElementType()),
+        ins.getSource(), reassoc);
+    rw.setInsertionPoint(ins);
+    rw.create<tensor::ParallelInsertSliceOp>(collapsedTile, newOutArg, newOffs,
+                                             newSzs, unitStrides);
+    rw.eraseOp(ins);
+
+    // rw.replaceAllUsesWith(loopRes, newForall->getResult(resIdx));
+    // rw.replaceAllUsesWith(collapseOp.getResult(),
+    // newForall->getResult(resIdx));
+    rw.replaceAllUsesWith(collapseOp.getResult(), newForall->getResult(resIdx));
+    rw.eraseOp(collapseOp);
+    rw.replaceOp(forall, newForall);
+    forall = newForall;
+    return true;
+  }
+
+  static bool fuseExpandShape(OpRewriter &rw, scf::ForallOp &forall,
+                              OpResult loopRes,
+                              tensor::ExpandShapeOp expandOp) {
+    auto dstType = expandOp.getResultType();
+    auto reassoc = expandOp.getReassociationIndices();
+    unsigned resIdx = loopRes.getResultNumber();
+    tensor::ParallelInsertSliceOp ins =
+        findParallelInsertSlice(forall, loopRes);
+    if (!ins) return false;
+
+    auto insOffsets = ins.getMixedOffsets();
+    auto insSizes = ins.getMixedSizes();
+
+    // innerProd[gi] = product of dst dims group[1:] for each reassoc group.
+    SmallVector<int64_t> innerProds(reassoc.size(), 1);
+    for (auto [gi, group] : llvm::enumerate(reassoc)) {
+      if (group.size() <= 1) continue;
+      int64_t srcDim = expandOp.getCorrespondingSourceDim(group[0]);
+      if (!dyn_cast_if_present<Value>(insOffsets[srcDim])) return false;
+      for (size_t i = 1; i < group.size(); ++i)
+        innerProds[gi] *= dstType.getDimSize(group[i]);
+      auto tileSzOpt = getConstantIntValue(insSizes[srcDim]);
+      if (!tileSzOpt) return false;
+      int64_t ts = *tileSzOpt, ip = innerProds[gi];
+      // Full: tile covers k complete outer rows (ts % ip == 0).
+      // Sub-inner: tile is smaller than one inner slice (ip % ts == 0), only
+      // 2-dim groups supported so the partial dim is unambiguous.
+      if (ts % ip != 0 && (group.size() != 2 || ip % ts != 0)) return false;
+    }
+
+    // Compute expanded offsets/sizes from collapsed src coords.
+    //   Full:      outer_off = src_off / ip, inner dims fully covered.
+    //   Sub-inner: outer_off = src_off / ip, last inner off = src_off % ip.
+    auto expandParams = [&](ArrayRef<OpFoldResult> offs,
+                            ArrayRef<OpFoldResult> szs)
+        -> std::tuple<SmallVector<OpFoldResult>, SmallVector<OpFoldResult>,
+                      SmallVector<OpFoldResult>> {
+      SmallVector<OpFoldResult> expOffs, expSzs, expStrides;
+      for (auto [gi, group] : llvm::enumerate(reassoc)) {
+        int64_t srcDim = expandOp.getCorrespondingSourceDim(group[0]);
+        int64_t ip = innerProds[gi];
+        int64_t ts = *getConstantIntValue(szs[srcDim]);
+        bool subInner = ip > 1 && ip % ts == 0 && ts % ip != 0;
+        // outer dim
+        if (ip == 1) {
+          expOffs.push_back(offs[srcDim]);
+          expSzs.push_back(szs[srcDim]);
+        } else {
+          Value ip_v = rw.create<arith::ConstantIndexOp>(ip);
+          Value srcOff = cast<Value>(offs[srcDim]);
+          expOffs.push_back((Value)rw.create<arith::DivUIOp>(srcOff, ip_v));
+          expSzs.push_back(rw.getIndexAttr(subInner ? 1 : ts / ip));
+        }
+        expStrides.push_back(rw.getIndexAttr(1));
+        // inner dims
+        for (size_t i = 1; i < group.size(); ++i) {
+          bool isPartial = subInner && i == group.size() - 1;
+          if (isPartial) {
+            Value ip_v = rw.create<arith::ConstantIndexOp>(ip);
+            expOffs.push_back((Value)rw.create<arith::RemUIOp>(
+                cast<Value>(offs[srcDim]), ip_v));
+            expSzs.push_back(rw.getIndexAttr(ts));
+          } else {
+            expOffs.push_back(rw.getIndexAttr(0));
+            expSzs.push_back(rw.getIndexAttr(dstType.getDimSize(group[i])));
+          }
+          expStrides.push_back(rw.getIndexAttr(1));
+        }
+      }
+      return {expOffs, expSzs, expStrides};
+    };
+
+    rw.setInsertionPoint(forall);
+    rw.loc = forall.getLoc();
+    Value newOut = rw.create<tensor::ExpandShapeOp>(
+        dstType, forall.getOutputs()[resIdx], reassoc,
+        expandOp.getMixedOutputShape());
+    auto newForall = rebuildForall(rw, forall, resIdx, newOut);
+
+    BlockArgument newOutArg =
+        newForall.getTiedBlockArgument(newForall->getResult(resIdx));
+    newOutArg.setType(dstType);
+
+    auto expandedTileType = [&](ArrayRef<OpFoldResult> szs) {
+      return RankedTensorType::get(
+          llvm::map_to_vector(
+              szs, [](OpFoldResult r) { return *getConstantIntValue(r); }),
+          dstType.getElementType());
+    };
+
+    for (auto *user : llvm::make_early_inc_range(newOutArg.getUsers())) {
+      auto slice = dyn_cast<tensor::ExtractSliceOp>(user);
+      if (!slice) continue;
+      rw.setInsertionPoint(slice);
+      rw.loc = slice.getLoc();
+      auto [offs, szs, strides] =
+          expandParams(slice.getMixedOffsets(), slice.getMixedSizes());
+      auto extracted = rw.create<tensor::ExtractSliceOp>(
+          expandedTileType(szs), newOutArg, offs, szs, strides);
+      rw.replaceOp(slice, rw.create<tensor::CollapseShapeOp>(
+                              slice.getType(), extracted, reassoc));
+    }
+
+    rw.setInsertionPoint(newForall.getTerminator());
+    rw.loc = ins.getLoc();
+    auto [offs, szs, strides] = expandParams(insOffsets, insSizes);
+    auto expandedTile = rw.create<tensor::ExpandShapeOp>(
+        expandedTileType(szs), ins.getSource(), reassoc);
+    rw.setInsertionPoint(ins);
+    rw.create<tensor::ParallelInsertSliceOp>(expandedTile, newOutArg, offs, szs,
+                                             strides);
+    rw.eraseOp(ins);
+
+    rw.replaceAllUsesWith(expandOp.getResult(), newForall->getResult(resIdx));
+    rw.eraseOp(expandOp);
+    rw.replaceOp(forall, newForall);
+    forall = newForall;
+    return true;
   }
 };
 #endif // TILING_UTILS_H

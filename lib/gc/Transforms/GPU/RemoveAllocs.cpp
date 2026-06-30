@@ -288,6 +288,59 @@ struct FoldAllocCopyIntoDirectWrite final : OpRewritePattern<memref::CopyOp> {
   }
 };
 
+// Fold alloc → transfer_write → reshape → transfer_read into shape_cast:
+//   %alloc = memref.alloc()
+//   vector.transfer_write %v, %alloc[0,0,...]
+//   %rs = memref.expand_shape / collapse_shape %alloc
+//   %r  = vector.transfer_read %rs[0,0,...]
+// → %r = vector.shape_cast %v  (+ erase alloc, write, reshape)
+struct FoldAllocWriteReshapeRead
+    : public OpRewritePattern<vector::TransferReadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::TransferReadOp read,
+                                PatternRewriter &rw) const override {
+    auto isZero = [](Value v) {
+      auto cst = getConstantIntValue(v);
+      return cst && *cst == 0;
+    };
+    if (!llvm::all_of(read.getIndices(), isZero)) return failure();
+
+    auto *reshape = read.getBase().getDefiningOp();
+    if (!isa_and_present<memref::ExpandShapeOp, memref::CollapseShapeOp>(
+            reshape))
+      return failure();
+
+    auto reshapeInput = cast<ViewLikeOpInterface>(reshape).getViewSource();
+    auto alloc = reshapeInput.getDefiningOp<memref::AllocOp>();
+    if (!alloc) return failure();
+
+    // Find the single transfer_write into alloc.
+    vector::TransferWriteOp write;
+    for (auto &use : alloc.getResult().getUses()) {
+      if (auto w = dyn_cast<vector::TransferWriteOp>(use.getOwner())) {
+        if (write || !llvm::all_of(w.getIndices(), isZero)) return failure();
+        write = w;
+      } else if (!isa<memref::DeallocOp, memref::ExpandShapeOp,
+                      memref::CollapseShapeOp>(use.getOwner())) {
+        return failure(); // unexpected use
+      }
+    }
+    if (!write) return failure();
+
+    auto srcType = cast<VectorType>(write.getVector().getType());
+    auto dstType = cast<VectorType>(read.getResult().getType());
+    if (srcType.getNumElements() != dstType.getNumElements()) return failure();
+
+    rw.replaceOpWithNewOp<vector::ShapeCastOp>(read, dstType,
+                                               write.getVector());
+    if (reshape->use_empty()) rw.eraseOp(reshape);
+    if (write->use_empty()) rw.eraseOp(write);
+    if (alloc->use_empty()) rw.eraseOp(alloc);
+    return success();
+  }
+};
+
 struct RemoveAllocs final : gc::impl::RemoveAllocsBase<RemoveAllocs> {
 
   void runOnOperation() override {
@@ -298,7 +351,8 @@ struct RemoveAllocs final : gc::impl::RemoveAllocsBase<RemoveAllocs> {
 
     RewritePatternSet patterns(&getContext());
     patterns.add<RemoveCopyToArg, RemoveAllocDeallocPair,
-                 FoldAllocCopyIntoDirectWrite>(&getContext());
+                 FoldAllocCopyIntoDirectWrite, FoldAllocWriteReshapeRead>(
+        &getContext());
 
     if (failed(applyPatternsGreedily(fn, std::move(patterns)))) {
       signalPassFailure();

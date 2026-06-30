@@ -13,14 +13,22 @@
 #include <variant>
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/SmallVectorExtras.h"
 
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/XeGPU/uArch/IntelGpuXe2.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/IR/Value.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::gc {
 
@@ -193,8 +201,7 @@ private:
     else list.set(name, toDict(op, newList));
   }
 
-  static inline DictionaryAttr toDict(Operation *op,
-                                      const NamedAttrList &list) {
+  static DictionaryAttr toDict(Operation *op, const NamedAttrList &list) {
     return list.getDictionary(op->getContext());
   }
 };
@@ -300,15 +307,24 @@ struct KernelAttrs : public GcAttrs<const char *, StringRef> {
   template <typename T = size_t> std::optional<T> getWgSize() {
     return get<T>(WG_SIZE);
   }
-  template <typename T> void setWgSize(T wgSize) {
+  template <typename T = size_t> void setWgSize(T wgSize) {
     set(WG_SIZE, static_cast<T>(wgSize));
   }
 
   template <typename T = size_t> std::optional<T> getSgSize() {
     return get<T>(SG_SIZE);
   }
-  template <typename T> void setSgSize(T sgSize) {
+  template <typename T = size_t> void setSgSize(T sgSize) {
     set(SG_SIZE, static_cast<T>(sgSize));
+  }
+
+  template <typename T = size_t> std::optional<T> getSgCount() {
+    auto sgSize = getSgSize();
+    auto threads = getThreads();
+    if (!sgSize || !threads) return std::nullopt;
+    auto prod = std::accumulate(threads->begin(), threads->end(), 1,
+                                std::multiplies<>());
+    return static_cast<T>(prod / *sgSize);
   }
 
 private:
@@ -401,10 +417,122 @@ bool isOpDependsOnResult(std::function<bool(Operation *)> predicate,
   return false;
 }
 
-static inline bool isMatmulOp(Operation *op) {
+inline bool isMatmulOp(Operation *op) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
   return linalgOp && linalg::isaContractionOpInterface(linalgOp);
   // TODO: Check matmul like generics
+}
+
+// If a slice inside the loop is created from an external empty tensor and
+// the tensor is not passed to the loop's shared_outs, but referenced
+// directly, replace the slice with an empty tensor of the same size.
+inline void replaceEmptySlices(OpRewriter &rw, LoopLikeOpInterface loop) {
+  loop.walk([&](tensor::ExtractSliceOp slice) {
+    if (auto empty = slice.getSource().getDefiningOp<tensor::EmptyOp>();
+        empty && empty->getParentOfType<LoopLikeOpInterface>() != loop) {
+      auto type = slice.getType();
+      rw.setInsertionPointAfter(slice);
+      SmallVector<Value> dynDims;
+      for (int64_t i = 0, r = type.getRank(); i < r; ++i) {
+        if (type.isDynamicDim(i)) {
+          dynDims.push_back(rw.create<tensor::DimOp>(slice, i));
+        }
+      }
+      rw.replaceOp(slice, rw.create<tensor::EmptyOp>(
+                              type.getShape(), type.getElementType(), dynDims));
+    }
+  });
+}
+
+inline void canonicalizeLoop(LoopLikeOpInterface &loop) {
+  auto parent = loop->getParentWithTrait<OpTrait::IsIsolatedFromAbove>();
+  assert(parent);
+  auto ctx = parent->getContext();
+  RewritePatternSet patterns(ctx);
+  if (isa<scf::ForallOp>(loop.getOperation())) {
+    scf::ForallOp::getCanonicalizationPatterns(patterns, ctx);
+  } else if (isa<scf::ForOp>(loop.getOperation())) {
+    scf::ForOp::getCanonicalizationPatterns(patterns, ctx);
+  }
+
+  constexpr char stampAttrName[] = "gc.loop.stamp";
+  static size_t stamp = 0;
+  auto st = ++stamp;
+  // The loop's operation can be replaced by the patterns. Using a stamp
+  // to find it again.
+  loop->setDiscardableAttr(stampAttrName, createAttr(ctx, st));
+  if (failed(applyPatternsGreedily(parent, std::move(patterns)))) {
+    loop->emitWarning() << "Loop canonicalization failed";
+  }
+  parent->walk([&](LoopLikeOpInterface o) {
+    if (getDiscardableAttr<size_t>(o, stampAttrName, 0) == st) {
+      o->removeDiscardableAttr(stampAttrName);
+      loop = o;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+}
+
+// `result` is an OpResult produced by some srcOp.
+// `consumer` is a consumer of this result.
+// Check if the `consumer` has any other input, that depend on `srcOp` through a
+// different path.
+inline bool hasDiamondDep(OpResult result, Operation *consumer) {
+  auto srcOp = result.getDefiningOp();
+  SmallVector<Operation *> stack = llvm::filter_to_vector(
+      llvm::map_range(consumer->getOperands(),
+                      [&](Value v) { return v.getDefiningOp(); }),
+      [&](Operation *o) { return o && o != srcOp; });
+  llvm::SmallPtrSet<Operation *, 16> visited;
+  while (!stack.empty()) {
+    Operation *op = stack.pop_back_val();
+    if (!visited.insert(op).second) continue;
+    if (op == srcOp) return true;
+    for (auto operand : op->getOperands()) {
+      if (auto defOp = operand.getDefiningOp()) stack.push_back(defOp);
+    }
+  }
+  return false;
+}
+
+// Check if all subgraphs from the `result` have a common intersection.
+template <typename Predicate>
+bool allUsersIntersect(OpResult result, Predicate predicate) {
+  SmallVector<Value::user_range> stack = {result.getUsers()};
+  if (stack.size() <= 1) return true;
+  Operation *intersection = nullptr;
+  llvm::SmallSet<Operation *, 32> visited;
+  while (!stack.empty()) {
+    auto range = stack.pop_back_val();
+    llvm::SmallSet<Operation *, 8> unique;
+    for (auto op : range) unique.insert(op);
+    for (auto op : unique) {
+      if (!visited.insert(op).second) {
+        if (intersection == nullptr) intersection = op;
+        else if (intersection != op) return false;
+        continue;
+      }
+      if (op->hasTrait<OpTrait::ReturnLike>()) continue;
+      if (!predicate(op)) return false;
+      for (auto result : op->getResults()) stack.push_back(result.getUsers());
+    }
+  }
+  return true;
+}
+
+// Find ParallelInsertSliceOp corresponding to the specified loop result.
+inline tensor::ParallelInsertSliceOp
+findParallelInsertSlice(scf::ForallOp &forall, OpResult loopRes) {
+  BlockArgument outArg = forall.getTiedBlockArgument(loopRes);
+  tensor::ParallelInsertSliceOp ins;
+  for (auto &op : forall.getTerminator().getYieldingOps())
+    if (auto i = dyn_cast<tensor::ParallelInsertSliceOp>(&op);
+        i && i.getDest() == outArg) {
+      ins = i;
+      break;
+    }
+  return ins;
 }
 
 } // namespace mlir::gc

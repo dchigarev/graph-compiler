@@ -8,9 +8,13 @@
 
 #include <string>
 
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/TargetSelect.h"
 
+#include "gc/Dialect/Linalgx/LinalgxDialect.h"
+#include "gc/Transforms/Passes.h"
+#include "gc/Utils/Transform.h"
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Dialect/Affine/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
@@ -38,6 +42,53 @@
 #include "gc/Utils/Transform.h"
 
 namespace mlir::gc {
+
+namespace {
+struct TruncatingPrintIRPass
+    : PassWrapper<TruncatingPrintIRPass, OperationPass<>> {
+  std::string label;
+  TruncatingPrintIRPass(StringRef label) : label(label.str()) {}
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TruncatingPrintIRPass)
+
+  void runOnOperation() override {
+    std::string buf;
+    llvm::raw_string_ostream os(buf);
+    getOperation()->print(os);
+
+    constexpr size_t kKeep = 32;
+    auto truncate = [&](StringRef marker, bool closeParen) {
+      std::string result;
+      size_t pos = 0;
+      while (pos < buf.size()) {
+        size_t found = buf.find(marker, pos);
+        if (found == std::string::npos) {
+          result += buf.substr(pos);
+          buf = result;
+          return;
+        }
+        result += buf.substr(pos, found - pos);
+        size_t start = found + marker.size();
+        size_t end = buf.find('"', start);
+        size_t len = end - start;
+        result += marker;
+        result += buf.substr(start, std::min(len, kKeep));
+        if (len > kKeep) result += "...<" + std::to_string(len) + " chars>...";
+        result += '"';
+        if (closeParen) result += ')';
+        pos = end + (closeParen ? 2 : 1); // skip closing `"` [and `)`]
+      }
+      buf = result;
+    };
+    truncate("bin = \"", false);
+    truncate("_SPIRV(\"", true);
+    std::string &out = buf;
+
+    llvm::dbgs() << "// -----// IR Dump " << label << " //----- //\n"
+                 << out << "\n";
+    markAllAnalysesPreserved();
+  }
+};
+} // namespace
 
 DialectRegistry &getDialectRegistry() {
   static mlir::DialectRegistry registry = []() {
@@ -69,27 +120,31 @@ addAttentionOptimizationPasses(OpPassManager &pm,
 
 void populateGPUPipeline(OpPassManager &pm,
                          const GPUPipelineOptions &pipelineOpts) {
-  auto phase = [&pm, &pipelineOpts](const char *name,
-                                    std::function<void()> func) {
+  bool truncate = false;
+  auto phase = [&](const char *name, std::function<void()> func) {
     func();
     pm.addPass(createCSEPass());
     pm.addPass(createCanonicalizerPass());
-    if (pipelineOpts.dump) pm.addPass(createPrintIRPass({name}));
+    if (!pipelineOpts.dump) return;
+    if (truncate) pm.addPass(std::make_unique<TruncatingPrintIRPass>(name));
+    else pm.addPass(createPrintIRPass({name}));
   };
 
   GpuDevicePropsOptions deviceProps;
   if (pipelineOpts.deviceProps) {
     deviceProps = *pipelineOpts.deviceProps;
   }
-  phase("Initial", [&]() {});
+
+  pm.addPass(createCanonicalizerPass());
+  if (pipelineOpts.dump) pm.addPass(createPrintIRPass({"Initial"}));
 
   phase("Preprocess", [&]() {
     pm.addPass(createGpuDeviceProps(deviceProps));
     pm.addNestedPass<func::FuncOp>(createTensorConcatToLinalg());
+    pm.addNestedPass<func::FuncOp>(createTensorReshapeToLinalg());
   });
 
   phase("Tiling", [&]() {
-    pm.addNestedPass<func::FuncOp>(createLinalgElementwiseOpFusionPass());
     pm.addNestedPass<func::FuncOp>(createTileContraction());
     pm.addNestedPass<func::FuncOp>(createTileAttention());
     pm.addNestedPass<func::FuncOp>(createTileParallel());
@@ -153,8 +208,10 @@ void populateGPUPipeline(OpPassManager &pm,
     pm.addPass(createLoopInvariantCodeMotionPass());
     pm.addPass(createLoopInvariantSubsetHoistingPass());
     pm.addPass(createMemrefCopyToGpu());
+    pm.addPass(createSetLayouts());
   });
 
+  truncate = pipelineOpts.truncate;
   phase("XeGpu", [&]() {
     gpu::GPUToXeVMPipelineOptions opts;
     opts.use64bitIndex = true;

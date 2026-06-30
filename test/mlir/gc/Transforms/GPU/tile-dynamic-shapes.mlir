@@ -2,13 +2,13 @@
 
 
 // CHECK-LABEL: func.func @entry
-// CHECK-DAG:     %[[C16:.+]] = arith.constant 16 : index
+// CHECK-DAG:     %[[C64:.+]] = arith.constant 64 : index
 // CHECK-DAG:     %[[C0:.+]] = arith.constant 0 : index
 // CHECK:         %[[M:.+]] = tensor.dim
 // CHECK:         %[[K:.+]] = tensor.dim
 // CHECK:         %[[N:.+]] = tensor.dim
-// CHECK:         scf.forall (%{{.+}}, %{{.+}}) = (0, 0) to (%[[M]], %[[N]]) step (256, 512)
-// CHECK:           scf.for %{{.+}} = %[[C0]] to %[[K]] step %[[C16]]
+// CHECK:         scf.forall (%{{.+}}, %{{.+}}) = (0, 0) to (%[[M]], %[[N]]) step (32, 64)
+// CHECK:           scf.for %{{.+}} = %[[C0]] to %[[K]] step %[[C64]]
 // CHECK:             linalg.matmul {gc.tiling.level = 1
 // CHECK:           linalg.add {gc.tiling.level = 0
 func.func @entry(%arg0: memref<?x?xf16>, %arg1: memref<?x?xf16>, %arg2: memref<?x?xf16>) {

@@ -15,6 +15,7 @@ gc_add_mlir_library(
   GpuKernelOutline.cpp
   MemrefCopyToGpuMemcpy.cpp
   TensorConcatToLinalg.cpp
+  TensorReshapeToLinalg.cpp
   Vectorize.cpp
   RemoveAllocs.cpp
   HoistForLoopTransferRead.cpp
@@ -25,6 +26,7 @@ gc_add_mlir_library(
   AttentionOptimizations/SetAttentionLayouts.cpp
   AttentionOptimizations/SetAttentionPrefetch.cpp
   AttentionOptimizations/HoistAttentionVLoad.cpp
+  SetLayouts.cpp
   SetGpuFastMath.cpp
   Pipeline.cpp
   DEPENDS

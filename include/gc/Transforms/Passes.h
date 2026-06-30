@@ -28,6 +28,10 @@ struct GPUPipelineOptions : PassPipelineOptions<GPUPipelineOptions> {
   Option<bool> dump{*this, "dump",
                     llvm::cl::desc("Dump the IR after each phase."),
                     llvm::cl::init(false)};
+  Option<bool> truncate{
+      *this, "truncate-bin",
+      llvm::cl::desc("Truncate large binary blobs in the dumps."),
+      llvm::cl::init(true)};
   Option<bool> isUsmArgs{
       *this, "is-usm-args",
       llvm::cl::desc("Whether to use USM(unified shared memory) func args, in "

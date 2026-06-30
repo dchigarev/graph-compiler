@@ -115,11 +115,26 @@ def RemoveAllocs : Pass<"remove-allocs", "func::FuncOp"> {
   }];
 }
 
+def TensorReshapeToLinalg : Pass<"tensor-reshape-to-linalg", "func::FuncOp"> {
+  let summary = "Convert tensor.expand_shape/collapse_shape to linalg ops, if possible.";
+  let description = [{
+    Replaces tensor.expand_shape and tensor.collapse_shape with linalg.pack
+    and linalg.unpack or linalg.broadcast, if possible.
+  }];
+}
+
 def TensorConcatToLinalg : Pass<"tensor-concat-to-linalg", "func::FuncOp"> {
   let summary = "Convert tensor.concat to linalg operations.";
   let description = [{
     Eliminate tensor.concat by routing producers into output subviews
     or convert to linalg.copy.
+  }];
+}
+
+def SetLayouts : Pass<"set-layouts"> {
+  let summary = "Set XeGPU layouts.";
+  let description = [{
+    Sets layout attributes on anchor xegpu.* ops.
   }];
 }
 
