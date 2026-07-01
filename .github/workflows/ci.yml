@@ -18,7 +18,7 @@ env:
   LLVM_BUILD_TYPE: RelWithDebInfo
   LLVM_INSTALL_DIR: externals/llvm
   OV_REPO: https://x-access-token:${{ secrets.OV_TOKEN }}@github.com/intel-sandbox/openvino-gc.git
-  OV_VERSION: a7069d016c311958a81390c534f9099cb1d19283
+  OV_VERSION: 5c03ce58d8ebfa31c0d33b52b97af1530f6031b2
   OV_INSTALL_DIR: externals/openvino
 
 jobs:
