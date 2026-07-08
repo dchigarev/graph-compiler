@@ -18,7 +18,7 @@ env:
   LLVM_BUILD_TYPE: RelWithDebInfo
   LLVM_INSTALL_DIR: externals/llvm
   OV_REPO: https://x-access-token:${{ secrets.OV_TOKEN }}@github.com/dchigarev/openvino.git
-  OV_VERSION: 5c03ce58d8ebfa31c0d33b52b97af1530f6031b2
+  OV_VERSION: eec19f7650627dea8f8ff69a0e022b9f25a17a13
   OV_INSTALL_DIR: externals/openvino
 
 jobs:
@@ -221,7 +221,7 @@ jobs:
         run: |
           [ -z "$ONEAPI_ROOT" ] && . /opt/intel/oneapi/setvars.sh
           bin_dir="$PWD/${{env.OV_INSTALL_DIR}}/bin/intel64/Release"
-          export OV_MLIR_MODE=GC_GPU
+          export OV_MLIR=1
           filter=$(printf '%s:' \
             'MLIRExecution.SimpleMatmulf16' \
             'MLIRExecution.SDPABasic' \
