@@ -4,8 +4,9 @@ set -e
 echo "Installing dependencies"
 sudo apt-get update
 sudo apt-get dist-upgrade -y
-sudo apt-get install -yq \
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
     binutils \
+    ccache \
     clang \
     clang-format \
     clang-tidy \
