@@ -62,10 +62,6 @@ struct Options {
   llvm::cl::opt<bool> dumpSpirv{
       "dump-spirv", llvm::cl::desc("Dump spirv for generated kernels."),
       llvm::cl::init(false), llvm::cl::cat(runnerCategory)};
-  llvm::cl::opt<std::string> objDumpFile{
-      "obj-dump-file",
-      llvm::cl::desc("Dump the compiled object to the specified file."),
-      llvm::cl::value_desc("file path"), llvm::cl::cat(runnerCategory)};
 };
 } // namespace
 
@@ -74,8 +70,7 @@ void findFunc(Options &opts, ModuleOp mod) {
 
   if (opts.skipPipeline) {
     matcher = [](ArrayRef<Type> args, ModuleOp &mod) {
-      if (args.size() != 3)
-        return false;
+      if (args.size() != 3) return false;
       auto ctx = mod.getContext();
       auto ptrType = LLVM::LLVMPointerType::get(ctx);
       return args[0] == ptrType && args[1] == ptrType &&
@@ -145,7 +140,6 @@ int main(int argc, char **argv) {
   builderOpts.funcName = opts.mainFuncName;
   builderOpts.dumpIr = opts.dumpIr;
   builderOpts.dumpSpirv = opts.dumpSpirv;
-  builderOpts.enableObjectDump = !opts.objDumpFile.getValue().empty();
   builderOpts.sharedLibPaths = sharedLibs;
   builderOpts.pipeline =
       opts.skipPipeline ? [](OpPassManager &, gc::GPUPipelineOptions &) {}
@@ -159,11 +153,6 @@ int main(int argc, char **argv) {
   auto runtime = gcGetOrReport(gc::gpu::OclRuntime::get());
   auto oclMod = gcGetOrReport(builder.build(runtime));
   assert(oclMod->isStatic);
-
-  if (!opts.objDumpFile.getValue().empty()) {
-    gcLogD("Dumping the compiled object to ", opts.objDumpFile.getValue());
-    oclMod->dumpToObjectFile(opts.objDumpFile.getValue());
-  }
 
   auto queue = gcGetOrReport(runtime.createQueue());
   gc::gpu::OclContext ctx{runtime, queue};

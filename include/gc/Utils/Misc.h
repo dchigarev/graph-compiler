@@ -7,71 +7,34 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef MISCUTILS_H
-#define MISCUTILS_H
+#pragma once
 
-#include <algorithm>
 #include <cassert>
-#include <numeric>
+#include <cstdlib>
+#include <type_traits>
 
-#include "llvm/ADT/bit.h"
+#include "llvm/ADT/StringRef.h"
 
-template <typename T> static T isPow2(T value) {
-  assert(value > 0);
-  return (value & (value - 1)) == 0;
-}
+namespace mlir::gc::misc {
 
-// Round to the largest power of 2 that is <= value.
-template <typename T> static T floorPow2(T value) {
-  if (value == 0)
-    return 0;
-  assert(value > 0);
-  auto v = static_cast<std::make_unsigned_t<T>>(value);
-  return T(1) << (llvm::bit_width(v) - 1);
-}
+template <typename T = const char *>
+T getEnv(const char *name, T defaultValue = T()) {
+  auto env = std::getenv(name);
+  if (!env) return defaultValue;
 
-// Round to the smallest power of 2 that is >= value.
-template <typename T> static T ceilPow2(T value) {
-  if (value == 0)
-    return 0;
-  assert(value > 0);
-  auto v = static_cast<std::make_unsigned_t<T>>(value);
-  return llvm::bit_ceil(v);
-}
-
-// Find a factor of the number that is close to the given value and, if
-// possible, is a power of 2.
-template <typename T> T findFactor(T number, T closeTo) {
-  closeTo = std::max(T(1), std::min(closeTo, number));
-
-  for (T max = number - closeTo + 1, i = 0; i < max; ++i) {
-    T up = closeTo + i;
-    if (auto pow2 = ceilPow2(up); number % pow2 == 0) {
-      return pow2;
-    }
-    if (i < closeTo - 1) {
-      T down = closeTo - i;
-      if (auto pow2 = floorPow2(down); pow2 != 1 && number % pow2 == 0) {
-        return pow2;
-      }
-      if (number % down == 0) {
-        return down;
-      }
-    }
-    if (number % up == 0) {
-      return up;
-    }
+  if constexpr (std::is_same_v<T, const char *>) {
+    return env;
+  } else if constexpr (std::is_same_v<T, bool>) {
+    return *env == '1' || *env == 'y' || *env == 'Y' || *env == 't' ||
+           *env == 'T';
+  } else if constexpr (std::is_convertible_v<llvm::StringRef, T>) {
+    return (T)llvm::StringRef(env);
+  } else if constexpr (std::is_integral_v<T>) {
+    return static_cast<T>(std::atoi(env));
+  } else if constexpr (std::is_floating_point_v<T>) {
+    return static_cast<T>(std::atof(env));
+  } else {
+    static_assert(std::is_same_v<T, void>, "Unsupported type");
   }
-
-  return closeTo;
 }
-
-template <typename L, typename T> static T findClosestDiv(L &sorted, T value) {
-  for (int i = sorted.size() - 1; i >= 0; --i) {
-    if (value % sorted[i] == 0) {
-      return static_cast<T>(sorted[i]);
-    }
-  }
-  return static_cast<T>(1);
-}
-#endif // MISCUTILS_H
+}; // namespace mlir::gc::misc

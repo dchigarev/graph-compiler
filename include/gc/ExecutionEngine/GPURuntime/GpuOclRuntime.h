@@ -29,10 +29,10 @@ constexpr char GPU_OCL_MOD_DESTRUCTOR[] = "gcGpuOclModuleDestructor";
 #define CL_TARGET_OPENCL_VERSION 300
 #include <CL/cl.h>
 
+#include "gc/ExecutionEngine/JitEngine.h"
 #include "gc/Transforms/Passes.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 
@@ -202,10 +202,6 @@ struct OclModule {
     return (outArgsMask & (1ULL << idx)) != 0;
   }
 
-  void dumpToObjectFile(StringRef filename) const {
-    engine->dumpToObjectFile(filename);
-  }
-
 private:
   friend OclModuleBuilder;
   template <unsigned N> friend struct DynamicExecutor;
@@ -220,24 +216,32 @@ private:
     WrappedMainFunc wrappedMain;
   };
   const MainFunc main;
-  const SmallVector<Type> argTypes;
+  const uint8_t argCount;
   const uint64_t outArgsMask;
-  std::unique_ptr<ExecutionEngine> engine;
+  std::unique_ptr<JitEngine> engine;
+#ifndef NDEBUG
+  const SmallVector<Type> argTypes;
+#endif
 
   explicit OclModule(const OclRuntime &runtime, const bool isStatic,
-                     const MainFunc main, const ArrayRef<Type> argTypes,
+                     const MainFunc main, uint8_t argCount,
                      const uint64_t outArgsMask,
-                     std::unique_ptr<ExecutionEngine> engine)
-      : runtime(runtime), isStatic(isStatic), main(main),
-        argTypes(argTypes.begin(), argTypes.end()), outArgsMask(outArgsMask),
-        engine(std::move(engine)) {}
+                     std::unique_ptr<JitEngine> engine,
+                     const ArrayRef<Type> argTypesRef = {})
+      : runtime(runtime), isStatic(isStatic), main(main), argCount(argCount),
+        outArgsMask(outArgsMask), engine(std::move(engine))
+#ifndef NDEBUG
+        ,
+        argTypes(argTypesRef.begin(), argTypesRef.end())
+#endif
+  {
+  }
 };
 
 struct OclModuleBuilderOpts {
   StringRef funcName = {};
   bool dumpIr = false;
   bool dumpSpirv = false;
-  bool enableObjectDump = false;
   bool callFinish = false;
   ArrayRef<StringRef> sharedLibPaths = {};
   std::function<void(OpPassManager &, GPUPipelineOptions &)> pipeline = nullptr;
@@ -267,11 +271,12 @@ private:
   ModuleOp mlirModule;
   const bool dumpIr;
   const bool dumpSpirv;
-  const bool enableObjectDump;
+  const bool callFinish;
   const ArrayRef<StringRef> sharedLibPaths;
   std::function<void(OpPassManager &, GPUPipelineOptions &)> pipeline;
-  const StringRef funcName;
+  SmallString<128> funcName;
   SmallVector<Type> argTypes;
+  uint8_t argCount;
   uint64_t outArgsMask;
   std::shared_mutex mux;
   std::unordered_map<const OclDevCtxPair, std::shared_ptr<const OclModule>>
@@ -289,8 +294,6 @@ template <unsigned N> struct OclModuleExecutorBase {
     clPtrs.clear();
     argCounter = 0;
   }
-
-  Type getArgType(unsigned idx) const { return mod->argTypes[idx]; }
 
   [[nodiscard]] bool isSmall() const { return args.small(); }
 
@@ -315,7 +318,7 @@ protected:
     auto rt = OclRuntime::get(ctx.queue);
     assert(rt);
     assert(*rt == mod->runtime);
-    assert(argCounter == mod->argTypes.size());
+    assert(argCounter == mod->argCount);
   }
 
   void checkArg(const void *alignedPtr, bool isUsm = true) const {
@@ -370,7 +373,7 @@ template <unsigned N = 8> struct StaticExecutor : OclModuleExecutorBase<N> {
       arg(reinterpret_cast<void *>(ptr1));
       va_list args;
       va_start(args, ptr1);
-      for (unsigned i = 0, n = this->mod->argTypes.size() - 1; i < n; i++) {
+      for (unsigned i = 0, n = this->mod->argCount - 1; i < n; i++) {
         arg(va_arg(args, void *));
       }
       va_end(args);
@@ -413,21 +416,23 @@ template <unsigned N = 64> struct DynamicExecutor : OclModuleExecutorBase<N> {
            bool isUsm = true) {
 #ifndef NDEBUG
     this->checkArg(alignedPtr, isUsm);
-    if (auto type =
-            llvm::dyn_cast<MemRefType>(this->getArgType(this->argCounter))) {
-      if (type.hasStaticShape()) {
-        auto size = type.getShape();
-        assert(rank == size.size());
-        for (size_t i = 0; i < rank; i++) {
-          assert(shape[i] == size[i]);
-        }
-
-        SmallVector<int64_t> expectedStrides;
-        if (int64_t expectedOffset; !failed(
-                type.getStridesAndOffset(expectedStrides, expectedOffset))) {
-          assert(expectedOffset == offset);
+    if (!this->mod->argTypes.empty()) {
+      if (auto type = llvm::dyn_cast<MemRefType>(
+              this->mod->argTypes[this->argCounter])) {
+        if (type.hasStaticShape()) {
+          auto size = type.getShape();
+          assert(rank == size.size());
           for (size_t i = 0; i < rank; i++) {
-            assert(expectedStrides[i] == strides[i]);
+            assert(shape[i] == size[i]);
+          }
+
+          SmallVector<int64_t> expectedStrides;
+          if (int64_t expectedOffset; !failed(
+                  type.getStridesAndOffset(expectedStrides, expectedOffset))) {
+            assert(expectedOffset == offset);
+            for (size_t i = 0; i < rank; i++) {
+              assert(expectedStrides[i] == strides[i]);
+            }
           }
         }
       }

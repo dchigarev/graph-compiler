@@ -17,7 +17,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(
   GraphCompiler
-  VERSION "0.1.0"
+  VERSION "1"
   LANGUAGES C CXX)
 
 # ########################### Build options ####################################
@@ -71,6 +71,18 @@ target_include_directories(
   INTERFACE $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
             $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:include>)
+
+find_package(Git QUIET)
+add_custom_target(
+  GcVersion ALL
+  COMMAND
+    ${CMAKE_COMMAND} -DPROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+    -DBUILD_DIR="${PROJECT_BINARY_DIR}" -DGIT_EXECUTABLE="${GIT_EXECUTABLE}"
+    -DVERSION_CODE="${PROJECT_VERSION_MAJOR}" -P
+    "${PROJECT_SOURCE_DIR}/cmake/version.cmake"
+  BYPRODUCTS "${PROJECT_BINARY_DIR}/include/gc/Version.h"
+  COMMENT "Generating Version.h")
+add_dependencies(GcInterface GcVersion)
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 include(functions)

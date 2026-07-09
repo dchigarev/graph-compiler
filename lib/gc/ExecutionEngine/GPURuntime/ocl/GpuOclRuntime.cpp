@@ -5,22 +5,23 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-#include <variant>
 
-#include "gc/ExecutionEngine/GPURuntime/GpuOclRuntime.h"
 #include <CL/cl_ext.h>
 
+#include "gc/ExecutionEngine/Cache.h"
+#include "gc/ExecutionEngine/GPURuntime/GpuOclRuntime.h"
+#include "gc/ExecutionEngine/JitEngine.h"
 #include "gc/Transforms/Passes.h"
 #include "gc/Utils/Error.h"
 #include "gc/Utils/Log.h"
-#include "gc/Utils/Transform.h"
 
-#include "llvm/ADT/StringExtras.h"
-#include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Error.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 
@@ -327,7 +328,8 @@ private:
 
     for (size_t i = 0, n = kernel->argSize.size(); i < n; i++) {
       auto size = kernel->argSize[i];
-      void *ptr = va_arg(args, void *);
+      void *ptr =
+          va_arg(args, void *); // NOLINT(clang-analyzer-valist.Uninitialized)
 
       if (size) {
         gcLogD("Setting kernel ", cloned.kernel, " argument ", i, " to ",
@@ -718,7 +720,7 @@ void OclContext::setLastEvent(cl_event event) {
   }
 }
 
-static void destroyKernels(const std::unique_ptr<ExecutionEngine> &engine) {
+static void destroyKernels(const std::unique_ptr<JitEngine> &engine) {
   if (auto fn = engine->lookup(GPU_OCL_MOD_DESTRUCTOR)) {
     reinterpret_cast<void (*)()>(fn.get())();
   } else {
@@ -863,10 +865,7 @@ StringRef createStaticMain(ModuleOp &module, const StringRef &funcName,
   return newFunc.getName();
 }
 
-StringRef getFuncName(const OclModuleBuilderOpts &opts, ModuleOp &mod) {
-  if (!opts.funcName.empty()) {
-    return opts.funcName;
-  }
+StringRef getFuncName(ModuleOp &mod) {
   for (auto &op : mod.getBody()->getOperations()) {
     if (auto fn = dyn_cast<func::FuncOp>(op);
         fn && !fn.isExternal() && fn.isPublic()) {
@@ -883,35 +882,15 @@ StringRef getFuncName(const OclModuleBuilderOpts &opts, ModuleOp &mod) {
 OclModuleBuilder::OclModuleBuilder(ModuleOp module,
                                    const OclModuleBuilderOpts &opts)
     : mlirModule(module), dumpIr(opts.dumpIr), dumpSpirv(opts.dumpSpirv),
-      enableObjectDump(opts.enableObjectDump),
-      sharedLibPaths(opts.sharedLibPaths),
-      pipeline(opts.pipeline ? opts.pipeline
-                             : [callFinish = opts.callFinish](OpPassManager &pm,
-                                  GPUPipelineOptions &
-                                      opts) {
-                                        opts.callFinish = callFinish;
-                                        populateGPUPipeline(pm, opts);
-                                       }),
-      funcName(getFuncName(opts, mlirModule)), argTypes(),
-      outArgsMask(0xFFFFFFFFFFFFFFFFULL) {
-  if (auto fn = mlirModule.lookupSymbol<FunctionOpInterface>(funcName)) {
-    auto args = fn.getArgumentTypes();
-    auto rets = fn.getResultTypes();
-    argTypes.reserve(args.size() + rets.size());
-    argTypes.append(args.begin(), args.end());
-    argTypes.append(rets.begin(), rets.end());
-    if (fn.getNumResults()) {
-      outArgsMask = 0xFFFFFFFFFFFFFFFFULL << args.size();
-      for (unsigned i = 0, n = args.size(); i < n; ++i) {
-        if (fn.getArgAttr(i, "bufferize.result")) {
-          outArgsMask |= 1ULL << i;
-        }
-      }
-    }
-  } else {
-    gcReportErr("Failed to find the function '", funcName.begin(),
-                "' in the module.");
-  }
+      callFinish(opts.callFinish), sharedLibPaths(opts.sharedLibPaths),
+      pipeline(opts.pipeline), funcName(opts.funcName), argTypes{}, argCount(0),
+      outArgsMask(0) {
+  if (pipeline) return;
+  pipeline = [callFinish = opts.callFinish](OpPassManager &pm,
+                                            GPUPipelineOptions &opts) {
+    opts.callFinish = callFinish;
+    populateGPUPipeline(pm, opts);
+  };
 }
 
 llvm::Expected<std::shared_ptr<const OclModule>>
@@ -949,86 +928,127 @@ OclModuleBuilder::build(cl_device_id device, cl_context context) {
 
 llvm::Expected<std::shared_ptr<const OclModule>>
 OclModuleBuilder::build(const OclRuntime::Ext &ext) {
-  OclRuntime rt(ext);
-  auto expectedQueue = rt.createQueue();
-  CHECKE(expectedQueue, "Failed to create queue!");
-  struct OclQueue {
-    cl_command_queue queue;
-    ~OclQueue() { clReleaseCommandQueue(queue); }
-  } queue{*expectedQueue};
-  OclContext oclCtx{rt, queue.queue, false};
-
   ModuleOp mod;
+  OclRuntime rt(ext);
   StringRef staticMain;
-  std::unique_ptr<ExecutionEngine> eng;
-  ExecutionEngineOptions opts;
-  opts.jitCodeGenOptLevel = llvm::CodeGenOptLevel::Aggressive;
-  opts.enableObjectDump = enableObjectDump;
-  opts.sharedLibPaths = sharedLibPaths;
+  std::unique_ptr<JitEngine> eng;
+  auto dev = ext.device;
+  OclModule::MainFunc main = {nullptr};
+  GpuDevicePropsOptions devProps;
+  devProps.id = clGetDevInfo(cl_uint, dev, CL_DEVICE_ID_INTEL);
+
+  struct __attribute__((packed)) {
+    size_t id;
+    bool callFinish;
+  } salt{devProps.id, callFinish};
+  auto cacheDir = cache::getCacheDir(
+      mlirModule, {reinterpret_cast<uint8_t *>(&salt), sizeof(salt)});
+  if (auto cached = cache::load(cacheDir, sharedLibPaths)) {
+    eng = std::move(cached->first);
+    auto &info = cached->second;
+    funcName = info.mainFuncName;
+    if (info.isStatic) staticMain = funcName;
+    argCount = info.argCount;
+    outArgsMask = info.outArgsMask;
+    cacheDir.clear();
+  } else {
+    if (outArgsMask == 0) {
+      if (funcName.empty()) funcName = getFuncName(mlirModule);
+      outArgsMask = 0xFFFFFFFFFFFFFFFFULL;
+      if (auto fn = mlirModule.lookupSymbol<FunctionOpInterface>(funcName)) {
+        auto args = fn.getArgumentTypes();
+        auto rets = fn.getResultTypes();
+        argTypes.reserve(args.size() + rets.size());
+        argTypes.append(args.begin(), args.end());
+        argTypes.append(rets.begin(), rets.end());
+        argCount = argTypes.size();
+        if (fn.getNumResults()) {
+          outArgsMask = 0xFFFFFFFFFFFFFFFFULL << args.size();
+          for (unsigned i = 0, n = args.size(); i < n; ++i) {
+            if (fn.getArgAttr(i, "bufferize.result")) {
+              outArgsMask |= 1ULL << i;
+            }
+          }
+        }
+      } else {
+        gcReportErr("Failed to find the function '", funcName.begin(),
+                    "' in the module.");
+      }
+    }
+
+    auto expectedQueue = rt.createQueue();
+    CHECKE(expectedQueue, "Failed to create queue!");
+    struct OclQueue {
+      cl_command_queue queue;
+      ~OclQueue() { clReleaseCommandQueue(queue); }
+    } queue{*expectedQueue};
+    OclContext oclCtx{rt, queue.queue, false};
+
+    ExecutionEngineOptions opts;
+    opts.jitCodeGenOptLevel = llvm::CodeGenOptLevel::Aggressive;
+    opts.enableObjectDump = true;
+    opts.sharedLibPaths = sharedLibPaths;
 #ifdef NDEBUG
-  opts.enableGDBNotificationListener = false;
-  opts.enablePerfNotificationListener = false;
+    opts.enableGDBNotificationListener = false;
+    opts.enablePerfNotificationListener = false;
 #endif
 
-  auto dev = ext.device;
-  GpuDevicePropsOptions devProps;
-  GPUPipelineOptions pipelineOpts;
-  pipelineOpts.deviceProps = &devProps;
-  pipelineOpts.dump = dumpIr;
-  devProps.id = clGetDevInfo(cl_uint, dev, CL_DEVICE_ID_INTEL);
-  devProps.name = clGetDevInfo(std::string, dev, CL_DEVICE_NAME);
-  devProps.maxWgSize = clGetDevInfo(size_t, dev, CL_DEVICE_MAX_WORK_GROUP_SIZE);
-  devProps.sgSizes =
-      clGetDevInfo(SmallVector<size_t>, dev, CL_DEVICE_SUB_GROUP_SIZES_INTEL);
+    GPUPipelineOptions pipelineOpts;
+    pipelineOpts.deviceProps = &devProps;
+    pipelineOpts.dump = dumpIr;
+    devProps.name = clGetDevInfo(std::string, dev, CL_DEVICE_NAME);
+    devProps.maxWgSize =
+        clGetDevInfo(size_t, dev, CL_DEVICE_MAX_WORK_GROUP_SIZE);
+    devProps.sgSizes =
+        clGetDevInfo(SmallVector<size_t>, dev, CL_DEVICE_SUB_GROUP_SIZES_INTEL);
 
-  mod = mlirModule.clone();
-  PassManager pm{mod.getContext()};
-  pipeline(pm, pipelineOpts);
-  CHECK(!pm.run(mod).failed(), "GPU pipeline failed!");
-  staticMain = createStaticMain(mod, funcName, argTypes);
-  auto expectedEng = ExecutionEngine::create(mod, opts);
-  CHECKE(expectedEng, "Failed to create ExecutionEngine!");
-  eng = std::move(*expectedEng);
-  eng->registerSymbols(OclRuntime::Exports::symbolMap);
+    mod = mlirModule.clone();
+    PassManager pm{mod.getContext()};
+    pipeline(pm, pipelineOpts);
+    CHECK(!pm.run(mod).failed(), "GPU pipeline failed!");
+    staticMain = createStaticMain(mod, funcName, argTypes);
+    auto expectedEng = ExecutionEngine::create(mod, opts);
+    CHECKE(expectedEng, "Failed to create ExecutionEngine!");
+    eng = std::make_unique<::gc::JitEngine>(std::move(*expectedEng));
 
-  if (dumpSpirv) {
-    mod->walk([&](LLVM::GlobalOp global) {
-      auto isaKernel = [&](LLVM::GlobalOp op) {
-        return op.getName().starts_with("gcGpuOclKernel_") &&
-               op.getName().ends_with("SPIRV");
-      };
+    if (dumpSpirv) {
+      mod->walk([&](LLVM::GlobalOp global) {
+        auto isaKernel = [&](LLVM::GlobalOp op) {
+          return op.getName().starts_with("gcGpuOclKernel_") &&
+                 op.getName().ends_with("SPIRV");
+        };
 
-      if (!isaKernel(global)) return WalkResult::skip();
+        if (!isaKernel(global)) return WalkResult::skip();
 
-      auto name = global.getName();
-      gcLogD("Found a kernel to dump (", name.str(), ")");
+        auto name = global.getName();
+        gcLogD("Found a kernel to dump (", name.str(), ")");
 
-      std::error_code ec;
-      std::string filename = "GC_" + name.str() + ".spv";
-      llvm::raw_fd_ostream spvStream(filename, ec);
-      if (ec) {
-        gcLogE("Failed to create a file `", filename,
-               "`, error message: ", ec.message());
+        std::error_code ec;
+        std::string filename = "GC_" + name.str() + ".spv";
+        llvm::raw_fd_ostream spvStream(filename, ec);
+        if (ec) {
+          gcLogE("Failed to create a file `", filename,
+                 "`, error message: ", ec.message());
+          return WalkResult::skip();
+        }
+
+        auto val = global.getValue();
+        assert(val && "unexpected empty kernel");
+        auto string = llvm::cast<mlir::StringAttr>(*val);
+        spvStream.write(string.data(), string.size());
+
+        if (spvStream.has_error()) {
+          gcLogE("An error occurred while writing to `", filename, "`.");
+          return WalkResult::skip();
+        }
+
+        spvStream.flush();
         return WalkResult::skip();
-      }
-
-      auto val = global.getValue();
-      assert(val && "unexpected empty kernel");
-      auto string = llvm::cast<mlir::StringAttr>(*val);
-      spvStream.write(string.data(), string.size());
-
-      if (spvStream.has_error()) {
-        gcLogE("An error occured while writing to `", filename, "`.");
-        return WalkResult::skip();
-      }
-
-      spvStream.flush();
-      return WalkResult::skip();
-    });
+      });
+    }
   }
 
-  OclModule::MainFunc main = {nullptr};
-
+  eng->registerSymbols(OclRuntime::Exports::symbolMap);
   if (staticMain.empty()) {
     auto expect = eng->lookupPacked(funcName);
     CHECKE(expect, "Packed function '", funcName.begin(), "' not found!");
@@ -1043,8 +1063,19 @@ OclModuleBuilder::build(const OclRuntime::Ext &ext) {
   if (auto it = cache.find(ext); it != cache.end()) {
     return it->second;
   }
-  std::shared_ptr<const OclModule> ptr(new OclModule(
-      rt, !staticMain.empty(), main, argTypes, outArgsMask, std::move(eng)));
+
+  if (!cacheDir.empty()) {
+    cache::CachedEngineInfo info(
+        !staticMain.empty() ? staticMain.str() : funcName.str(),
+        !staticMain.empty(), argTypes.size(), outArgsMask);
+    SmallDenseMap<StringRef, ModuleOp> dumpModules{{"module.mlir", mlirModule},
+                                                   {"module.llir", mod}};
+    cache::save(cacheDir, eng.get(), info, dumpModules);
+  }
+
+  std::shared_ptr<const OclModule> ptr(
+      new OclModule(rt, !staticMain.empty(), main, argCount, outArgsMask,
+                    std::move(eng), argTypes));
   return cache.emplace(OclDevCtxPair(ext.device, ext.context), ptr)
       .first->second;
 }

@@ -1,1 +1,11 @@
+gc_add_mlir_library(
+  GcJitEngine
+  JitEngine.cpp
+  LINK_LIBS
+  PUBLIC
+  GcInterface
+  ${MLIR_EXECUTION_ENGINE}
+  LLVMOrcJIT
+  LLVMOrcTargetProcess)
+
 add_subdirectory(GPURuntime)
