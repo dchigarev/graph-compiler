@@ -18,7 +18,7 @@ env:
   LLVM_BUILD_TYPE: RelWithDebInfo
   LLVM_INSTALL_DIR: externals/llvm
   OV_REPO: https://x-access-token:${{ secrets.OV_TOKEN }}@github.com/dchigarev/openvino.git
-  OV_VERSION: 6d2bd8d5995617579e45209e939d1103b1932e0f
+  OV_VERSION: mlir-gpu-gc-integration
   OV_INSTALL_DIR: externals/openvino
 
 jobs:
@@ -70,7 +70,8 @@ jobs:
 
           venv_sha=$(sha scripts/create_venv.sh)
           llvm_sha=$(sha $venv_sha cmake/llvm-version.txt scripts/compile.sh patches/*.patch)
-          ov_sha=$(sha $llvm_sha $OV_VERSION)
+          ov_sha=$(git ls-remote "$OV_REPO" "$OV_VERSION" | awk '{print $1}')
+          ov_sha=$(sha $llvm_sha $ov_sha)
           echo "venv-key=venv-${venv_sha}" >> "$GITHUB_OUTPUT"
           echo "llvm-key=llvm-${llvm_sha}" >> "$GITHUB_OUTPUT"
           echo "ov-key=ov-${ov_sha}" >> "$GITHUB_OUTPUT"
