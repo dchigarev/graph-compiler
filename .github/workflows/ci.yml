@@ -18,7 +18,7 @@ env:
   LLVM_BUILD_TYPE: RelWithDebInfo
   LLVM_INSTALL_DIR: externals/llvm
   OV_REPO: https://x-access-token:${{ secrets.OV_TOKEN }}@github.com/dchigarev/openvino.git
-  OV_VERSION: eec19f7650627dea8f8ff69a0e022b9f25a17a13
+  OV_VERSION: 6d2bd8d5995617579e45209e939d1103b1932e0f
   OV_INSTALL_DIR: externals/openvino
 
 jobs:
@@ -150,10 +150,11 @@ jobs:
           path: ${{ env.LLVM_INSTALL_DIR }}
           key: ${{ steps.setup-cache.outputs.llvm-key }}
 
-      - name: clang-tidy
-        run: |
-          echo "${{ steps.ls.outputs.files }}" | tr ':' '\n' | sed -nE '/\.(h|cpp)$/p' \
-          | xargs -r -P $(nproc) clang-tidy -p build --warnings-as-errors='*'
+      # Temporary disabled due to https://github.com/llvm/llvm-project/issues/208735
+      # - name: clang-tidy
+      #   run: |
+      #     echo "${{ steps.ls.outputs.files }}" | tr ':' '\n' | sed -nE '/\.(h|cpp)$/p' \
+      #     | xargs -r -P $(nproc) clang-tidy -p build --warnings-as-errors='*'
 
       - name: Run lit tests
         run: |

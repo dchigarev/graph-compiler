@@ -18,14 +18,18 @@
  */
 
 #include "gc/Transforms/Passes.h"
+
+#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/InitAllPasses.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
-namespace mlir::gc {
-void registerGPUPipeline();
-} // namespace mlir::gc
-
 int main(int argc, char *argv[]) {
+  mlir::registerAllPasses();
   mlir::DialectRegistry &registry = mlir::gc::getDialectRegistry();
+  registry.insert<mlir::transform::TransformDialect>();
+  mlir::linalg::registerTransformDialectExtension(registry);
+
   mlir::gc::registerGPUPipeline();
   return mlir::asMainReturnCode(mlir::MlirOptMain(
       argc, argv, "Graph Compiler modular optimizer driver\n", registry));

@@ -19,6 +19,8 @@
 using namespace mlir;
 using namespace mlir::linalgx;
 
+namespace {
+
 //===----------------------------------------------------------------------===//
 // Attention Helpers
 //===----------------------------------------------------------------------===//
@@ -143,6 +145,8 @@ getAttentionIteratorTypes(int64_t domainRank, AffineMap qMap, AffineMap kMap,
   return iteratorTypes;
 }
 
+} // namespace
+
 //===----------------------------------------------------------------------===//
 // AttentionOp
 //===----------------------------------------------------------------------===//
@@ -165,6 +169,14 @@ FailureOr<TilingResult>
 AttentionOp::getTiledImplementation(OpBuilder &builder,
                                     ArrayRef<OpFoldResult> offsets,
                                     ArrayRef<OpFoldResult> sizes) {
+  return getTiledImplementation(builder, offsets, sizes, {});
+}
+
+FailureOr<TilingResult> AttentionOp::getTiledImplementation(
+    OpBuilder &builder, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes,
+    ArrayRef<InnerTileAlignment> innerTileAlignments) {
+  (void)innerTileAlignments;
   assert(offsets.size() == static_cast<size_t>(getIterationDomainRank()));
   assert(sizes.size() == static_cast<size_t>(getIterationDomainRank()));
 
@@ -265,6 +277,13 @@ FailureOr<TilingResult>
 AttentionOp::generateResultTileValue(OpBuilder &builder, unsigned resultNumber,
                                      ArrayRef<OpFoldResult> offsets,
                                      ArrayRef<OpFoldResult> sizes) {
+  return generateResultTileValue(builder, resultNumber, offsets, sizes, {});
+}
+
+FailureOr<TilingResult> AttentionOp::generateResultTileValue(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes,
+    ArrayRef<InnerTileAlignment> innerTileAlignments) {
   // Input offsets and sizes here are from the POV of the outputMap. We need to
   // normalize these offsets and size for it to be useful.
 
@@ -281,5 +300,6 @@ AttentionOp::generateResultTileValue(OpBuilder &builder, unsigned resultNumber,
     normalizedOffsets[dim] = offsets[i];
     normalizedSizes[dim] = sizes[i];
   }
-  return getTiledImplementation(builder, normalizedOffsets, normalizedSizes);
+  return getTiledImplementation(builder, normalizedOffsets, normalizedSizes,
+                                innerTileAlignments);
 }

@@ -65,7 +65,7 @@ struct Options {
 };
 } // namespace
 
-void findFunc(Options &opts, ModuleOp mod) {
+static void findFunc(Options &opts, ModuleOp mod) {
   std::function<bool(ArrayRef<Type>, ModuleOp &)> matcher;
 
   if (opts.skipPipeline) {

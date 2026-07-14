@@ -20,6 +20,9 @@ project(
   VERSION "1"
   LANGUAGES C CXX)
 
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 # ########################### Build options ####################################
 option(GC_ENABLE_TEST "Build the tests" ON)
 option(GC_ENABLE_TOOLS "Build the tools" ON)
@@ -45,9 +48,8 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -ffunction-sections -fdata-sections")
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO
     "-O2 -g -DNDEBUG -ffunction-sections -fdata-sections")
-
-if(NOT GC_DYLINK)
-  add_compile_options(-fvisibility=hidden)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(-Werror -Werror=missing-declarations)
 endif()
 
 # Silence a false positive GCC -Wunused-but-set-parameter warning
@@ -71,6 +73,10 @@ target_include_directories(
   INTERFACE $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
             $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:include>)
+if(NOT GC_DYLINK AND NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+  target_compile_options(GcInterface INTERFACE -ffunction-sections
+                                               -fdata-sections)
+endif()
 
 find_package(Git QUIET)
 add_custom_target(
@@ -110,7 +116,8 @@ else()
   get_property(GC_MLIR_LIBS GLOBAL PROPERTY GC_MLIR_LIBS)
   get_property(GC_PASS_LIBS GLOBAL PROPERTY GC_PASS_LIBS)
   get_property(GC_DIALECT_LIBS GLOBAL PROPERTY GC_DIALECT_LIBS)
-  set(GC_LIBS ${GC_MLIR_LIBS} ${GC_PASS_LIBS} ${GC_DIALECT_LIBS})
+  set(GC_LIBS ${PROJECT_NAME} ${GC_MLIR_LIBS} ${GC_PASS_LIBS}
+              ${GC_DIALECT_LIBS})
 endif()
 
 install(
@@ -126,8 +133,22 @@ install(
 export(EXPORT ${PROJECT_NAME}Targets
        FILE "${PROJECT_BINARY_DIR}/${PROJECT_NAME}Targets.cmake")
 
+configure_package_config_file(
+  "${PROJECT_SOURCE_DIR}/cmake/${PROJECT_NAME}Config.cmake.in"
+  "${PROJECT_BINARY_DIR}/${PROJECT_NAME}Config.cmake"
+  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}")
+
+write_basic_package_version_file(
+  "${PROJECT_BINARY_DIR}/${PROJECT_NAME}ConfigVersion.cmake"
+  VERSION "${PROJECT_VERSION}"
+  COMPATIBILITY SameMajorVersion)
+
 install(
   EXPORT ${PROJECT_NAME}Targets
   FILE ${PROJECT_NAME}Targets.cmake
-  DESTINATION lib/cmake/${PROJECT_NAME})
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}")
+
+install(FILES "${PROJECT_BINARY_DIR}/${PROJECT_NAME}Config.cmake"
+              "${PROJECT_BINARY_DIR}/${PROJECT_NAME}ConfigVersion.cmake"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}")
 # ##############################################################################

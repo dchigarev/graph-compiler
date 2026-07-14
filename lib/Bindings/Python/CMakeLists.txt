@@ -14,6 +14,8 @@ execute_process(
   OUTPUT_VARIABLE nanobind_ROOT)
 find_package(nanobind CONFIG REQUIRED)
 
+add_compile_options(-Wno-error=cast-qual -Wno-error=missing-declarations
+                    -Wno-switch-default -Wno-covered-switch-default)
 nanobind_add_module(graph_compiler Nanobind.cpp)
 gc_link_mlir_tool(graph_compiler PRIVATE GcGpuOclRuntime)
 

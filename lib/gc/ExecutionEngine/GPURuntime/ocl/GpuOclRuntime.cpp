@@ -164,8 +164,8 @@ struct Kernel {
 
   explicit Kernel(cl_program program, cl_kernel kernel, const size_t *blockSize,
                   size_t argNum, const size_t *argSize)
-      : program(program), kernel(kernel),
-        localSize{blockSize[0], blockSize[1], blockSize[2]},
+      : program(program),
+        kernel(kernel), localSize{blockSize[0], blockSize[1], blockSize[2]},
         argSize(argSize, argSize + argNum) {
 #ifndef NDEBUG
     std::string args;
@@ -740,8 +740,8 @@ OclModule::~OclModule() {
 // buffers. The function will call the original function with the context,
 // buffers and the offset/shape/strides, statically created from the
 // memref descriptor.
-StringRef createStaticMain(ModuleOp &module, const StringRef &funcName,
-                           const ArrayRef<Type> argTypes) {
+static StringRef createStaticMain(ModuleOp &module, const StringRef &funcName,
+                                  const ArrayRef<Type> argTypes) {
   auto mainFunc = module.lookupSymbol<LLVM::LLVMFuncOp>(funcName);
   if (!mainFunc) {
     gcReportErr("The function '", funcName.begin(), "' not found.");
@@ -865,7 +865,7 @@ StringRef createStaticMain(ModuleOp &module, const StringRef &funcName,
   return newFunc.getName();
 }
 
-StringRef getFuncName(ModuleOp &mod) {
+static StringRef getFuncName(ModuleOp &mod) {
   for (auto &op : mod.getBody()->getOperations()) {
     if (auto fn = dyn_cast<func::FuncOp>(op);
         fn && !fn.isExternal() && fn.isPublic()) {

@@ -23,5 +23,6 @@ gc_add_mlir_tool(gc-opt GcOpt.cpp)
 gc_link_mlir_tool(gc-opt GcGpuPasses)
 
 if(NOT GC_DYLINK)
-  gc_link_mlir_tool(gc-opt MLIROptLib)
+  gc_link_mlir_tool(gc-opt MLIROptLib MLIRLinalgTransformOps
+                    MLIRLLVMIRTransforms MLIRTransformDialect)
 endif()

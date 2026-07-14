@@ -59,6 +59,8 @@ DialectRegistry &getDialectRegistry();
 
 void populateGPUPipeline(mlir::OpPassManager &, const GPUPipelineOptions &);
 
+void registerGPUPipeline();
+
 #define GEN_PASS_DECL
 #include "gc/Transforms/Passes.h.inc"
 

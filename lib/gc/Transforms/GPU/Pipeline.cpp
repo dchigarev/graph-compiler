@@ -9,37 +9,87 @@
 #include <string>
 
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/TargetSelect.h"
 
-#include "gc/Dialect/Linalgx/LinalgxDialect.h"
-#include "gc/Transforms/Passes.h"
-#include "gc/Utils/Transform.h"
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
+#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/GPUCommon/GPUToLLVM.h"
+#include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/Affine/Transforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/Transforms/BufferDeallocationOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Bufferization/Extensions/AllExtensions.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/ControlFlow/Transforms/BufferDeallocationOpInterfaceImpl.h"
+#include "mlir/Dialect/ControlFlow/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/DLTI/DLTI.h"
+#include "mlir/Dialect/Func/Extensions/AllExtensions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/GPU/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/GPU/Pipelines/Passes.h"
+#include "mlir/Dialect/GPU/Transforms/BufferDeallocationOpInterfaceImpl.h"
+#include "mlir/Dialect/GPU/Transforms/IndexedAccessOpInterfaceImpl.h"
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
-#include "mlir/Dialect/LLVMIR/Transforms/Passes.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
+#include "mlir/Dialect/LLVMIR/XeVMDialect.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/Linalg/Transforms/AllInterfaces.h"
+#include "mlir/Dialect/Linalg/Transforms/RuntimeOpVerification.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/IR/MemRefMemorySlot.h"
+#include "mlir/Dialect/MemRef/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/MemRef/Transforms/AllocationOpInterfaceImpl.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "mlir/Dialect/MemRef/Transforms/RuntimeOpVerification.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/SCF/Transforms/BufferDeallocationOpInterfaceImpl.h"
+#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/Passes.h"
-#include "mlir/Dialect/SPIRV/Transforms/Passes.h"
-#include "mlir/Dialect/XeGPU/Transforms/Passes.h"
-#include "mlir/InitAllDialects.h"
-#include "mlir/InitAllExtensions.h"
-#include "mlir/InitAllPasses.h"
+#include "mlir/Dialect/Tensor/Extensions/AllExtensions.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/IR/TensorInferTypeOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/IR/TensorTilingInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/Transforms/RuntimeOpVerification.h"
+#include "mlir/Dialect/Tensor/Transforms/SubsetInsertionOpInterfaceImpl.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/Dialect/Vector/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Vector/Transforms/IndexedAccessOpInterfaceImpl.h"
+#include "mlir/Dialect/Vector/Transforms/SubsetOpInterfaceImpl.h"
+#include "mlir/Dialect/XeGPU/IR/XeGPU.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Target/LLVMIR/Dialect/All.h"
+#include "mlir/Target/LLVM/XeVM/Target.h"
+#include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Dialect/XeVM/XeVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/Passes.h"
 
 #include "gc/Dialect/Linalgx/LinalgxDialect.h"
 #include "gc/Transforms/Passes.h"
 #include "gc/Transforms/TensorMaskingOpInterface.h"
-#include "gc/Utils/Transform.h"
 
 namespace mlir::gc {
 
@@ -92,14 +142,71 @@ struct TruncatingPrintIRPass
 
 DialectRegistry &getDialectRegistry() {
   static mlir::DialectRegistry registry = []() {
-    mlir::registerAllPasses();
     mlir::gc::registerGraphCompilerPasses();
     mlir::DialectRegistry registry;
-    registry.insert<mlir::linalgx::LinalgxDialect>();
+    registry.insert<mlir::affine::AffineDialect, mlir::arith::ArithDialect,
+                    mlir::bufferization::BufferizationDialect,
+                    mlir::cf::ControlFlowDialect, mlir::DLTIDialect,
+                    mlir::func::FuncDialect, mlir::gpu::GPUDialect,
+                    mlir::index::IndexDialect, mlir::linalg::LinalgDialect,
+                    mlir::linalgx::LinalgxDialect, mlir::LLVM::LLVMDialect,
+                    mlir::math::MathDialect, mlir::memref::MemRefDialect,
+                    mlir::scf::SCFDialect, mlir::tensor::TensorDialect,
+                    mlir::ub::UBDialect, mlir::vector::VectorDialect,
+                    mlir::xegpu::XeGPUDialect, mlir::xevm::XeVMDialect>();
+    mlir::affine::registerValueBoundsOpInterfaceExternalModels(registry);
+    mlir::arith::registerValueBoundsOpInterfaceExternalModels(registry);
+    mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
+    mlir::arith::registerBufferDeallocationOpInterfaceExternalModels(registry);
+    mlir::bufferization::registerAllExtensions(registry);
+    mlir::bufferization::func_ext::
+        registerBufferizableOpInterfaceExternalModels(registry);
+    mlir::func::registerAllExtensions(registry);
+    mlir::tensor::registerAllExtensions(registry);
+    mlir::arith::registerConvertArithToLLVMInterface(registry);
+    mlir::registerConvertComplexToLLVMInterface(registry);
+    mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
+    mlir::registerConvertFuncToLLVMInterface(registry);
+    mlir::gpu::registerConvertGpuToLLVMInterface(registry);
+    mlir::index::registerConvertIndexToLLVMInterface(registry);
+    mlir::registerConvertMathToLLVMInterface(registry);
+    mlir::registerConvertMemRefToLLVMInterface(registry);
+    mlir::ub::registerConvertUBToLLVMInterface(registry);
+    mlir::vector::registerConvertVectorToLLVMInterface(registry);
+
+    mlir::cf::registerBufferizableOpInterfaceExternalModels(registry);
+    mlir::cf::registerBufferDeallocationOpInterfaceExternalModels(registry);
+    mlir::gpu::registerBufferDeallocationOpInterfaceExternalModels(registry);
+    mlir::gpu::registerIndexedAccessOpInterfaceExternalModels(registry);
+    mlir::gpu::registerValueBoundsOpInterfaceExternalModels(registry);
+    mlir::linalg::registerAllDialectInterfaceImplementations(registry);
+    mlir::linalg::registerRuntimeVerifiableOpInterfaceExternalModels(registry);
+    mlir::memref::registerAllocationOpInterfaceExternalModels(registry);
+    mlir::memref::registerRuntimeVerifiableOpInterfaceExternalModels(registry);
+    mlir::memref::registerValueBoundsOpInterfaceExternalModels(registry);
+    mlir::memref::registerMemorySlotExternalModels(registry);
+    mlir::scf::registerBufferDeallocationOpInterfaceExternalModels(registry);
+    mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
+    mlir::scf::registerValueBoundsOpInterfaceExternalModels(registry);
+    mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
+    mlir::tensor::registerInferTypeOpInterfaceExternalModels(registry);
+    mlir::tensor::registerRuntimeVerifiableOpInterfaceExternalModels(registry);
+    mlir::tensor::registerSubsetOpInterfaceExternalModels(registry);
+    mlir::tensor::registerTilingInterfaceExternalModels(registry);
+    mlir::tensor::registerValueBoundsOpInterfaceExternalModels(registry);
+    mlir::vector::registerBufferizableOpInterfaceExternalModels(registry);
+    mlir::vector::registerIndexedAccessOpInterfaceExternalModels(registry);
+    mlir::vector::registerSubsetOpInterfaceExternalModels(registry);
+    mlir::vector::registerValueBoundsOpInterfaceExternalModels(registry);
+    mlir::xevm::registerXeVMTargetInterfaceExternalModels(registry);
+    mlir::registerBuiltinDialectTranslation(registry);
+    mlir::registerConvertComplexToLLVMInterface(registry);
+    mlir::registerLLVMDialectTranslation(registry);
+    mlir::registerGPUDialectTranslation(registry);
+
     mlir::gc::registerTensorMaskingOpInterfaceForLinalg(registry);
-    mlir::registerAllDialects(registry);
-    mlir::registerAllExtensions(registry);
-    mlir::registerAllToLLVMIRTranslations(registry);
+    mlir::gpu::registerOffloadingLLVMTranslationInterfaceExternalModels(
+        registry);
     mlir::registerXeVMDialectTranslation(registry);
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
