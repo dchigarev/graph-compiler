@@ -1,3 +1,4 @@
+# uv pip install -v -e 'python[test]'
 [project]
 name = "graph_compiler"
 version = "1.0.0"
@@ -6,17 +7,18 @@ version = "1.0.0"
 requires = ["setuptools", "wheel", "nanobind"]
 build-backend = "setuptools.build_meta"
 
-[project.optional-dependencies] 
-test = ["pytest", "torch>=2.13.0", "torch-mlir"]
-xpu = ["torch"]
+[project.optional-dependencies]
+test = ["pytest", "torch", "torch-mlir", "triton-xpu"]
+xpu = ["torch", "triton-xpu"]
 
 [tool.uv.sources]
-torch = { index = "pytorch", extra = "xpu" }
+torch = { index = "pytorch-xpu" }
+triton-xpu = { index = "pytorch-xpu" }
 torch-mlir = { index = "torch_mlir" }
 
 [[tool.uv.index]]
-name = "pytorch"
-url = "https://download.pytorch.org/whl"
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
 explicit = true
 
 [[tool.uv.index]]

@@ -15,7 +15,10 @@ execute_process(
 find_package(nanobind CONFIG REQUIRED)
 
 add_compile_options(-Wno-error=cast-qual -Wno-error=missing-declarations
-                    -Wno-switch-default -Wno-covered-switch-default)
+                    -Wno-switch-default)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wno-covered-switch-default)
+endif()
 nanobind_add_module(graph_compiler Nanobind.cpp)
 gc_link_mlir_tool(graph_compiler PRIVATE GcGpuOclRuntime)
 

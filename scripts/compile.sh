@@ -138,6 +138,7 @@ build_llvm() {
         -DLLVM_INCLUDE_DOCS=OFF \
         -DLLVM_INSTALL_UTILS=ON \
         -DLLVM_INSTALL_GTEST=ON \
+        -DLLVM_USE_PERF=ON \
         -DLLVM_ENABLE_BINDINGS=OFF \
         -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
         -DPython3_EXECUTABLE=$(which python3) \

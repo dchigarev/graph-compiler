@@ -21,14 +21,14 @@
 
 #include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
-#include "mlir/InitAllPasses.h"
+#include "mlir/Dialect/Transform/Transforms/Passes.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
 int main(int argc, char *argv[]) {
-  mlir::registerAllPasses();
   mlir::DialectRegistry &registry = mlir::gc::getDialectRegistry();
   registry.insert<mlir::transform::TransformDialect>();
   mlir::linalg::registerTransformDialectExtension(registry);
+  mlir::transform::registerTransformPasses();
 
   mlir::gc::registerGPUPipeline();
   return mlir::asMainReturnCode(mlir::MlirOptMain(

@@ -34,10 +34,5 @@ gc_add_mlir_library(
   GcTensorMaskingOpInterfaceIncGen
   LINK_LIBS
   PUBLIC
-  ${MLIR_LINK_COMPONENTS}
-  ${MLIR_DIALECT_LIBS}
-  ${MLIR_CONVERSION_LIBS}
-  ${GC_PASS_LIBS}
-  ${GC_DIALECT_LIBS}
-  GcInterface
-  GcGpuOclPasses)
+  GcGpuOclPasses
+  GcInterface)
