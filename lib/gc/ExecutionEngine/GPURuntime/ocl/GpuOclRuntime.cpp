@@ -14,6 +14,7 @@
 #include "gc/Transforms/Passes.h"
 #include "gc/Utils/Error.h"
 #include "gc/Utils/Log.h"
+#include "gc/Utils/Transform.h"
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
@@ -251,6 +252,24 @@ private:
     gcGetOrReport(ctx->runtime.usmCpy(*ctx, src, dst, size));
   }
 
+  static void dumpProgramBuildLog(cl_program program, cl_device_id device) {
+    size_t size = 0;
+    if (clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr,
+                              &size) != CL_SUCCESS ||
+        size == 0) {
+      return;
+    }
+    std::string log(size, '\0');
+    if (clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, size,
+                              log.data(), nullptr) != CL_SUCCESS) {
+      return;
+    }
+    log.erase(log.find_last_not_of('\0') + 1);
+    if (!log.empty()) {
+      gcLogE("OpenCL build log for program ", program, ":\n", log);
+    }
+  }
+
   static Kernel *kernelCreate(const OclContext *ctx, size_t spirvLen,
                               const unsigned char *spirv, const char *name,
                               const size_t *blockSize, size_t argNum,
@@ -261,13 +280,16 @@ private:
     CL_CHECKR(err, "Failed to create OpenCL program with IL.");
 
     gcLogD("Created new OpenCL program: ", program);
-    clBuildProgram(program, 1, &ctx->runtime.ext.device, nullptr, nullptr,
-                   nullptr);
+    err = clBuildProgram(program, 1, &ctx->runtime.ext.device, nullptr, nullptr,
+                         nullptr);
+    if (err != CL_SUCCESS)
+      dumpProgramBuildLog(program, ctx->runtime.ext.device);
     CL_CHECKR(err, "Failed to build the program: ", program);
     gcLogD("The program has been built: ", program);
 
     auto kernel = clCreateKernel(program, name, &err);
     if (err != CL_SUCCESS) {
+      dumpProgramBuildLog(program, ctx->runtime.ext.device);
       clReleaseProgram(program);
       CL_CHECKR(err, "Failed to create OpenCL kernel from program: ", program);
     }
@@ -459,13 +481,30 @@ OclRuntime::gcIntelDevices(size_t max) {
         clGetDeviceInfo(dev, CL_DEVICE_NAME, nameSize, &name[0], nullptr);
         gcLogD("[ INFO ] GPU device ", name.c_str(), " id: ", dev);
 #endif
-        if (intelDevices.size() == max) {
-          return intelDevices;
-        }
       }
     }
   }
 
+  std::sort(
+      intelDevices.begin(), intelDevices.end(),
+      [](cl_device_id a, cl_device_id b) {
+        cl_uint devA = 0, devB = 0;
+        clGetDeviceInfo(a, CL_DEVICE_ID_INTEL, sizeof(devA), &devA, nullptr);
+        clGetDeviceInfo(b, CL_DEVICE_ID_INTEL, sizeof(devB), &devB, nullptr);
+        auto archA = DevAttrs::getDeviceArch(devA);
+        auto archB = DevAttrs::getDeviceArch(devB);
+        if (archA && !archB) return true;
+        if (!archA && archB) return false;
+
+        cl_uint ipA = 0, ipB = 0;
+        clGetDeviceInfo(a, CL_DEVICE_IP_VERSION_INTEL, sizeof(cl_uint), &ipA,
+                        nullptr);
+        clGetDeviceInfo(b, CL_DEVICE_IP_VERSION_INTEL, sizeof(cl_uint), &ipB,
+                        nullptr);
+        return ipA > ipB;
+      });
+
+  if (intelDevices.size() > max) intelDevices.resize(max);
   return intelDevices;
 }
 

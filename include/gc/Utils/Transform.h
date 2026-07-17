@@ -243,7 +243,7 @@ struct DevAttrs : public GcAttrs<const char *> {
   std::optional<size_t> getMaxWgSize() { return get<size_t>(MAX_WG_SIZE); }
   void setMaxWgSize(size_t size) { set(MAX_WG_SIZE, size); }
 
-  const std::optional<const char *> getDeviceArch(int deviceId) {
+  static const std::optional<const char *> getDeviceArch(int deviceId) {
     // Using device ID from this source -
     // https://github.com/intel/compute-runtime/blob/master/shared/source/dll/devices/devices_base.inl
     switch (deviceId) {
