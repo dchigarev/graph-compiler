@@ -20,7 +20,6 @@ set -e
 
 # Default values
 : ${GC_BUILD_TYPE:=RelWithDebInfo}
-: ${LLVM_BUILD_TYPE:=$GC_BUILD_TYPE}
 : ${GC_DYLINK:=OFF}
 
 print_usage() {
@@ -68,6 +67,7 @@ done
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
+: ${LLVM_BUILD_TYPE:=$GC_BUILD_TYPE}
 : ${EXTERNALS_DIR:="$PROJECT_DIR/externals"}
 : ${MAX_JOBS:=$(($(nproc) - 2))}
 [ $MAX_JOBS -gt 0 ] || MAX_JOBS=2
