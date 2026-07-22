@@ -32,6 +32,8 @@ constexpr char GPU_OCL_MOD_DESTRUCTOR[] = "gcGpuOclModuleDestructor";
 #include "gc/ExecutionEngine/JitEngine.h"
 #include "gc/Transforms/Passes.h"
 
+#include "llvm/ADT/SmallVector.h"
+
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
@@ -81,7 +83,7 @@ struct OclRuntime {
   [[nodiscard]] cl_device_id getDevice() const;
 
   [[nodiscard]] llvm::Expected<cl_command_queue>
-  createQueue(bool outOfOrder = false) const;
+  createQueue(bool outOfOrder = true) const;
 
   [[nodiscard]] static llvm::Expected<bool>
   releaseQueue(cl_command_queue queue);
@@ -152,16 +154,10 @@ static constexpr auto ZERO_PTR = const_cast<int64_t *>(&ZERO);
 struct OclContext {
   const OclRuntime &runtime;
   const cl_command_queue queue;
-  // Create 'cl_event' object, for each enqueued command, that can be used to
-  // query or wait for the command to complete. This is required in case of
-  // out-of-order execution (CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE), but can
-  // also be used to get the last event. When the execution is completed, the
-  // 'lastEvent' field contains the event of the last enqueued command. If this
-  // field is false, 'waitList' is ignored.
+  // Create 'cl_event' object, for each enqueued command.
   const bool createEvents;
-  cl_uint waitListLen;
-  cl_event *waitList;
-  cl_event lastEvent;
+  llvm::SmallVector<cl_event> waitList;
+  llvm::SmallVector<cl_event> events{};
 
   explicit OclContext(const OclRuntime &runtime, cl_command_queue queue)
       : OclContext(runtime, queue, OclRuntime::isOutOfOrder(queue)) {}
@@ -182,8 +178,6 @@ private:
   template <unsigned N> friend struct DynamicExecutor;
   template <unsigned N> friend struct StaticExecutor;
   std::unordered_set<void *> *clPtrs;
-
-  void setLastEvent(cl_event event);
 };
 
 struct OclModule {

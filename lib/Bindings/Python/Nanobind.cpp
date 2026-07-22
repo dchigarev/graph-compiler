@@ -32,7 +32,6 @@ static size_t tensorSize(const nb::object &tensor) {
 
 struct GpuContext {
   const OclRuntime runtime;
-  OclContext oclCtx;
   MLIRContext mlirCtx{gc::getDialectRegistry()};
 
   static GpuContext &get() {
@@ -40,10 +39,14 @@ struct GpuContext {
     return instance;
   }
 
+  OclContext &getOclContext() {
+    thread_local static OclContext ctx{runtime,
+                                       gcGetOrReport(runtime.createQueue())};
+    return ctx;
+  }
+
 private:
-  explicit GpuContext(OclRuntime rt)
-      : runtime(std::move(rt)),
-        oclCtx{runtime, gcGetOrReport(runtime.createQueue())} {}
+  explicit GpuContext(OclRuntime rt) : runtime(std::move(rt)) {}
 };
 
 struct Usm {
@@ -98,14 +101,16 @@ struct Usm {
 
   void copyFrom(const void *src, size_t size) const {
     auto &ctx = GpuContext::get();
-    gcGetOrReport(ctx.runtime.usmCpy(ctx.oclCtx, src, ptr, size));
-    gcGetOrReport(GpuContext::get().oclCtx.finish());
+    auto &oclCtx = ctx.getOclContext();
+    gcGetOrReport(ctx.runtime.usmCpy(oclCtx, src, ptr, size));
+    gcGetOrReport(oclCtx.finish());
   }
 
   void copyTo(void *dst, size_t size) const {
     auto &ctx = GpuContext::get();
-    gcGetOrReport(ctx.runtime.usmCpy(ctx.oclCtx, ptr, dst, size));
-    gcGetOrReport(GpuContext::get().oclCtx.finish());
+    auto &oclCtx = ctx.getOclContext();
+    gcGetOrReport(ctx.runtime.usmCpy(oclCtx, ptr, dst, size));
+    gcGetOrReport(oclCtx.finish());
   }
 
   ~Usm() {
@@ -165,7 +170,7 @@ NB_MODULE(graph_compiler, m) {
           exec.arg(ptr, true);
         }
 
-        exec(GpuContext::get().oclCtx);
+        exec(GpuContext::get().getOclContext());
 
         // Copy back to tensors
         if (!outputs.empty()) {

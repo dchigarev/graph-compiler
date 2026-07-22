@@ -18,6 +18,7 @@ gc_add_mlir_library(
   TensorReshapeToLinalg.cpp
   Vectorize.cpp
   RemoveAllocs.cpp
+  SetKernelDepends.cpp
   HoistForLoopTransferRead.cpp
   FoldPadRoundtrip.cpp
   HoistStaticForInit.cpp

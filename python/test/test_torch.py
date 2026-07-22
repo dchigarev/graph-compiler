@@ -132,3 +132,26 @@ def test_transpose_concat(S0: int, S1: int, H: int, D: int, DT: torch.dtype):
             return (a, b)
 
     Test().test()
+
+
+@pytest.mark.parametrize("M,K,P,Q,N,DT", ((64, 512, 128, 512, 64, torch.float16),))
+def test_kernel_depends(M: int, K: int, P: int, Q: int, N: int, DT: torch.dtype):
+
+    class Test(TestModule):
+        def forward(
+            self,
+            a: torch.Tensor,
+            b: torch.Tensor,
+            c: torch.Tensor,
+            d: torch.Tensor,
+        ):
+            return torch.matmul(torch.matmul(a, b), torch.matmul(c, d))
+
+        def get_inputs(self, dev):
+            a = torch.full((M, K), 0.01, dtype=DT, device=dev)
+            b = torch.full((K, P), 0.01, dtype=DT, device=dev)
+            c = torch.full((P, Q), 0.01, dtype=DT, device=dev)
+            d = torch.full((Q, N), 0.01, dtype=DT, device=dev)
+            return (a, b, c, d)
+
+    Test().test()

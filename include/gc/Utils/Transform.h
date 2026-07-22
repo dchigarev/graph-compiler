@@ -304,6 +304,11 @@ struct KernelAttrs : public GcAttrs<const char *, StringRef> {
   }
   void setThreads(ArrayRef<size_t> threads) { set(THREADS, threads); }
 
+  std::optional<SmallVector<StringRef>> getDepends() {
+    return get<SmallVector<StringRef>>(DEPENDS);
+  }
+  void setDepends(ArrayRef<StringRef> depends) { set(DEPENDS, depends); }
+
   template <typename T = size_t> std::optional<T> getWgSize() {
     return get<T>(WG_SIZE);
   }
@@ -332,6 +337,7 @@ private:
   static constexpr char THREADS[] = "threads";
   static constexpr char WG_SIZE[] = "wg_size";
   static constexpr char SG_SIZE[] = "sg_size";
+  static constexpr char DEPENDS[] = "depends";
 };
 // ---------------------------------------------------------- //
 
@@ -423,6 +429,19 @@ inline bool isMatmulOp(Operation *op) {
   // TODO: Check matmul like generics
 }
 
+inline bool containsMatmulOp(Operation *op) {
+  if (isMatmulOp(op)) return true;
+  bool found = false;
+  op->walk([&](Operation *nested) {
+    if (nested != op && isMatmulOp(nested)) {
+      found = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return found;
+}
+
 // If a slice inside the loop is created from an external empty tensor and
 // the tensor is not passed to the loop's shared_outs, but referenced
 // directly, replace the slice with an empty tensor of the same size.
@@ -442,6 +461,15 @@ inline void replaceEmptySlices(OpRewriter &rw, LoopLikeOpInterface loop) {
                               type.getShape(), type.getElementType(), dynDims));
     }
   });
+}
+
+inline scf::ForallOp getKernelLoop(Operation *op) {
+  for (; op; op = op->getParentOp()) {
+    if (auto loop = dyn_cast<scf::ForallOp>(op);
+        loop && loop->hasAttr(GC_ATTR_KERNEL_NAME))
+      return loop;
+  }
+  return nullptr;
 }
 
 inline void canonicalizeLoop(LoopLikeOpInterface &loop) {

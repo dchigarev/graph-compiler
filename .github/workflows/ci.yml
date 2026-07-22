@@ -224,6 +224,7 @@ jobs:
           [ -z "$ONEAPI_ROOT" ] && . /opt/intel/oneapi/setvars.sh
           bin_dir="$PWD/${{env.OV_INSTALL_DIR}}/bin/intel64/Release"
           export OV_MLIR=1
+          export OV_GPU_QUEUE_TYPE=out-of-order
           filter=$(printf '%s:' \
             'MLIRExecution.SimpleMatmulf16' \
             'MLIRExecution.SDPABasic' \

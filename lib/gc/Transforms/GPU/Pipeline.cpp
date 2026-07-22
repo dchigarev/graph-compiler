@@ -255,6 +255,7 @@ void populateGPUPipeline(OpPassManager &pm,
     pm.addNestedPass<func::FuncOp>(createTileContraction());
     pm.addNestedPass<func::FuncOp>(createTileAttention());
     pm.addNestedPass<func::FuncOp>(createTileParallel());
+    pm.addNestedPass<func::FuncOp>(createSetKernelDepends());
   });
 
   phase("Decomposition", [&]() {

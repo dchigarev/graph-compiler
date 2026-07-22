@@ -191,6 +191,7 @@ public:
         numKernels = getAttrValue<unsigned>(numKernelsAttr);
         char buffer[8];
         snprintf(buffer, sizeof(buffer), "%u", numKernels);
+        kernelAttrs.save();
         kernelName.resize(fn.getName().size() + 7);
         kernelName.append("_");
         kernelName.append(buffer);
@@ -727,8 +728,11 @@ protected:
     SmallVector<tensor::ExtractSliceOp> candidates;
     loop->walk([&](tensor::ExtractSliceOp slice) {
       auto producer = slice.getSource().getDefiningOp();
-      if (producer && canFuse(loop, producer, false))
-        candidates.push_back(slice);
+      if (!producer || !canFuse(loop, producer, false)) return;
+      if (isOpDependsOnResult<0>(isMatmulOp, slice) &&
+          isOperandDependsOnOp(isMatmulOp, slice))
+        return;
+      candidates.push_back(slice);
     });
     SmallVector<LoopLikeOpInterface> loops = {loop};
     for (auto slice : candidates)
@@ -741,6 +745,7 @@ private:
   static bool canFuse(LoopLikeOpInterface loop, Operation *op,
                       bool isConsumer = true) {
     if (op->getBlock() != loop->getBlock()) return false;
+    if (containsMatmulOp(op)) return false;
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
         linalgOp && !linalgOp.hasOnlyProjectedPermutations()) {
       return false;

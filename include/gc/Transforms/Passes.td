@@ -113,6 +113,8 @@ def RemoveAllocs : Pass<"remove-allocs", "func::FuncOp"> {
   let description = [{
     Remove unnecessry memref.alloc operations.
   }];
+  let dependentDialects = ["gpu::GPUDialect", "memref::MemRefDialect",
+                           "scf::SCFDialect"];
 }
 
 def TensorReshapeToLinalg : Pass<"tensor-reshape-to-linalg", "func::FuncOp"> {
@@ -151,6 +153,14 @@ def GpuKernelOutline : Pass<"gpu-kernel-outline", "ModuleOp"> {
     Convert scf.forall operations into GPU kernels.
   }];
   let dependentDialects = ["scf::SCFDialect", "gpu::GPUDialect", "xevm::XeVMDialect"];
+}
+
+def SetKernelDepends : Pass<"set-kernel-depends", "func::FuncOp"> {
+  let summary = "Set dependencies between GPU kernels.";
+  let description = [{
+    Collect dependencies between scf.forall operations annotated as GPU kernels.
+  }];
+  let dependentDialects = ["scf::SCFDialect"];
 }
 
 def MemrefCopyToGpu : Pass<"memref-copy-to-gpu", "ModuleOp"> {

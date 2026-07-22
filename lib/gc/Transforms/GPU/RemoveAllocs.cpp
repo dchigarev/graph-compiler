@@ -9,9 +9,11 @@
 
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/Utils/MemRefUtils.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
@@ -341,6 +343,100 @@ struct FoldAllocWriteReshapeRead
   }
 };
 
+struct PromoteRemainingAllocToGpuAlloc final
+    : OpRewritePattern<memref::AllocOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(memref::AllocOp alloc,
+                                PatternRewriter &rewriter) const override {
+    // Ignore allocations inside a kernel
+    if (getKernelLoop(alloc) != nullptr) return failure();
+    bool usedByKernel = gc::isOpDependsOnResult(
+        [](Operation *user) { return getKernelLoop(user) != nullptr; }, alloc);
+    if (!usedByKernel) return failure();
+
+    rewriter.setInsertionPoint(alloc);
+    auto gpuAlloc = gpu::AllocOp::create(
+        rewriter, alloc.getLoc(), alloc.getType(), Type{}, ValueRange{},
+        alloc.getDynamicSizes(), alloc.getSymbolOperands(),
+        /*hostShared=*/false);
+
+    if (!hasDealloc(alloc.getResult())) {
+      setInsertionPointAfterLastUse(rewriter, alloc.getResult());
+      gpu::DeallocOp::create(rewriter, alloc.getLoc(), Type{}, ValueRange{},
+                             gpuAlloc.getMemref());
+    }
+
+    rewriter.replaceOp(alloc, gpuAlloc.getMemref());
+    return success();
+  }
+
+private:
+  static bool hasDealloc(Value value) {
+    for (Operation *user : value.getUsers()) {
+      if (isa<memref::DeallocOp, gpu::DeallocOp>(user)) return true;
+      auto view = dyn_cast<ViewLikeOpInterface>(user);
+      if (view && hasDealloc(view->getResult(0))) return true;
+    }
+    return false;
+  }
+
+  static Operation *getAncestorInBlock(Operation *op, Block *block) {
+    while (op && op->getBlock() != block) op = op->getParentOp();
+    return op;
+  }
+
+  static void collectUseAncestors(Value value, Block *block,
+                                  SmallVectorImpl<Operation *> &ops) {
+    for (Operation *user : value.getUsers()) {
+      if (Operation *ancestor = getAncestorInBlock(user, block))
+        ops.push_back(ancestor);
+      auto view = dyn_cast<ViewLikeOpInterface>(user);
+      if (view) collectUseAncestors(view->getResult(0), block, ops);
+    }
+  }
+
+  static void setInsertionPointAfterLastUse(PatternRewriter &rewriter,
+                                            Value value) {
+    auto *block = value.getParentBlock();
+    Operation *last = value.getDefiningOp();
+    SmallVector<Operation *> useAncestors;
+    collectUseAncestors(value, block, useAncestors);
+    for (Operation *op : useAncestors)
+      if (last->isBeforeInBlock(op)) last = op;
+
+    if (last->hasTrait<OpTrait::IsTerminator>())
+      rewriter.setInsertionPoint(last);
+    else rewriter.setInsertionPointAfter(last);
+  }
+};
+
+struct PromoteRemainingDeallocToGpuDealloc final
+    : OpRewritePattern<memref::DeallocOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(memref::DeallocOp dealloc,
+                                PatternRewriter &rewriter) const override {
+    if (!getSourceGpuAlloc(dealloc.getMemref())) return failure();
+
+    gpu::DeallocOp::create(rewriter, dealloc.getLoc(), Type{}, ValueRange{},
+                           dealloc.getMemref());
+    rewriter.eraseOp(dealloc);
+    return success();
+  }
+
+private:
+  static gpu::AllocOp getSourceGpuAlloc(Value value) {
+    while (auto *op = value.getDefiningOp()) {
+      if (auto alloc = dyn_cast<gpu::AllocOp>(op)) return alloc;
+      auto view = dyn_cast<ViewLikeOpInterface>(op);
+      if (!view) break;
+      value = view.getViewSource();
+    }
+    return nullptr;
+  }
+};
+
 struct RemoveAllocs final : gc::impl::RemoveAllocsBase<RemoveAllocs> {
 
   void runOnOperation() override {
@@ -355,6 +451,14 @@ struct RemoveAllocs final : gc::impl::RemoveAllocsBase<RemoveAllocs> {
         &getContext());
 
     if (failed(applyPatternsGreedily(fn, std::move(patterns)))) {
+      signalPassFailure();
+      return;
+    }
+
+    RewritePatternSet fallbackPatterns(&getContext());
+    fallbackPatterns.add<PromoteRemainingAllocToGpuAlloc,
+                         PromoteRemainingDeallocToGpuDealloc>(&getContext());
+    if (failed(applyPatternsGreedily(fn, std::move(fallbackPatterns)))) {
       signalPassFailure();
     }
   }

@@ -25,6 +25,7 @@
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/LLVM.h"
 
 namespace mlir::gc::gpu {
 
@@ -244,8 +245,60 @@ private:
     return gcGetOrReport(ctx->runtime.usmAllocShared(size));
   }
 
-  static void dealloc(const OclContext *ctx, const void *ptr) {
-    gcGetOrReport(ctx->runtime.usmFree(ptr));
+  static void dealloc(OclContext *ctx, const void *ptr,
+                      size_t numWaitEvents = 0, ...) {
+    if (numWaitEvents == 0 || !ctx->createEvents) {
+      finish(ctx);
+      gcGetOrReport(ctx->runtime.usmFree(ptr));
+      return;
+    }
+
+    struct Deallocator {
+      const OclRuntime &runtime;
+      const void *ptr;
+      llvm::SmallVector<cl_event> waitList{};
+      ~Deallocator() {
+        CL_CHECKR(clWaitForEvents(waitList.size(), waitList.data()),
+                  "Failed to wait for OpenCL events");
+        for (auto event : waitList) {
+          CL_CHECKR(clReleaseEvent(event),
+                    "Failed to release OpenCL event: ", event);
+        }
+        gcGetOrReport(runtime.usmFree(ptr));
+      }
+
+      static void callback(cl_event, cl_int, void *userData) {
+        delete static_cast<Deallocator *>(userData);
+      }
+    } *deallocator = new Deallocator{ctx->runtime, ptr};
+
+    va_list args;
+    va_start(args, numWaitEvents);
+    deallocator->waitList.reserve(numWaitEvents + 1);
+    for (size_t i = 0; i < numWaitEvents; i++) {
+      auto event = ctx->events[va_arg(args, size_t)];
+      CL_CHECKR(clRetainEvent(event), "Failed to retain OpenCL event");
+      deallocator->waitList.push_back(event);
+    }
+    va_end(args);
+
+    gcLogD("Waiting for ", deallocator->waitList.size(),
+           " events before deallocation: ", ptr);
+
+    cl_event marker;
+    if (deallocator->waitList.size() == 1) {
+      marker = deallocator->waitList[0];
+    } else {
+      deallocator->waitList.reserve(deallocator->waitList.size() + 1);
+      CL_CHECKR(
+          clEnqueueMarkerWithWaitList(ctx->queue, deallocator->waitList.size(),
+                                      deallocator->waitList.data(), &marker),
+          "Failed to enqueue marker with wait list");
+      deallocator->waitList.push_back(marker);
+    }
+    CL_CHECKR(clSetEventCallback(marker, CL_COMPLETE, Deallocator::callback,
+                                 deallocator),
+              "Failed to set OpenCL event callback");
   }
 
   static void memcpy(OclContext *ctx, const void *src, void *dst, size_t size) {
@@ -321,8 +374,9 @@ private:
     }
   }
 
-  static void kernelLaunch(OclContext *ctx, Kernel *kernel, size_t gridX,
-                           size_t gridY, size_t gridZ, ...) {
+  static size_t kernelLaunch(OclContext *ctx, Kernel *kernel, size_t gridX,
+                             size_t gridY, size_t gridZ, size_t numWaitEvents,
+                             ...) {
     struct ClonedKernel {
       cl_kernel kernel;
 
@@ -338,10 +392,18 @@ private:
     const size_t globalSize[3] = {gridX * kernel->localSize[0],
                                   gridY * kernel->localSize[1],
                                   gridZ * kernel->localSize[2]};
+    size_t waitListSize = ctx->waitList.size();
+    if (ctx->createEvents)
+      ctx->waitList.reserve(ctx->waitList.size() + numWaitEvents);
 
     va_list args;
-    va_start(args, gridZ);
+    va_start(args, numWaitEvents);
     gcLogD("Launching kernel: ", kernel->kernel);
+
+    for (size_t i = 0; i < numWaitEvents; i++) {
+      auto idx = va_arg(args, size_t);
+      if (ctx->createEvents) ctx->waitList.push_back(ctx->events[idx]);
+    }
 
     cl_int err;
     ClonedKernel cloned{clCloneKernel(kernel->kernel, &err)};
@@ -373,17 +435,14 @@ private:
     }
     va_end(args);
 
-    if (ctx->createEvents) {
-      cl_event event = nullptr;
-      err = clEnqueueNDRangeKernel(ctx->queue, cloned.kernel, 3, nullptr,
-                                   globalSize, kernel->localSize,
-                                   ctx->waitListLen, ctx->waitList, &event);
-      ctx->setLastEvent(event);
-    } else {
-      err = clEnqueueNDRangeKernel(ctx->queue, cloned.kernel, 3, nullptr,
-                                   globalSize, kernel->localSize, 0, nullptr,
-                                   nullptr);
-    }
+    cl_event event = nullptr;
+    auto waitList = ctx->waitList.empty() ? nullptr : ctx->waitList.data();
+    err = clEnqueueNDRangeKernel(
+        ctx->queue, cloned.kernel, 3, nullptr, globalSize, kernel->localSize,
+        static_cast<cl_uint>(ctx->waitList.size()), waitList,
+        ctx->createEvents ? &event : nullptr);
+    if (event) ctx->events.emplace_back(event);
+    ctx->waitList.truncate(waitListSize);
 
     if (err == CL_INVALID_WORK_GROUP_SIZE) {
       size_t wgSize, compileWgSize[3];
@@ -412,6 +471,7 @@ private:
 
     CL_CHECKR(err, "Failed to enqueue kernel execution: ", cloned.kernel);
     gcLogD("Enqueued kernel execution: ", cloned.kernel);
+    return ctx->events.empty() ? 0 : ctx->events.size() - 1;
   }
 
   static void finish(OclContext *ctx) { gcGetOrReport(ctx->finish()); }
@@ -606,9 +666,21 @@ cl_device_id OclRuntime::getDevice() const { return ext.device; }
 
 llvm::Expected<cl_command_queue>
 OclRuntime::createQueue(bool outOfOrder) const {
+  if (outOfOrder) {
+    cl_command_queue_properties props;
+    CL_CHECKR(clGetDeviceInfo(ext.device, CL_DEVICE_QUEUE_ON_HOST_PROPERTIES,
+                              sizeof(props), &props, nullptr),
+              "Failed to get OpenCL device properties.");
+    if (!(props & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE)) {
+      gcLogE("Out-of-order execution mode is not supported by the OpenCL "
+             "implementation.");
+      outOfOrder = false;
+    }
+  }
+
   cl_int err;
   cl_command_queue queue;
-#ifdef CL_VERSION_2_0
+#if CL_TARGET_OPENCL_VERSION >= 200
   cl_queue_properties properties[] = {
       CL_QUEUE_PROPERTIES,
       static_cast<cl_queue_properties>(
@@ -663,15 +735,12 @@ llvm::Expected<bool> OclRuntime::usmFree(const void *ptr) const {
 llvm::Expected<bool> OclRuntime::usmCpy(OclContext &ctx, const void *src,
                                         void *dst, size_t size) const {
   cl_int err;
-  if (ctx.createEvents) {
-    cl_event event;
-    err = ext.clEnqueueMemcpyINTEL(ctx.queue, false, dst, src, size,
-                                   ctx.waitListLen, ctx.waitList, &event);
-    ctx.setLastEvent(event);
-  } else {
-    err = ext.clEnqueueMemcpyINTEL(ctx.queue, false, dst, src, size, 0, nullptr,
-                                   nullptr);
-  }
+  cl_event event = nullptr;
+  auto waitList = ctx.waitList.empty() ? nullptr : ctx.waitList.data();
+  err = ext.clEnqueueMemcpyINTEL(ctx.queue, false, dst, src, size,
+                                 static_cast<cl_uint>(ctx.waitList.size()),
+                                 waitList, ctx.createEvents ? &event : nullptr);
+  if (event) ctx.events.emplace_back(event);
   CL_CHECK(err, "Failed to copy ", size, " bytes from ", src, " to ", dst);
   gcLogD("Enqueued USM memory copy of ", size, " bytes from ", src, " to ",
          dst);
@@ -697,66 +766,39 @@ void OclRuntime::debug(const char *file, int line, const char *msg) {
 OclContext::OclContext(const OclRuntime &runtime, cl_command_queue queue,
                        bool createEvents, cl_uint waitListLen,
                        cl_event *waitList)
-    : runtime(runtime), queue(queue), createEvents(createEvents),
-      waitListLen(createEvents ? waitListLen : 0),
-      waitList(createEvents ? waitList : nullptr), lastEvent(nullptr),
+    : runtime(runtime), queue(queue), createEvents(createEvents), waitList(),
       clPtrs(nullptr) {
   assert(!OclRuntime::isOutOfOrder(queue) || createEvents);
-  assert(createEvents || (waitListLen == 0 && waitList == nullptr));
+  this->waitList.reserve(waitListLen);
   for (cl_uint i = 0; i < waitListLen; i++) {
     gcLogD("Retaining OpenCL event: ", waitList[i]);
     CL_CHECKR(clRetainEvent(waitList[i]),
               "Failed to retain OpenCL event: ", waitList[i]);
+    this->waitList.push_back(waitList[i]);
   }
 }
 
-OclContext::~OclContext() {
-  for (cl_uint i = 0; i < waitListLen; i++) {
-    gcLogD("Releasing OpenCL event: ", waitList[i]);
-    CL_CHECKR(clReleaseEvent(waitList[i]),
-              "Failed to release OpenCL event: ", waitList[i]);
+static void releaseEvents(OclContext &ctx) {
+  for (auto event : ctx.waitList) {
+    gcLogD("Releasing OpenCL event: ", event);
+    CL_CHECKR(clReleaseEvent(event), "Failed to release OpenCL event: ", event);
   }
+  for (auto event : ctx.events) {
+    gcLogD("Releasing OpenCL event: ", event);
+    CL_CHECKR(clReleaseEvent(event), "Failed to release OpenCL event: ", event);
+  }
+  ctx.waitList.clear();
+  ctx.events.clear();
 }
+
+OclContext::~OclContext() { releaseEvents(*this); }
 
 llvm::Expected<bool> OclContext::finish() {
-  if (createEvents) {
-    if (waitListLen) {
-      gcLogD("Waiting for ", waitListLen, " OpenCL events to finish.");
-      CL_CHECK(clWaitForEvents(waitListLen, waitList),
-               "Failed to wait for OpenCL events.");
-
-      for (cl_uint i = 0; i < waitListLen; i++) {
-        gcLogD("Releasing OpenCL event: ", waitList[i]);
-        CL_CHECK(clReleaseEvent(waitList[i]),
-                 "Failed to release OpenCL event: ", waitList[i]);
-      }
-      waitListLen = 0;
-      waitList = nullptr;
-    }
-  } else {
-    gcLogD("Waiting for the enqueued OpenCL commands to finish: ", queue);
-    CL_CHECK(clFinish(queue),
-             "Failed to finish the OpenCL command queue: ", queue);
-  }
+  gcLogD("Waiting for the enqueued OpenCL commands to finish: ", queue);
+  CL_CHECK(clFinish(queue),
+           "Failed to finish the OpenCL command queue: ", queue);
+  releaseEvents(*this);
   return true;
-}
-
-void OclContext::setLastEvent(cl_event event) {
-  for (cl_uint i = 0; i < waitListLen; i++) {
-    gcLogD("Releasing OpenCL event: ", waitList[i]);
-    CL_CHECKR(clReleaseEvent(waitList[i]),
-              "Failed to release OpenCL event: ", waitList[i]);
-  }
-
-  gcLogD("Setting the last OpenCL event: ", event);
-  lastEvent = event;
-  if (event) {
-    waitListLen = 1;
-    waitList = &lastEvent;
-  } else {
-    waitListLen = 0;
-    waitList = nullptr;
-  }
 }
 
 static void destroyKernels(const std::unique_ptr<JitEngine> &engine) {
@@ -1021,7 +1063,7 @@ OclModuleBuilder::build(const OclRuntime::Ext &ext) {
       cl_command_queue queue;
       ~OclQueue() { clReleaseCommandQueue(queue); }
     } queue{*expectedQueue};
-    OclContext oclCtx{rt, queue.queue, false};
+    OclContext oclCtx{rt, queue.queue};
 
     ExecutionEngineOptions opts;
     opts.jitCodeGenOptLevel = llvm::CodeGenOptLevel::Aggressive;

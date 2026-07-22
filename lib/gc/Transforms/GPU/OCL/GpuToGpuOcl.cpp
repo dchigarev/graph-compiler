@@ -5,10 +5,12 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+#include <unordered_map>
 #include <unordered_set>
 
 #define GC_GPU_OCL_CONST_ONLY
 #include "gc/ExecutionEngine/GPURuntime/GpuOclRuntime.h"
+#include "gc/Utils/Transform.h"
 
 #include "llvm/ADT/SmallSet.h"
 
@@ -62,6 +64,10 @@ struct Helper final {
   Type ptrType;
   Type idxType;
   mutable std::unordered_set<std::string> kernelNames;
+  mutable std::unordered_map<Operation *,
+                             std::unordered_map<std::string, Value>>
+      kernelEvents;
+  mutable std::unordered_set<Operation *> launchFuncs;
 
   explicit Helper(MLIRContext *ctx, LLVMTypeConverter &converter)
       : converter(converter), voidType(LLVM::LLVMVoidType::get(ctx)),
@@ -124,122 +130,80 @@ struct ConvertOpPattern : ConvertOpToLLVMPattern<SourceOp> {
       : ConvertOpToLLVMPattern<SourceOp>(helper.converter), helper(helper) {}
 };
 
-struct ConvertAlloc final : ConvertOpPattern<gpu::AllocOp> {
-  explicit ConvertAlloc(const Helper &helper) : ConvertOpPattern(helper) {}
+struct ConvertMgpuAlloc final : OpRewritePattern<LLVM::CallOp> {
+  const Helper &helper;
 
-  LogicalResult
-  matchAndRewrite(gpu::AllocOp allocOp, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto fnName =
-        allocOp.getHostShared() ? GPU_OCL_MALLOC_SHARED : GPU_OCL_MALLOC_DEV;
-    auto loc = allocOp.getLoc();
-    MemRefType type = allocOp.getType();
+  ConvertMgpuAlloc(MLIRContext *ctx, const Helper &helper)
+      : OpRewritePattern(ctx), helper(helper) {}
 
-    if (auto staticSize = helper.calculateStaticSize(rewriter, loc, type)) {
-      auto ptr = funcCall(rewriter, fnName, helper.ptrType,
-                          {helper.ptrType, helper.idxType}, loc,
-                          {getCtxPtr(rewriter), staticSize})
-                     .getResult();
-      Value replacement = MemRefDescriptor::fromStaticShape(
-          rewriter, loc, helper.converter, type, ptr, ptr);
-      rewriter.replaceOp(allocOp, replacement);
-      return success();
-    }
-
-    auto dstType = helper.converter.convertType(type);
-    if (!dstType) {
-      allocOp.emitError() << "Failed to convert the MemRefType";
+  LogicalResult matchAndRewrite(LLVM::CallOp callOp,
+                                PatternRewriter &rewriter) const override {
+    // mgpuMemAlloc(size, stream, isHostShared)
+    if (callOp.getCallee().value_or("") != "mgpuMemAlloc" ||
+        callOp.getNumOperands() != 3)
       return failure();
-    }
 
-    SmallVector<Value> shape;
-    SmallVector<Value> strides;
-    Value size;
-    getMemRefDescriptorSizes(loc, type, adaptor.getDynamicSizes(), rewriter,
-                             shape, strides, size);
-    assert(shape.size() == strides.size());
-
-    auto ptr = funcCall(rewriter, fnName, helper.ptrType,
-                        {helper.ptrType, helper.idxType}, loc,
-                        {getCtxPtr(rewriter), size})
-                   .getResult();
-
-    auto dsc = MemRefDescriptor::poison(rewriter, loc, dstType);
-    dsc.setAllocatedPtr(rewriter, loc, ptr);
-    dsc.setAlignedPtr(rewriter, loc, ptr);
-    dsc.setOffset(rewriter, loc, helper.idxConstant(rewriter, loc, 0));
-
-    for (unsigned i = 0, n = static_cast<unsigned>(shape.size()); i < n; i++) {
-      dsc.setSize(rewriter, loc, i, shape[i]);
-      dsc.setStride(rewriter, loc, i, strides[i]);
-    }
-
-    rewriter.replaceOp(allocOp, static_cast<Value>(dsc));
+    auto shared = getConstantIntValue(callOp.getOperand(2));
+    auto fnName =
+        !shared || !*shared ? GPU_OCL_MALLOC_DEV : GPU_OCL_MALLOC_SHARED;
+    auto ptr =
+        funcCall(rewriter, fnName, helper.ptrType,
+                 {helper.ptrType, callOp.getOperand(0).getType()},
+                 callOp.getLoc(), {getCtxPtr(rewriter), callOp.getOperand(0)})
+            .getResult();
+    rewriter.replaceOp(callOp, ptr);
     return success();
   }
 };
 
-struct ConvertDealloc final : ConvertOpPattern<gpu::DeallocOp> {
-  explicit ConvertDealloc(const Helper &helper) : ConvertOpPattern(helper) {}
+struct ConvertMgpuFree final : OpRewritePattern<LLVM::CallOp> {
+  const Helper &helper;
 
-  LogicalResult
-  matchAndRewrite(gpu::DeallocOp gpuDealloc, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto loc = gpuDealloc.getLoc();
-    MemRefDescriptor dsc(adaptor.getMemref());
-    auto ptr = dsc.allocatedPtr(rewriter, loc);
-    auto oclDealloc = funcCall(rewriter, GPU_OCL_DEALLOC, helper.voidType,
-                               {helper.ptrType, helper.ptrType}, loc,
-                               {getCtxPtr(rewriter), ptr});
-    rewriter.replaceOp(gpuDealloc, oclDealloc);
-    return success();
-  }
-};
+  ConvertMgpuFree(MLIRContext *ctx, const Helper &helper)
+      : OpRewritePattern(ctx), helper(helper) {}
 
-struct ConvertMemcpy final : ConvertOpPattern<gpu::MemcpyOp> {
-  explicit ConvertMemcpy(const Helper &helper) : ConvertOpPattern(helper) {}
+  LogicalResult matchAndRewrite(LLVM::CallOp callOp,
+                                PatternRewriter &rewriter) const override {
+    // mgpuMemFree(ptr, stream)
+    if (callOp.getCallee().value_or("") != "mgpuMemFree" ||
+        callOp.getNumOperands() != 2)
+      return failure();
 
-  LogicalResult
-  matchAndRewrite(gpu::MemcpyOp gpuMemcpy, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto loc = gpuMemcpy.getLoc();
-    MemRefDescriptor srcDsc(adaptor.getSrc());
-    MemRefDescriptor dstDsc(adaptor.getDst());
-    auto srcType = gpuMemcpy.getSrc().getType();
-    Value size = helper.calculateStaticSize(rewriter, loc, srcType);
+    auto loc = callOp.getLoc();
+    auto func = callOp->getParentOfType<LLVM::LLVMFuncOp>();
+    auto kernelEvents = helper.kernelEvents.find(func.getOperation());
 
-    if (!size) {
-      auto numElements = helper.idxConstant(rewriter, loc, 1);
-      for (unsigned i = 0, n = srcType.getRank(); i < n; i++) {
-        numElements = LLVM::MulOp::create(rewriter, loc, numElements,
-                                          srcDsc.size(rewriter, loc, i));
+    SmallVector<Value> waitEvents;
+    if (kernelEvents != helper.kernelEvents.end()) {
+      for (auto &[name, event] : kernelEvents->second) {
+        bool depends = false;
+        for (auto user : callOp.getOperand(0).getUsers()) {
+          if (auto call = dyn_cast<LLVM::CallOp>(user);
+              call && call.getCallee().value_or("") == GPU_OCL_KERNEL_LAUNCH &&
+              gc::getDiscardableAttr(call, gc::GC_ATTR_KERNEL_NAME, "") ==
+                  name) {
+            depends = true;
+            break;
+          }
+        }
+        if (!depends) continue;
+        auto *eventOp = event.getDefiningOp();
+        if (eventOp && eventOp->getBlock() == callOp->getBlock() &&
+            eventOp->isBeforeInBlock(callOp))
+          waitEvents.emplace_back(event);
       }
-      size = LLVM::MulOp::create(
-          rewriter, loc, numElements,
-          getSizeInBytes(loc, srcType.getElementType(), rewriter));
     }
 
-    auto ptrWithOffset = [&](MemRefDescriptor &dsc, MemRefType type) {
-      auto ptr = dsc.alignedPtr(rewriter, loc);
-      auto offset = dsc.offset(rewriter, loc);
-      return LLVM::GEPOp::create(
-                 rewriter, loc, helper.ptrType,
-                 helper.converter.convertType(type.getElementType()), ptr,
-                 offset)
-          .getResult();
-    };
-    auto srcPtr = ptrWithOffset(srcDsc, srcType);
-    auto dstPtr = ptrWithOffset(dstDsc, gpuMemcpy.getDst().getType());
-    funcCall(rewriter, GPU_OCL_MEMCPY, helper.voidType,
-             {helper.ptrType, helper.ptrType, helper.ptrType, helper.idxType},
-             loc, {getCtxPtr(rewriter), srcPtr, dstPtr, size});
-    if (gpuMemcpy.getAsyncToken()) {
-      // Replace the async token with a null ptr.
-      Value nullPtr = LLVM::ZeroOp::create(rewriter, loc, helper.ptrType);
-      rewriter.replaceOp(gpuMemcpy, nullPtr);
-    } else {
-      rewriter.eraseOp(gpuMemcpy);
-    }
+    SmallVector<Value> args;
+    args.emplace_back(getCtxPtr(rewriter));
+    args.emplace_back(callOp.getOperand(0));
+    args.emplace_back(helper.idxConstant(rewriter, loc, waitEvents.size()));
+    args.append(waitEvents);
+
+    funcCall(rewriter, GPU_OCL_DEALLOC, helper.voidType,
+             {helper.ptrType, helper.ptrType, helper.idxType}, loc, args,
+             /*isVarArg=*/true);
+    rewriter.eraseOp(callOp);
     return success();
   }
 };
@@ -270,8 +234,7 @@ struct ConvertMgpuMemcpy final : OpRewritePattern<LLVM::CallOp> {
 
 struct ConvertLaunch final : ConvertOpPattern<gpu::LaunchFuncOp> {
 
-  explicit ConvertLaunch(const Helper &helper, bool callFinish)
-      : ConvertOpPattern(helper), callFinish(callFinish) {}
+  explicit ConvertLaunch(const Helper &helper) : ConvertOpPattern(helper) {}
 
   LogicalResult
   matchAndRewrite(gpu::LaunchFuncOp gpuLaunch, OpAdaptor adaptor,
@@ -283,8 +246,15 @@ struct ConvertLaunch final : ConvertOpPattern<gpu::LaunchFuncOp> {
 
     const Location loc = gpuLaunch.getLoc();
     auto kernelArgs = adaptor.getKernelOperands();
+    auto mod = rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
+    auto func =
+        rewriter.getBlock()->getParent()->getParentOfType<LLVM::LLVMFuncOp>();
+    helper.launchFuncs.insert(func.getOperation());
+    auto &kernelEvents = helper.kernelEvents[func.getOperation()];
+    auto kernelName = gpuLaunch.getKernelModuleName().getValue();
+    auto depends = gc::KernelAttrs(mod, kernelName).getDepends();
     SmallVector<Value> args;
-    args.reserve(kernelArgs.size() + 5);
+    args.reserve(kernelArgs.size() + 6 + (depends ? depends->size() : 0));
     args.emplace_back(getCtxPtr(rewriter));
     args.emplace_back(kernelPtr.value());
 
@@ -298,6 +268,20 @@ struct ConvertLaunch final : ConvertOpPattern<gpu::LaunchFuncOp> {
     args.emplace_back(castToIdx(gpuLaunch.getGridSizeX()));
     args.emplace_back(castToIdx(gpuLaunch.getGridSizeY()));
     args.emplace_back(castToIdx(gpuLaunch.getGridSizeZ()));
+    args.emplace_back(
+        helper.idxConstant(rewriter, loc, depends ? depends->size() : 0));
+
+    if (depends) {
+      for (auto dep : *depends) {
+        auto event = kernelEvents.find(dep.str());
+        if (event == kernelEvents.end()) {
+          gpuLaunch.emitOpError()
+              << "depends on kernel '" << dep << "' before it is launched";
+          return failure();
+        }
+        args.emplace_back(event->second);
+      }
+    }
 
     int i = 0;
     for (auto arg : kernelArgs) {
@@ -317,23 +301,20 @@ struct ConvertLaunch final : ConvertOpPattern<gpu::LaunchFuncOp> {
       }
     }
 
-    const auto gpuOclLaunch =
-        funcCall(rewriter, GPU_OCL_KERNEL_LAUNCH, helper.voidType,
+    auto gpuOclLaunch =
+        funcCall(rewriter, GPU_OCL_KERNEL_LAUNCH, helper.idxType,
                  {helper.ptrType, helper.ptrType, helper.idxType,
-                  helper.idxType, helper.idxType},
+                  helper.idxType, helper.idxType, helper.idxType},
                  loc, args, true);
-    rewriter.replaceOp(gpuLaunch, gpuOclLaunch);
+    gpuOclLaunch->setDiscardableAttr(gc::GC_ATTR_KERNEL_NAME,
+                                     gpuLaunch.getKernelModuleName());
+    kernelEvents[std::string(kernelName)] = gpuOclLaunch.getResult();
 
-    if (callFinish) {
-      funcCall(rewriter, GPU_OCL_FINISH, helper.voidType, {helper.ptrType}, loc,
-               getCtxPtr(rewriter));
-    }
-
+    rewriter.eraseOp(gpuLaunch);
     return success();
   }
 
 private:
-  bool callFinish;
   // Returns the kernel pointer stored in the global var ...name_Ptr.
   // If it's NULL, calls the createKernel() function.
   std::optional<Value> getKernel(gpu::LaunchFuncOp &gpuLaunch,
@@ -592,11 +573,17 @@ struct GpuToGpuOcl final : gc::impl::GpuToGpuOclBase<GpuToGpuOcl> {
     {
       RewritePatternSet patterns(ctx);
       populateGpuToLLVMConversionPatterns(converter, patterns);
-      patterns.insert<ConvertAlloc, ConvertMemcpy>(helper);
-      patterns.insert<ConvertLaunch>(helper, callFinish);
-      patterns.insert<ConvertDealloc>(helper);
+      patterns.insert<ConvertLaunch>(helper);
       if (failed(applyPartialConversion(getOperation(), target,
                                         std::move(patterns)))) {
+        signalPassFailure();
+        return;
+      }
+    }
+    {
+      RewritePatternSet patterns(ctx);
+      patterns.add<ConvertMgpuAlloc, ConvertMgpuFree>(ctx, helper);
+      if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
         signalPassFailure();
         return;
       }
@@ -604,11 +591,22 @@ struct GpuToGpuOcl final : gc::impl::GpuToGpuOclBase<GpuToGpuOcl> {
 
     auto mod = cast<ModuleOp>(getOperation());
 
+    if (callFinish) {
+      for (auto funcOp : helper.launchFuncs) {
+        cast<LLVM::LLVMFuncOp>(funcOp).walk([&](LLVM::ReturnOp ret) {
+          OpBuilder rewriter(ret);
+          funcCall(rewriter, GPU_OCL_FINISH, helper.voidType, {helper.ptrType},
+                   ret.getLoc(), getCtxPtr(rewriter));
+        });
+      }
+    }
+
     // Delete llvm.call @mgpuStreamCreate() and all its users.
     SmallPtrSet<Operation *, 8> toErase;
     static constexpr StringLiteral mgpuFuncs[] = {
         "mgpuStreamCreate", "mgpuStreamDestroy",    "mgpuStreamSynchronize",
         "mgpuMemcpy",       "mgpuEventSynchronize", "mgpuEventDestroy",
+        "mgpuMemAlloc",     "mgpuMemFree",
     };
     auto isMgpu = [](StringRef name) {
       for (auto f : mgpuFuncs)
