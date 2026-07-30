@@ -591,6 +591,10 @@ protected:
           }));
     }
 
+    // Captured before tiling: tg.op may be erased once its uses are replaced
+    // below, so getResultIndexingMap must not be recomputed from it later.
+    AffineMap prodMap = getResultIndexingMap(tg.op.getOperation(), 0);
+
     auto result = tileConsumerAndFuseProducersUsingSCF(tg.rw, tg.op, opts);
     if (failed(result)) {
       tg.op->emitError() << "Failed to tile and fuse using SCF";
@@ -627,7 +631,7 @@ protected:
     }
 
     if (tg.level == Level::WG) {
-      if (!fuseConsumers(tg, opReplacement)) return nullptr;
+      if (!fuseConsumers(tg, opReplacement, prodMap)) return nullptr;
       else fuseProducers(tg, opReplacement);
     }
 
@@ -662,8 +666,8 @@ protected:
     return SCFTileAndFuseOptions::ControlFnResult{};
   }
 
-  static bool fuseConsumers(Target &tg, LoopLikeOpInterface &loop) {
-    AffineMap prodMap = getResultIndexingMap(tg.op.getOperation(), 0);
+  static bool fuseConsumers(Target &tg, LoopLikeOpInterface &loop,
+                            AffineMap prodMap) {
     auto isFusible = [&](Operation *op) {
       return canFuse(loop, op) ||
              isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp>(op);

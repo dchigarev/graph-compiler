@@ -41,7 +41,7 @@ template <typename... Args>
                                              llvm::inconvertibleErrorCode());
 }
 
-[[noreturn]] static void report(GC_ERR_LOC_DECL llvm::Error err) {
+[[noreturn]] inline void report(GC_ERR_LOC_DECL llvm::Error err) {
   log::log(GC_ERR_LOC_ARGS std::cerr, "ERROR", "Unrecoverable error!");
   report_fatal_error(std::move(err));
 }

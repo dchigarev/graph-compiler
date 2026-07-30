@@ -22,8 +22,6 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/ExecutionEngine/JitRunner.h"
-#include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Tools/ParseUtilities.h"
@@ -152,7 +150,7 @@ int main(int argc, char **argv) {
   gc::gpu::OclModuleBuilder builder{mlirMod, builderOpts};
   auto runtime = gcGetOrReport(gc::gpu::OclRuntime::get());
   auto oclMod = gcGetOrReport(builder.build(runtime));
-  assert(oclMod->isStatic);
+  assert(oclMod.isStatic());
 
   auto queue = gcGetOrReport(runtime.createQueue());
   gc::gpu::OclContext ctx{runtime, queue};

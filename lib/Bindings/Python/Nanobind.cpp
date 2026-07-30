@@ -120,7 +120,7 @@ struct Usm {
   }
 };
 
-using GpuModule = std::shared_ptr<const OclModule>;
+using GpuModule = OclModule;
 NB_MODULE(graph_compiler, m) {
   m.doc() = "Graph Compiler";
 
@@ -144,7 +144,7 @@ NB_MODULE(graph_compiler, m) {
              builderOpts.callFinish = wait;
              OclModuleBuilder builder{mlirMod, builderOpts};
              auto oclMod = gcGetOrReport(builder.build(ctx.runtime));
-             assert(oclMod->isStatic);
+             assert(oclMod.isStatic());
              return oclMod;
            }),
            nb::arg("mod"), nb::arg("dump") = false, nb::arg("wait") = false)
@@ -161,7 +161,7 @@ NB_MODULE(graph_compiler, m) {
             nb::object cpu = arg.attr("cpu")().attr("contiguous")();
             usms.emplace_back(cpu);
             ptr = usms.back().ptr;
-            if (mod->isOutputArg(i)) {
+            if (mod.isOutputArg(i)) {
               outputs.emplace_back(usms.back(), std::move(arg), std::move(cpu));
             }
           } else {

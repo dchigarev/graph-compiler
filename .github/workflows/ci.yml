@@ -22,7 +22,7 @@ env:
   LLVM_BUILD_TYPE: RelWithDebInfo
   LLVM_INSTALL_DIR: externals/llvm
   OV_REPO: https://x-access-token:${{ secrets.OV_TOKEN }}@github.com/dchigarev/openvino.git
-  OV_VERSION: mlir-gpu-gc-integration
+  OV_VERSION: ap/cache
   OV_INSTALL_DIR: externals/openvino
 
 jobs:

@@ -146,6 +146,12 @@ build_llvm() {
         -DLLVM_FORCE_VC_REPOSITORY="$llvm_url" \
         -DCMAKE_INSTALL_PREFIX="$llvm_install_dir"
     cmake --build "$llvm_build_dir" --parallel $MAX_JOBS $BUILD_TARGET
+    
+    local llvm_hash=$(git rev-parse --short HEAD)
+    local dirty=$( (git ls-files --modified --others --exclude-standard && git diff --name-only --cached) \
+      | sort -u | xargs sha1sum | grep -v ' -$')
+    [ -n "$dirty" ] && llvm_hash="${llvm_hash}-$(echo "$dirty" | sha1sum | cut -d' ' -f1)"
+    sed -r -i "s/set *\(LLVM_VERSION_SUFFIX.+/set(LLVM_VERSION_SUFFIX $llvm_hash)/g" "$MLIR_DIR/../llvm/LLVMConfig.cmake"
 }
 
 echo "GC_BUILD_TYPE=$GC_BUILD_TYPE"

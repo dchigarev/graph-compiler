@@ -78,21 +78,23 @@ if(NOT GC_DYLINK AND NOT CMAKE_BUILD_TYPE STREQUAL "Release")
                                                -fdata-sections)
 endif()
 
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+include(functions)
+include(mlir)
+
 find_package(Git QUIET)
 add_custom_target(
   GcVersion ALL
   COMMAND
     ${CMAKE_COMMAND} -DPROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
     -DBUILD_DIR="${PROJECT_BINARY_DIR}" -DGIT_EXECUTABLE="${GIT_EXECUTABLE}"
-    -DVERSION_CODE="${PROJECT_VERSION_MAJOR}" -P
+    -DVERSION_CODE="${PROJECT_VERSION_MAJOR}"
+    -DLLVM_VERSION_MAJOR="${LLVM_VERSION_MAJOR}"
+    -DLLVM_VERSION_SUFFIX="${LLVM_VERSION_SUFFIX}" -P
     "${PROJECT_SOURCE_DIR}/cmake/version.cmake"
   BYPRODUCTS "${PROJECT_BINARY_DIR}/include/gc/Version.h"
   COMMENT "Generating Version.h")
 add_dependencies(GcInterface GcVersion)
-
-list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
-include(functions)
-include(mlir)
 
 add_subdirectory(include)
 add_subdirectory(lib)

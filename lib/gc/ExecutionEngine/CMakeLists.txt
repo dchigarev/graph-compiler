@@ -1,5 +1,6 @@
 gc_add_mlir_library(
   GcJitEngine
+  Cache.cpp
   JitEngine.cpp
   LINK_LIBS
   PUBLIC
