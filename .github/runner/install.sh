@@ -7,9 +7,6 @@ sudo apt-get dist-upgrade -y
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
     binutils \
     ccache \
-    clang \
-    clang-format \
-    clang-tidy \
     clinfo \
     cmake \
     cmake-format \
@@ -18,7 +15,7 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
     git \
     libigdfcl-dev \
     libomp-dev \
-    lld \
+    libzstd-dev \
     ninja-build \
     ocl-icd-opencl-dev \
     psmisc \
@@ -29,11 +26,27 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
     python3-pip \
     python3-setuptools \
     python3-venv \
-    screen
+    screen \
+    software-properties-common
 
-sudo update-alternatives --install /usr/bin/cc cc /usr/bin/clang 100
-sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++ 100
-sudo update-alternatives --install /usr/bin/ld ld /usr/bin/lld 100
+export LLVM_VERSION=24
+wget -qO- https://apt.llvm.org/llvm.sh \
+  | sed -e "s|LLVM_VERSION_PATTERNS\[23\]|LLVM_VERSION_PATTERNS[${LLVM_VERSION}]|g" \
+  | sudo bash -s -- "${LLVM_VERSION}" all
+sudo apt purge -y clang lld llvm-14-linker-tools clang-format-14  libclang-cpp14 libclang-common-18-dev libllvm18 || true
+sudo apt auto-remove -y
+sudo apt-get install -y --no-install-recommends \
+    libmlir-${LLVM_VERSION}-dev \
+    mlir-${LLVM_VERSION}-tools
+
+sudo update-alternatives --install /usr/bin/cc cc /usr/bin/clang-${LLVM_VERSION} 100
+sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++-${LLVM_VERSION} 100
+sudo update-alternatives --install /usr/bin/ld ld /usr/bin/lld-${LLVM_VERSION} 100
+sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-${LLVM_VERSION} 100
+sudo update-alternatives --install /usr/bin/clangd clangd /usr/bin/clangd-${LLVM_VERSION} 100
+sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-${LLVM_VERSION} 100
+sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-${LLVM_VERSION} 100
+sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-${LLVM_VERSION} 100
 
 echo "Creating GitHub runner"
 [ -z "$GH_TOKEN" ] && read -p "GitHub token: " GH_TOKEN

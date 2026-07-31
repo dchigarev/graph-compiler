@@ -22,10 +22,10 @@ include(AddLLVM)
 include(AddMLIR)
 include(HandleLLVMOptions)
 
-include_directories(${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
 target_include_directories(
-  GcInterface INTERFACE $<BUILD_INTERFACE:${LLVM_INCLUDE_DIRS}>
-                        $<BUILD_INTERFACE:${MLIR_INCLUDE_DIRS}>)
+  GcInterface SYSTEM INTERFACE $<BUILD_INTERFACE:${LLVM_INCLUDE_DIRS}>
+                               $<BUILD_INTERFACE:${MLIR_INCLUDE_DIRS}>)
 
 set(LLVM_TABLEGEN_FLAGS -I${PROJECT_BINARY_DIR}/include
                         -I${PROJECT_SOURCE_DIR}/include)
