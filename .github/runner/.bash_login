@@ -4,7 +4,7 @@ export GH_ACTIONS_CACHE_DIR="$GH_RUNNER_DIR/cache"
 export CCACHE_DIR="$GH_RUNNER_DIR/ccache"
 alias ll='ls -la'
 
-if [ ! -d "$GH_RUNNER_DIR" ] || [ "$(readlink /etc/alternatives/cc)" != "/usr/bin/clang" ]; then
+if [ ! -d "$GH_RUNNER_DIR" ] || ! readlink /etc/alternatives/cc | grep -q clang ; then
     [ -z "$GH_TOKEN" ] && read -p "GitHub token: " GH_TOKEN
     export GH_TOKEN
     export GH_REPO_PATH='intel-sandbox/graph-compiler'
