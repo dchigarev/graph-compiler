@@ -1,0 +1,23 @@
+diff --git a/mlir/lib/Dialect/GPU/Pipelines/GPUToXeVMPipeline.cpp b/mlir/lib/Dialect/GPU/Pipelines/GPUToXeVMPipeline.cpp
+index 1cbf3bd63363..205c0aca0057 100644
+--- a/mlir/lib/Dialect/GPU/Pipelines/GPUToXeVMPipeline.cpp
++++ b/mlir/lib/Dialect/GPU/Pipelines/GPUToXeVMPipeline.cpp
+@@ -107,12 +107,12 @@ void buildGPUPassPipeline(OpPassManager &pm,
+   // intentionally left disabled: f4E2M1FN extf/truncf are lowered by the XeVM
+   // conversions (xevm.extf), whereas f8E8M0FNU is not supported there and so
+   // must be expanded here.
+-  {
+-    arith::ArithExpandOpsPassOptions arithExpandOptions;
+-    arithExpandOptions.includeF8E8M0 = true;
+-    pm.addNestedPass<gpu::GPUModuleOp>(
+-        arith::createArithExpandOpsPass(arithExpandOptions));
+-  }
++  // {
++  //   arith::ArithExpandOpsPassOptions arithExpandOptions;
++  //   arithExpandOptions.includeF8E8M0 = true;
++  //   pm.addNestedPass<gpu::GPUModuleOp>(
++  //       arith::createArithExpandOpsPass(arithExpandOptions));
++  // }
+   pm.addNestedPass<gpu::GPUModuleOp>(createConvertMathToXeVM());
+   ConvertXeGPUToXeVMPassOptions xegpuToXeVMOptions;
+   xegpuToXeVMOptions.use64bitIndex = options.use64bitIndex;
