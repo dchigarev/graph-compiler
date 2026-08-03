@@ -36,4 +36,5 @@ gc_add_mlir_library(
   LINK_LIBS
   PUBLIC
   GcGpuOclPasses
+  ${GC_DIALECT_LIBS}
   GcInterface)

@@ -24,5 +24,6 @@ gc_link_mlir_tool(gc-opt GcGpuPasses)
 
 if(NOT GC_DYLINK)
   gc_link_mlir_tool(gc-opt MLIROptLib MLIRLinalgTransformOps
-                    MLIRLLVMIRTransforms MLIRTransformDialect)
+                    MLIRLLVMIRTransforms MLIRTransformDialect
+                    MLIRTransformDialectTransforms)
 endif()
