@@ -21,6 +21,7 @@ set -e
 # Default values
 : ${GC_BUILD_TYPE:=RelWithDebInfo}
 : ${GC_DYLINK:=OFF}
+: "${GC_BUILD_TARGET:=--target install}"
 
 print_usage() {
     cat <<EOF
@@ -30,6 +31,7 @@ $(basename "$0")
     [ -r | --release ] Release build (default: RelWithDebInfo)
     [ -l | --dyn     ] Dynamical linking, requires rebuild of LLVM, activates 'dev' option
     [ -v | --llvm    ] Build LLVM only, without patching and git resetting
+    [      --no-gc-install ] Do not build GC install target
     [ -c | --clean   ] Delete the build artifacts from the previous build
     [ -s | --suffix  ] Build dir suffix
     [ -h | --help    ] Print this message
@@ -56,6 +58,9 @@ for arg in "$@"; do
       ;;
     -v | --llvm)
       BUILD_LLVM_ONLY=1
+      ;;
+    --no-gc-install)
+      GC_BUILD_TARGET=""
       ;;
     *)
       echo "Unknown option: $arg"
@@ -150,6 +155,7 @@ build_llvm() {
 
 echo "GC_BUILD_TYPE=$GC_BUILD_TYPE"
 echo "GC_DYLINK=$GC_DYLINK"
+echo "GC_BUILD_TARGET=$GC_BUILD_TARGET"
 
 build_llvm
 [ -z "$BUILD_LLVM_ONLY" ] || exit 0
@@ -166,4 +172,4 @@ cmake -S . --preset gc \
     -DMLIR_DIR="$MLIR_DIR" \
     -DLLVM_EXTERNAL_LIT="$LIT_PATH" \
     -DCMAKE_INSTALL_PREFIX="$BUILD_DIR/install"
-cmake --build "$BUILD_DIR" --parallel $MAX_JOBS $BUILD_TARGET
+cmake --build "$BUILD_DIR" --parallel $MAX_JOBS $GC_BUILD_TARGET
