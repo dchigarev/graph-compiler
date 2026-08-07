@@ -202,8 +202,6 @@ jobs:
           mkdir -p $ov_dir/src/plugins/intel_gpu/tests/functional/mlir_op
           cp $bk/bin/intel64/Release/ov_gpu_func_tests $ov_dir/bin/intel64/Release/
           cp $bk/bin/intel64/Release/*.so* $ov_dir/bin/intel64/Release/
-          cp -r $bk/src/plugins/intel_gpu/tests/functional/mlir_op/models/ \
-                $ov_dir/src/plugins/intel_gpu/tests/functional/mlir_op/
           rm -rf $bk
 
       - name: Save OpenVINO to cache
