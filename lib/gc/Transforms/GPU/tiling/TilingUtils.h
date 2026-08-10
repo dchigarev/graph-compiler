@@ -331,20 +331,26 @@ protected:
 
   virtual void computeSgTiles(Target &tg) { computeTiles(tg, true); }
 
-  // Tile the last 2 dims and set all leading dims to 1.
+  // Tile the innermost 2 non-unit dims and set all leading dims to 1.
   virtual void computeTiles(Target &tg, bool reduction) {
     auto wgTiles = tg.getSizes(reduction);
     if (wgTiles.empty()) return;
     SmallVector<size_t> sgTiles(wgTiles.size(), 1);
 
-    bool unit = wgTiles.size() == 1;
-    for (auto &t :
-         llvm::make_range(wgTiles.begin(), wgTiles.end() - (unit ? 1 : 2)))
-      t = 1;
+    // Skip the inner most unit dims because they can't be mapped to 2D block
+    // load/store instructions
+    int wDim = wgTiles.size();
+    while (wDim-- && wgTiles[wDim] == 1);
+    if (wDim == -1) { // all dims are unit
+      tg.setTiles(sgTiles, sgTiles, reduction);
+      return;
+    }
 
-    size_t dummy = 1;
-    auto &wTile = wgTiles.back();
-    auto &hTile = unit ? dummy : wgTiles[wgTiles.size() - 2];
+    bool unit = wDim == 0;
+    size_t hDim = unit ? wDim : wDim - 1;
+    size_t wTile = wgTiles[wDim];
+    size_t hTile = unit ? 1 : wgTiles[hDim];
+    for (auto &t : wgTiles) t = 1;
     adjustMaxTileSizes(tg, reduction, wTile, hTile);
     // TODO: parameterize sgMul and wgMul in kernel attributes so they can
     // be used for auto tuning.
@@ -372,18 +378,20 @@ protected:
               auto sgw = w * c * sm, sgh = h * sm;
               auto wgw = sgw * wm, wgh = sgh * wm;
               if (wTile % wgw || (!unit && hTile % wgh)) continue;
-              wTile = wgw;
-              hTile = wgh;
-              sgTiles.back() = sgw;
-              if (!unit) sgTiles[wgTiles.size() - 2] = sgh;
+              wgTiles[wDim] = wgw;
+              sgTiles[wDim] = sgw;
+              if (!unit) {
+                wgTiles[hDim] = wgh;
+                sgTiles[hDim] = sgh;
+              }
               tg.setTiles(wgTiles, sgTiles, reduction);
               return;
             }
 
-    wTile = 1;
-    hTile = 1;
-    sgTiles.back() = 1;
-    if (!unit) sgTiles[wgTiles.size() - 2] = 1;
+    wgTiles[wDim] = 1;
+    wgTiles[hDim] = 1;
+    sgTiles[wDim] = 1;
+    sgTiles[hDim] = 1;
     tg.setTiles(wgTiles, sgTiles, reduction);
   }
 

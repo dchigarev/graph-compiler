@@ -24,6 +24,7 @@
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
 #include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -171,17 +172,24 @@ private:
           }
         }
         if (attr && attr.isSplat()) {
-          toErase.set(i);
           auto arg = gpuFunc.getArgument(i);
           assert(isa<MemRefType>(arg.getType()));
-          for (auto *user : llvm::make_early_inc_range(arg.getUsers())) {
-            if (auto tr = dyn_cast<vector::TransferReadOp>(user)) {
-              rw.setInsertionPoint(tr);
-              auto cst = arith::ConstantOp::create(
-                  rw, tr.getLoc(), attr.resizeSplat(tr.getVectorType()));
-              rw.replaceOp(tr, cst.getResult());
+          // The reads may be separated from the argument by view ops.
+          std::function<void(Value)> replaceReads = [&](Value v) {
+            for (auto *user : llvm::make_early_inc_range(v.getUsers())) {
+              if (auto tr = dyn_cast<vector::TransferReadOp>(user)) {
+                rw.setInsertionPoint(tr);
+                auto cst = arith::ConstantOp::create(
+                    rw, tr.getLoc(), attr.resizeSplat(tr.getVectorType()));
+                rw.replaceOp(tr, cst.getResult());
+              } else if (auto view = dyn_cast<ViewLikeOpInterface>(user)) {
+                replaceReads(view->getResult(0));
+                if (view->use_empty()) rw.eraseOp(view);
+              }
             }
-          }
+          };
+          replaceReads(arg);
+          if (arg.use_empty()) toErase.set(i);
         }
       }
 

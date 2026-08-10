@@ -11,6 +11,7 @@ gc_add_mlir_library(
   ApplyPaddingLevel.cpp
   TensorMaskingOpInterface.cpp
   Decomposition.cpp
+  DropUnitDims.cpp
   GpuDeviceProps.cpp
   GpuKernelOutline.cpp
   MemrefCopyToGpuMemcpy.cpp

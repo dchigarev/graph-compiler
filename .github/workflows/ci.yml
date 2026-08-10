@@ -5,12 +5,16 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      GC_DUMP_IR:
+        description: 'Dump IRs after each phase.'
+        default: ''
       GC_DEBUG:
         description: 'Regex pattern matching GC files to enable debug for.'
         default: ''
-      OV_MLIR_DEBUG:
-        description: 'Dump OV MLIRs'
-        default: ''
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 
 env:
   GC_DYLINK: ON
@@ -91,12 +95,17 @@ jobs:
 
       - name: Activate Python venv
         run: |
+          is_enabled() { echo "$1" | grep -qiE '^(1|true|on)$'; }
+
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
           [ -z '${{ github.event.inputs.GC_DEBUG }}' ] || \
             echo 'GC_DEBUG=${{ github.event.inputs.GC_DEBUG }}' >> "$GITHUB_ENV"
-          [ -z '${{ github.event.inputs.OV_MLIR_DEBUG }}' ] || \
-            echo 'OV_MLIR_DEBUG=${{ github.event.inputs.OV_MLIR_DEBUG }}' >> "$GITHUB_ENV"
+          if is_enabled '${{ github.event.inputs.GC_DUMP_IR }}'; then
+            echo 'GC_DUMP_IR=1' >> "$GITHUB_ENV"
+            echo 'OV_MLIR_DEBUG=1' >> "$GITHUB_ENV"
+            echo 'GC_FILE_CACHE_OFF=1' >> "$GITHUB_ENV"
+          fi
 
       - name: ruff-format
         run: |
@@ -161,6 +170,11 @@ jobs:
         run: |
           cmake --build build --target gc-check
 
+      - name: Run Python tests
+        run: |
+          [ -z "$ONEAPI_ROOT" ] && . /opt/intel/oneapi/setvars.sh
+          pytest -n 16 python/test
+
       - name: Load OpenVINO from cache
         id: load-ov
         uses: ./.github/actions/cache
@@ -220,22 +234,46 @@ jobs:
       - name: Run OpenVINO tests
         run: |
           [ -z "$ONEAPI_ROOT" ] && . /opt/intel/oneapi/setvars.sh
-          bin_dir="$PWD/${{env.OV_INSTALL_DIR}}/bin/intel64/Release"
+          export test_runner="$PWD/${{env.OV_INSTALL_DIR}}/bin/intel64/Release/ov_gpu_func_tests"
           export OV_GPU_ENABLE_MLIR=1
           export OV_GPU_QUEUE_TYPE=out-of-order
+
+          # Regex patterns of tests to exclude from the run.
+          exclude=''
           filter=$(printf '%s:' \
             'MLIRExecution.SimpleMatmulf16' \
             'MLIRExecution.SDPABasic' \
             '*ScaledAttnLayerGPUMlirTest*' \
             'mlir_*' \
           )
-          tests=$("$bin_dir/ov_gpu_func_tests" --gtest_list_tests --gtest_filter="${filter%:}" \
-            | awk '/^  /{print suite $1} /^[^ ]/{suite=$1}')
-          start=$SECONDS
-          echo "$tests" | xargs -P 32 -I{} "$bin_dir/ov_gpu_func_tests" --gtest_filter='{}'
-          echo "Run $(echo "$tests" | wc -l) OV tests in $((SECONDS - start))s"
+          tests=$("$test_runner" --gtest_list_tests --gtest_filter="${filter%:}" \
+            | awk -v exclude="$exclude" '/^  /{print suite $1} /^[^ ]/{suite=$1}')
+          [ -n "$exclude" ] && tests=$(echo "$tests" | grep -v -E "$exclude")
 
-      - name: Run Python tests
-        run: |
-          [ -z "$ONEAPI_ROOT" ] && . /opt/intel/oneapi/setvars.sh
-          pytest -n 16 python/test
+
+          run_ov_test() {
+            local output
+            output="$(echo "OV test output $1:" && "$test_runner" --gtest_filter="$1" 2>&1)"
+            local ec=$?
+            if [ $ec -eq 0 ]; then
+              [ "$GC_DUMP_IR" = "1" ] && echo "$output"
+              return 0
+            fi
+
+            local dump_dir="$PWD/failed_ov_test_dumps"
+            local dump_file="$dump_dir/$(echo "$1" | sha1sum | cut -d' ' -f1).txt"
+            mkdir -p "$dump_dir"
+            echo "Test $1 failed with exit code $ec. Saving output to $dump_file"
+            echo "$output" > "$dump_file"
+            [ "$GC_DUMP_IR" = "1" ] && echo "$output" && return $ec
+
+            echo "Running test again with IR dumps enabled:" >> "$dump_file"
+            GC_DUMP_IR=1 OV_MLIR_DEBUG=1 GC_FILE_CACHE_OFF=1 "$test_runner" --gtest_filter="$1" &>> "$dump_file"
+            cat "$dump_file"
+            return 1
+          }
+
+          export -f run_ov_test
+          start=$SECONDS
+          echo "$tests" | xargs -P 32 -I{} bash -c 'run_ov_test "$@"' _ {}
+          echo "Run $(echo "$tests" | wc -l) OV tests in $((SECONDS - start))s"

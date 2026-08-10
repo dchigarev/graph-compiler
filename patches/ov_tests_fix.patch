@@ -1,0 +1,512 @@
+diff --git a/mlir/lib/Conversion/VectorToXeGPU/VectorToXeGPU.cpp b/mlir/lib/Conversion/VectorToXeGPU/VectorToXeGPU.cpp
+index 8a4583642693..9b659058db72 100644
+--- a/mlir/lib/Conversion/VectorToXeGPU/VectorToXeGPU.cpp
++++ b/mlir/lib/Conversion/VectorToXeGPU/VectorToXeGPU.cpp
+@@ -471,6 +471,101 @@ convertMemrefAndOffsetsToTargetRank(PatternRewriter &rewriter, Location loc,
+   return {subviewOp.getResult(), newOffsets};
+ }
+ 
++// Returns the descriptor shape for an nd block transfer of `shape`. Unit dims
++// (anywhere, not just leading) around a 2D tile carry no addressing
++// information beyond their offset, so they are dropped and their offsets
++// folded into the descriptor's base pointer, which is what XeVM's 2D-only
++// block load/store requires. A shape with more than two non-unit dims is a
++// true multi-dim block, kept as-is for the batch-unrolling passes to split.
++static SmallVector<int64_t> getBlockTransferDescShape(ArrayRef<int64_t> shape) {
++  if (shape.size() <= 2)
++    return llvm::to_vector(shape);
++  SmallVector<int64_t> nonUnit = llvm::to_vector(
++      llvm::make_filter_range(shape, [](int64_t d) { return d != 1; }));
++  return nonUnit.size() == 2 ? nonUnit : llvm::to_vector(shape);
++}
++
++// Builds a memref.subview that adapts `memref` to `ndDescShape`, the shape
++// getBlockTransferDescShape picked for the descriptor, so that every offset the
++// XeVM 2D block IO cannot express is folded into the subview's base pointer.
++// Each memref dim is classified as:
++//   - dropped: a leading dim beyond `descShape.size()` (not covered by the
++//     vector transfer at all), or a unit dim of `descShape` that `ndDescShape`
++//     dropped. A size-1 dim carries no addressing information beyond its
++//     offset, so the offset is folded in and the dim is rank-reduced away.
++//   - folded batch: a retained dim outside the innermost 2D tile. The 2D block
++//     IO has no offset for such a dim, and the batch-unrolling passes address
++//     it with offsets *relative to the tile*, so its (possibly dynamic) offset
++//     must be folded into the base pointer here. The dim itself is kept, sized
++//     to its tile extent, and its new offset is zero.
++//   - kept: the innermost two dims, addressed directly by the block IO.
++// The retained dims stay in their original relative order. Returns the new
++// memref and the matching offsets for the retained dims, in that order.
++static std::pair<Value, SmallVector<OpFoldResult>>
++convertMemrefAndOffsetsToBlockShape(PatternRewriter &rewriter, Location loc,
++                                    Value memref,
++                                    ArrayRef<OpFoldResult> offsets,
++                                    ArrayRef<int64_t> descShape,
++                                    ArrayRef<int64_t> ndDescShape) {
++  auto memrefType = cast<MemRefType>(memref.getType());
++  unsigned rank = memrefType.getRank();
++  unsigned leadingCount = rank - descShape.size();
++
++  SmallVector<unsigned> keptDims;
++  bool dropUnitDims = ndDescShape.size() != descShape.size();
++  for (auto [i, d] : llvm::enumerate(descShape))
++    if (d != 1 || !dropUnitDims)
++      keptDims.push_back(leadingCount + i);
++  assert(keptDims.size() == ndDescShape.size() &&
++         "retained dims must match the descriptor shape");
++
++  // Map each folded batch dim to its tile extent.
++  llvm::SmallDenseMap<unsigned, int64_t> batchDims;
++  for (unsigned i = 0, e = keptDims.size() > 2 ? keptDims.size() - 2 : 0; i < e;
++       ++i)
++    batchDims.try_emplace(keptDims[i], ndDescShape[i]);
++
++  if (keptDims.size() == rank && batchDims.empty())
++    return {memref, SmallVector<OpFoldResult>(offsets)};
++
++  llvm::SmallDenseSet<unsigned> keptSet(keptDims.begin(), keptDims.end());
++  SmallVector<OpFoldResult> subviewOffsets;
++  SmallVector<OpFoldResult> subviewSizes;
++  SmallVector<OpFoldResult> subviewStrides(rank, rewriter.getI64IntegerAttr(1));
++  SmallVector<int64_t> resultShape;
++  SmallVector<OpFoldResult> newOffsets;
++  ArrayRef<int64_t> originalShape = memrefType.getShape();
++  auto meta = memref::ExtractStridedMetadataOp::create(rewriter, loc, memref);
++  for (unsigned i = 0; i < rank; ++i) {
++    if (!keptSet.contains(i)) {
++      subviewOffsets.push_back(offsets[i]);
++      subviewSizes.push_back(rewriter.getI64IntegerAttr(1));
++    } else if (auto batch = batchDims.find(i); batch != batchDims.end()) {
++      subviewOffsets.push_back(offsets[i]);
++      subviewSizes.push_back(rewriter.getI64IntegerAttr(batch->second));
++      resultShape.push_back(batch->second);
++      newOffsets.push_back(rewriter.getI64IntegerAttr(0));
++    } else {
++      subviewOffsets.push_back(rewriter.getI64IntegerAttr(0));
++      if (ShapedType::isDynamic(originalShape[i])) {
++        subviewSizes.push_back(meta.getSizes()[i]);
++        resultShape.push_back(ShapedType::kDynamic);
++      } else {
++        subviewSizes.push_back(rewriter.getI64IntegerAttr(originalShape[i]));
++        resultShape.push_back(originalShape[i]);
++      }
++      newOffsets.push_back(offsets[i]);
++    }
++  }
++
++  auto resultType = memref::SubViewOp::inferRankReducedResultType(
++      resultShape, memrefType, subviewOffsets, subviewSizes, subviewStrides);
++  auto subviewOp =
++      memref::SubViewOp::create(rewriter, loc, resultType, memref,
++                                subviewOffsets, subviewSizes, subviewStrides);
++  return {subviewOp.getResult(), newOffsets};
++}
++
+ template <
+     typename OpType,
+     typename = std::enable_if_t<llvm::is_one_of<
+@@ -636,21 +731,25 @@ struct TransferReadLowering : public OpRewritePattern<vector::TransferReadOp> {
+         size_t rank = descShape.size();
+         assert(rank >= 2 && "Transpose requires at least 2 dimensions");
+         std::swap(descShape[rank - 1], descShape[rank - 2]);
+-        loadedVecTy = VectorType::get(descShape, elementType);
+       }
++      // Unit dims around the 2D tile are dropped; they are restored with a
++      // trailing vector.shape_cast.
++      SmallVector<int64_t> ndDescShape = getBlockTransferDescShape(descShape);
++      auto ndVecTy = VectorType::get(ndDescShape, elementType);
++
+       auto descType = xegpu::TensorDescType::get(
+-          descShape, elementType, /*array_length=*/1,
++          ndDescShape, elementType, /*array_length=*/1,
+           /*boundary_check=*/isOutOfBounds, xegpu::MemorySpace::Global);
+-      auto [src, indices] = convertMemrefAndOffsetsToTargetRank(
++      auto [src, indices] = convertMemrefAndOffsetsToBlockShape(
+           rewriter, loc, readOp.getBase(),
+-          getAsOpFoldResult(readOp.getIndices()), loadedVecTy.getRank());
++          getAsOpFoldResult(readOp.getIndices()), descShape, ndDescShape);
+       // By default, no specific caching policy is assigned.
+       xegpu::CachePolicyAttr hint = nullptr;
+       xegpu::CreateNdDescOp ndDesc = createNdDescriptor(
+           rewriter, loc, descType, dyn_cast<TypedValue<MemRefType>>(src));
+ 
+       Operation *loadedOp =
+-          xegpu::LoadNdOp::create(rewriter, loc, loadedVecTy, ndDesc, indices,
++          xegpu::LoadNdOp::create(rewriter, loc, ndVecTy, ndDesc, indices,
+                                   /*packed=*/nullptr, /*transpose=*/nullptr,
+                                   /*l1_hint=*/hint,
+                                   /*l2_hint=*/hint, /*l3_hint=*/hint,
+@@ -659,12 +758,15 @@ struct TransferReadLowering : public OpRewritePattern<vector::TransferReadOp> {
+         // Undo the innermost-two-dims swap with a trailing vector.transpose:
+         // keep the leading dimensions in place and interchange only the last
+         // two.
+-        int64_t rank = loadedVecTy.getRank();
++        int64_t rank = ndVecTy.getRank();
+         SmallVector<int64_t> perm(llvm::to_vector(llvm::seq<int64_t>(0, rank)));
+         std::swap(perm[rank - 1], perm[rank - 2]);
+         loadedOp = vector::TransposeOp::create(rewriter, loc,
+                                                loadedOp->getResult(0), perm);
+       }
++      if (loadedOp->getResult(0).getType() != loadedVecTy)
++        loadedOp = vector::ShapeCastOp::create(rewriter, loc, loadedVecTy,
++                                               loadedOp->getResult(0));
+       rewriter.replaceOp(readOp, loadedOp);
+       return success();
+     }
+@@ -738,12 +840,21 @@ struct TransferWriteLowering
+                              writeMemTy.getElementType().isIntOrFloat();
+ 
+     if (canLowerToStoreNd) {
+-      auto [src, indices] = convertMemrefAndOffsetsToTargetRank(
++      // Unit dims around the 2D tile are dropped with a vector.shape_cast.
++      Value stored = writeOp.getVector();
++      SmallVector<int64_t> descShape(vecTy.getShape());
++      SmallVector<int64_t> ndDescShape = getBlockTransferDescShape(descShape);
++      if (ndDescShape != descShape)
++        stored = vector::ShapeCastOp::create(
++            rewriter, loc,
++            VectorType::get(ndDescShape, vecTy.getElementType()), stored);
++
++      auto [src, indices] = convertMemrefAndOffsetsToBlockShape(
+           rewriter, loc, writeOp.getBase(),
+-          getAsOpFoldResult(writeOp.getIndices()), vecTy.getRank());
++          getAsOpFoldResult(writeOp.getIndices()), descShape, ndDescShape);
+ 
+       auto descType = xegpu::TensorDescType::get(
+-          vecTy.getShape(), vecTy.getElementType(),
++          ndDescShape, vecTy.getElementType(),
+           /*array_length=*/1, /*boundary_check=*/writeOp.hasOutOfBoundsDim(),
+           xegpu::MemorySpace::Global);
+       // By default, no specific caching policy is assigned.
+@@ -751,11 +862,11 @@ struct TransferWriteLowering
+       xegpu::CreateNdDescOp ndDesc = createNdDescriptor(
+           rewriter, loc, descType, dyn_cast<TypedValue<MemRefType>>(src));
+ 
+-      auto storeOp = xegpu::StoreNdOp::create(
+-          rewriter, loc, writeOp.getVector(), ndDesc, indices,
+-          /*l1_hint=*/hint,
+-          /*l2_hint=*/hint, /*l3_hint=*/hint,
+-          /*layout=*/nullptr);
++      auto storeOp =
++          xegpu::StoreNdOp::create(rewriter, loc, stored, ndDesc, indices,
++                                   /*l1_hint=*/hint,
++                                   /*l2_hint=*/hint, /*l3_hint=*/hint,
++                                   /*layout=*/nullptr);
+       rewriter.replaceOp(writeOp, storeOp);
+       return success();
+     }
+diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUBlocking.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUBlocking.cpp
+index 9d1686403a43..76e6133610db 100644
+--- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUBlocking.cpp
++++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUBlocking.cpp
+@@ -492,10 +492,17 @@ void XeGPUBlockingPass::runOnOperation() {
+       xegpu::TensorDescType newTy =
+           xegpu::TensorDescType::get(ctx, tileShape, elemTy, encoding,
+                                      tdescTy.getLayoutAttr().dropInstData());
+-      // Compute the product of batch (higher) dimensions.
++      // Compute the number of batch tiles as the ratio between the batch
++      // (higher) dimensions of the full shape and of the tile shape.
+       ArrayRef<int64_t> shape = type.getShape();
+-      int64_t batchCount =
+-          shape.size() > 2 ? computeProduct(shape.drop_back(2)) : 1;
++      int64_t batchCount = 1;
++      if (shape.size() > 2) {
++        std::optional<SmallVector<int64_t>> batchRatio = computeShapeRatio(
++            shape.drop_back(2), tileShape.drop_back(2));
++        assert(batchRatio &&
++               "batch dims of shape must be a multiple of tile batch dims");
++        batchCount = computeProduct(*batchRatio);
++      }
+       return SmallVector<Type>(batchCount, newTy);
+     }
+     Type newTy = VectorType::get(tileShape, elemTy);
+diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPULayoutImpl.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPULayoutImpl.cpp
+index eb3c3faf7557..8c1d6b27233f 100644
+--- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPULayoutImpl.cpp
++++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPULayoutImpl.cpp
+@@ -1141,13 +1141,13 @@ static std::optional<SmallVector<int64_t>> get2DBlockIOInstDataLayout(
+   // a multiple of lane_layout * lane_data on each dim (Category A
+   // invariant).
+   SmallVector<int64_t> instData(rank, 1);
+-  assert(rank >= 2 && "dataShape must be at least 2D for 2D-block IO");
+-  int instWidth =
++  assert(rank >= 1 && "dataShape must not be empty");
++  instData.back() =
+       xegpu::getLargestDivisor(static_cast<int>(dataShape.back()), bWidths);
+-  int instHeight =
+-      xegpu::getLargestDivisor(static_cast<int>(dataShape[rank - 2]), bHeights);
+-  instData.back() = instWidth;
+-  instData[rank - 2] = instHeight;
++  // A 1D block IO has no height dim; its single dim is the block width.
++  if (rank > 1)
++    instData[rank - 2] = xegpu::getLargestDivisor(
++        static_cast<int>(dataShape[rank - 2]), bHeights);
+ 
+   return instData;
+ }
+@@ -1772,11 +1772,15 @@ xegpu::setupLoadNdAnchorLayout(xegpu::LayoutKind layoutKind,
+   // vertical lane layout means that the blockload must be transposed
+   // note scaleA on PVC has vertical lane layout even without transposed order
+   // attr
+-  bool hasTranspose =
+-      consumerLaneLayout[rank - 2] > 1 && consumerLaneLayout[rank - 1] == 1;
+-  bool hasTransform = !hasTranspose && consumerLaneData[rank - 2] > 1 &&
++  // A 1D block IO has a single dim, so it can be neither transposed nor
++  // transformed.
++  bool hasTranspose = rank > 1 && consumerLaneLayout[rank - 2] > 1 &&
++                      consumerLaneLayout[rank - 1] == 1;
++  bool hasTransform = rank > 1 && !hasTranspose &&
++                      consumerLaneData[rank - 2] > 1 &&
+                       consumerLaneData[rank - 1] == 1;
+-  assert((consumerLaneData[rank - 2] == 1 || consumerLaneData[rank - 1] == 1) &&
++  assert((rank < 2 || consumerLaneData[rank - 2] == 1 ||
++          consumerLaneData[rank - 1] == 1) &&
+          "Expected consumer lane data to have at most one non-unit dim");
+ 
+   if (layoutKind == xegpu::LayoutKind::InstData) {
+@@ -1800,17 +1804,18 @@ xegpu::setupLoadNdAnchorLayout(xegpu::LayoutKind layoutKind,
+     }
+ 
+     // See whether the consumer's inst_data satisfies the block constraints.
+-    int64_t height = consumerInstData[rank - 2];
++    // A 1D block IO has no height dim, so only the width is constrained.
+     int64_t width = consumerInstData[rank - 1];
+     auto maxBlockCount = *llvm::max_element(bCounts);
+     auto maxWidth = *llvm::max_element(bWidths);
+-    if (llvm::is_contained(bWidths, static_cast<int>(width)) ||
+-        (width % maxWidth == 0 && width / maxWidth < maxBlockCount)) {
+-      if (llvm::is_contained(bHeights, static_cast<int>(height))) {
+-        return buildInstDataLayoutWithLane(context, consumerInstData,
+-                                           laneLayout, consumerLaneData,
+-                                           consumerOrderAttr);
+-      }
++    bool validHeight =
++        rank < 2 || llvm::is_contained(bHeights, static_cast<int>(
++                                                     consumerInstData[rank - 2]));
++    if (validHeight &&
++        (llvm::is_contained(bWidths, static_cast<int>(width)) ||
++         (width % maxWidth == 0 && width / maxWidth < maxBlockCount))) {
++      return buildInstDataLayoutWithLane(context, consumerInstData, laneLayout,
++                                         consumerLaneData, consumerOrderAttr);
+     }
+ 
+     // if consumer instData size too small, try the larger one. like DPAS_MX's
+diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp
+index 14061ab24ffe..e2aeff6d07c6 100644
+--- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp
++++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp
+@@ -13,6 +13,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/Dialect/Arith/Utils/Utils.h"
+ #include "mlir/Dialect/MemRef/IR/MemRef.h"
+ #include "mlir/Dialect/Utils/IndexingUtils.h"
+ #include "mlir/Dialect/Vector/IR/VectorOps.h"
+@@ -122,14 +123,13 @@ protected:
+ 
+   /// Helper for the rank > 2 case shared by Load/Store/PrefetchNd unroll
+   /// patterns. The matching CreateNdDesc unroll pattern produces one tdesc
+-  /// per batch tile (the batch offset is baked into its base pointer via
+-  /// memref.subview), so here we only need to iterate the inner 2D offsets
+-  /// for each batch tdesc.
++  /// per batch tile (the static batch tile offset is baked into its base
++  /// pointer via memref.subview), so here we only need to iterate the inner
++  /// 2D offsets for each batch tdesc.
+   ///
+   /// Packs `srcTdesc` into one tdesc per batch tile, then iterates the inner
+   /// 2D tile offsets for each batch tdesc and invokes `createOp` with
+-  /// (batchTdesc, fullOffsets), where fullOffsets is `batchRank` zeros
+-  /// followed by the inner offsets. Returns the values produced by createOp,
++  /// (batchTdesc, fullOffsets). Returns the values produced by createOp,
+   /// flattened across (batch, inner) iteration order.
+   SmallVector<Value> unrollNdBatch(
+       Value srcTdesc, xegpu::TensorDescType tdescTy,
+@@ -141,6 +141,8 @@ protected:
+     SmallVector<int64_t> innerShape(shape.begin() + batchRank, shape.end());
+     SmallVector<int64_t> innerTarget(targetShape.begin() + batchRank,
+                                      targetShape.end());
++    ArrayRef<int64_t> batchShape = shape.take_front(batchRank);
++    ArrayRef<int64_t> batchTileShape = targetShape.take_front(batchRank);
+ 
+     SmallVector<Type> batchTdescTypes = getUnrolledTypes(tdescTy, targetShape);
+     SmallVector<Value> batchTdescs =
+@@ -150,14 +152,28 @@ protected:
+         tdescTy.getContext(), innerShape, tdescTy.getElementType(),
+         tdescTy.getEncoding(), /*layout=*/nullptr);
+ 
++    ArrayRef<OpFoldResult> batchOffsets = mixedOffsets.take_front(batchRank);
+     SmallVector<OpFoldResult> innerOffsets(mixedOffsets.begin() + batchRank,
+                                            mixedOffsets.end());
+ 
++    // Each batchTdesc's memref.subview already bakes in the *static* start
++    // of its batch tile. Any remaining (e.g. dynamic) batch offset from the
++    // original op is the position within that tile: it must be preserved
++    // when there is exactly one batch tile (the tile spans the whole batch
++    // shape, so its static start is all zeros and the offset is unambiguous).
++    // With multiple static batch tiles there is no single tile the dynamic
++    // offset could consistently apply to, so it is dropped (existing
++    // behavior for fully-static batch unrolling).
++    bool singleBatchTile = llvm::equal(batchShape, batchTileShape);
++
+     SmallVector<Value> newOps;
+     for (Value batchTdesc : batchTdescs) {
+       auto wrappedCreate = [&](SmallVector<OpFoldResult> offsets) -> Value {
+-        SmallVector<OpFoldResult> fullOffsets(batchRank,
+-                                              rewriter.getIndexAttr(0));
++        SmallVector<OpFoldResult> fullOffsets;
++        if (singleBatchTile)
++          fullOffsets.assign(batchOffsets.begin(), batchOffsets.end());
++        else
++          fullOffsets.assign(batchRank, rewriter.getIndexAttr(0));
+         fullOffsets.append(offsets.begin(), offsets.end());
+         return createOp(batchTdesc, fullOffsets);
+       };
+@@ -251,8 +267,8 @@ struct UnrollCreateNdOp : public UnrollPattern<xegpu::CreateNdDescOp> {
+     int64_t rank = tdescTy.getRank();
+     int64_t batchRank = rank - 2;
+ 
+-    // For rank <= 2 or non-memref source: existing single-tdesc behavior.
+-    if (batchRank <= 0 || !isa<MemRefType>(op.getSourceType())) {
++    // For rank <= 2: existing single-tdesc behavior.
++    if (batchRank <= 0) {
+       SmallVector<Value> newOps;
+       auto newTdescTy = getUnrolledTypes(tdescTy, *targetShape)[0];
+       auto newOp = xegpu::CreateNdDescOp::create(
+@@ -264,19 +280,55 @@ struct UnrollCreateNdOp : public UnrollPattern<xegpu::CreateNdDescOp> {
+       return success();
+     }
+ 
+-    // For rank > 2 with memref source: create one tdesc per batch tile via
+-    // memref.subview. Each subview slices the batch dimensions, so the
+-    // resulting tdesc has the batch offset baked into its base pointer.
+-    // The inner dimensions remain full-size for reuse across multiple
+-    // load/store operations with different offsets.
+     ArrayRef<int64_t> shape = tdescTy.getShape();
+     SmallVector<int64_t> batchBlockSize(targetShape->begin(),
+-                                        targetShape->begin() + batchRank);
++                                       targetShape->begin() + batchRank);
+     batchBlockSize.append(shape.begin() + batchRank, shape.end());
+ 
+     auto newTdescTy =
+         cast<xegpu::TensorDescType>(getUnrolledTypes(tdescTy, *targetShape)[0]);
+ 
++    // For rank > 2 with an integer base pointer: one tdesc per batch tile,
++    // each with the batch tile's byte offset added to the base pointer.
++    if (!isa<MemRefType>(op.getSourceType())) {
++      auto ptrTy = cast<IntegerType>(op.getSourceType());
++      unsigned elemBytes =
++          llvm::divideCeil(tdescTy.getElementType().getIntOrFloatBitWidth(), 8);
++      SmallVector<OpFoldResult> mixedStrides = op.getMixedStrides();
++      SmallVector<Value> newOps;
++
++      for (SmallVector<int64_t> batchOffsets :
++           StaticTileOffsetRange(shape, batchBlockSize)) {
++        Value base = op.getSource();
++        for (auto [off, stride] :
++             llvm::zip_equal(ArrayRef(batchOffsets).take_front(batchRank),
++                             ArrayRef(mixedStrides).take_front(batchRank))) {
++          if (off == 0)
++            continue;
++          Value strideVal = getValueOrCreateConstantIndexOp(rewriter, loc,
++                                                            stride);
++          strideVal =
++              arith::IndexCastOp::create(rewriter, loc, ptrTy, strideVal);
++          Value bytes = arith::ConstantIntOp::create(
++              rewriter, loc, ptrTy, off * static_cast<int64_t>(elemBytes));
++          base = arith::AddIOp::create(
++              rewriter, loc, base,
++              arith::MulIOp::create(rewriter, loc, strideVal, bytes));
++        }
++        newOps.push_back(xegpu::CreateNdDescOp::create(
++            rewriter, loc, newTdescTy, base, op.getMixedSizes(), mixedStrides));
++      }
++
++      Value castOp = unpack(newOps, tdescTy, *targetShape, loc, rewriter);
++      rewriter.replaceOp(op, castOp);
++      return success();
++    }
++
++    // For rank > 2 with memref source: create one tdesc per batch tile via
++    // memref.subview. Each subview slices the batch dimensions, so the
++    // resulting tdesc has the batch offset baked into its base pointer.
++    // The inner dimensions remain full-size for reuse across multiple
++    // load/store operations with different offsets.
+     SmallVector<Value> newOps;
+     for (SmallVector<int64_t> batchOffsets :
+          StaticTileOffsetRange(shape, batchBlockSize)) {
+diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUWgToSgDistribute.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUWgToSgDistribute.cpp
+index afea358dafe2..8c6e2d1583f2 100644
+--- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUWgToSgDistribute.cpp
++++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUWgToSgDistribute.cpp
+@@ -189,7 +189,10 @@ struct WgToSgCreateNdOp : public OpConversionPattern<xegpu::CreateNdDescOp> {
+     Location loc = op.getLoc();
+     MLIRContext *ctx = op.getContext();
+     xegpu::TensorDescType tdescTy = op.getType();
+-    auto layout = dyn_cast<xegpu::LayoutAttr>(tdescTy.getLayout());
++    // Accept any DistributeLayoutAttr, not just LayoutAttr: a tdesc feeding a
++    // unit-dim-expanding shape_cast carries a SliceAttr of the expanded
++    // layout, and must be distributed alongside it.
++    auto layout = dyn_cast<xegpu::DistributeLayoutAttr>(tdescTy.getLayout());
+     if (!layout || !layout.isForWorkgroup())
+       return failure();
+ 
+@@ -1599,8 +1602,11 @@ void XeGPUWgToSgDistributePass::runOnOperation() {
+                                xegpu::StoreNdOp, xegpu::PrefetchNdOp>(
+       [=](Operation *op) -> bool {
+         auto tdescTy = getTensorDescType(op);
+-        auto layout =
+-            dyn_cast_if_present<xegpu::LayoutAttr>(tdescTy.getLayout());
++        // Match WgToSgCreateNdOp: accept any DistributeLayoutAttr, since a
++        // tdesc feeding a unit-dim-expanding shape_cast carries a SliceAttr
++        // of the expanded layout and still needs distributing.
++        auto layout = dyn_cast_if_present<xegpu::DistributeLayoutAttr>(
++            tdescTy.getLayout());
+         return isLegal(layout);
+       });
+ 
+diff --git a/mlir/lib/Dialect/XeGPU/Utils/XeGPUUtils.cpp b/mlir/lib/Dialect/XeGPU/Utils/XeGPUUtils.cpp
+index 07dcb438ca55..7d788cabb572 100644
+--- a/mlir/lib/Dialect/XeGPU/Utils/XeGPUUtils.cpp
++++ b/mlir/lib/Dialect/XeGPU/Utils/XeGPUUtils.cpp
+@@ -773,13 +773,22 @@ template int
+ xegpu::getLargestDivisor<unsigned>(unsigned dim, ArrayRef<unsigned> candidates,
+                                    ArrayRef<unsigned> candidateMultiples);
+ 
++/// A rank>2 layout describes a 2D block IO only if all its batch dims are unit;
++/// the packed/transpose effects are then decided by the innermost two dims.
++/// Returns an empty range if `dims` is not such a layout.
++static ArrayRef<int64_t> innermost2D(ArrayRef<int64_t> dims) {
++  if (dims.size() < 2 ||
++      !llvm::all_of(dims.drop_back(2), [](int64_t d) { return d == 1; }))
++    return {};
++  return dims.take_back(2);
++}
++
+ bool xegpu::requirePacked(const xegpu::DistributeLayoutAttr layout) {
+   if (!layout)
+     return false;
+-  auto laneData = layout.getEffectiveLaneDataAsInt();
+-  if (laneData.size() != 2)
+-    return false;
+-  return laneData[0] != 1;
++  SmallVector<int64_t> laneData = layout.getEffectiveLaneDataAsInt();
++  ArrayRef<int64_t> inner = innermost2D(laneData);
++  return !inner.empty() && inner[0] != 1;
+ }
+ 
+ bool xegpu::requireTranspose(const xegpu::DistributeLayoutAttr layout,
+@@ -790,10 +799,10 @@ bool xegpu::requireTranspose(const xegpu::DistributeLayoutAttr layout,
+     return false;
+   if (!layout)
+     return false;
+-  auto laneLayout = layout.getEffectiveLaneLayoutAsInt();
+-  if (laneLayout.size() != 2)
+-    return false;
+-  return laneLayout[0] == uArch->getSubgroupSize() && laneLayout[1] == 1;
++  SmallVector<int64_t> laneLayout = layout.getEffectiveLaneLayoutAsInt();
++  ArrayRef<int64_t> inner = innermost2D(laneLayout);
++  return !inner.empty() && inner[0] == uArch->getSubgroupSize() &&
++         inner[1] == 1;
+ }
+ 
+ // Check if dst shape is an expansion of src shape by inserting unit dimensions.

@@ -90,6 +90,7 @@
 #include "gc/Dialect/Linalgx/LinalgxDialect.h"
 #include "gc/Transforms/Passes.h"
 #include "gc/Transforms/TensorMaskingOpInterface.h"
+#include "gc/Utils/Misc.h"
 
 namespace mlir::gc {
 
@@ -227,12 +228,14 @@ addAttentionOptimizationPasses(OpPassManager &pm,
 
 void populateGPUPipeline(OpPassManager &pm,
                          const GPUPipelineOptions &pipelineOpts) {
+  static bool dumpIr = misc::getEnv("GC_DUMP_IR", false);
+  bool dump = pipelineOpts.dump || dumpIr;
   bool truncate = false;
   auto phase = [&](const char *name, std::function<void()> func) {
     func();
     pm.addPass(createCSEPass());
     pm.addPass(createCanonicalizerPass());
-    if (!pipelineOpts.dump) return;
+    if (!dump) return;
     if (truncate) pm.addPass(std::make_unique<TruncatingPrintIRPass>(name));
     else pm.addPass(createPrintIRPass({name}));
   };
@@ -243,7 +246,7 @@ void populateGPUPipeline(OpPassManager &pm,
   }
 
   pm.addPass(createCanonicalizerPass());
-  if (pipelineOpts.dump) pm.addPass(createPrintIRPass({"Initial"}));
+  if (dump) pm.addPass(createPrintIRPass({"Initial"}));
 
   phase("Preprocess", [&]() {
     pm.addPass(createGpuDeviceProps(deviceProps));
@@ -301,6 +304,7 @@ void populateGPUPipeline(OpPassManager &pm,
         {true, true, true, true}));
     pm.addPass(memref::createFoldMemRefAliasOpsPass());
     pm.addNestedPass<func::FuncOp>(createRemoveAllocs());
+    pm.addNestedPass<func::FuncOp>(createDropUnitDims());
   });
 
   phase("KernelOutlining", [&]() {
