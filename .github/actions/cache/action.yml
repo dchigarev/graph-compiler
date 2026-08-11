@@ -5,16 +5,22 @@ description: >
 
 inputs:
   operation:
-    description: "'restore', 'save', or 'cleanup'"
+    description: "'init', 'restore', 'save', or 'cleanup'"
     required: true
   key:
-    description: Cache key (required for restore and save)
+    description: Cache key (required for restore and save).
     required: false
   path:
-    description: A directory path to save or restore
+    description: A directory path to save or restore.
+    required: false
+  user:
+    description: "The user associated with the cache entry. If value is '%PR%', replace with github.event.pull_request.number."
+    required: false
+  preserve-users:
+    description: "cleanup: comma-separated users to preserve cache entries for. If value is '%PRs%', replace with opened PRs."
     required: false
   num-days:
-    description: "cleanup: delete entries older than this number of days"
+    description: "cleanup: delete entries older than this number of days."
     required: false
     default: '-1'
 
@@ -26,45 +32,73 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Export required environment variables
+    - name: Init local cache
+      id: init
       shell: bash
       run: |
-        [ -n "$GH_ACTIONS_CACHE_DIR" ] && echo "GH_ACTIONS_CACHE_DIR=$GH_ACTIONS_CACHE_DIR" >> "$GITHUB_ENV" || true
+        [ -n "$GH_ACTIONS_CACHE_DIR" ] || exit 0
+        echo "cache-dir=$GH_ACTIONS_CACHE_DIR" >> "$GITHUB_OUTPUT"
+        echo "usr-dir=$GH_ACTIONS_CACHE_DIR/.users" >> "$GITHUB_OUTPUT"
+        if [ -n "${{ inputs.user }}" ] && [ "${{ inputs.operation }}" = 'init' ]; then
+          uname='${{ inputs.user }}'
+          [ "$uname" != '%PR%' ] || uname='${{ github.event.pull_request.number }}'
+          rm -f "$GH_ACTIONS_CACHE_DIR/.users/$uname"
+        fi
 
     # ── Local cache: restore ──────────────────────────────────────────────────
     - name: Restore from local cache
       id: local-restore
-      if: ${{ env.GH_ACTIONS_CACHE_DIR != '' && inputs.operation == 'restore' }}
+      if: ${{ steps.init.outputs.cache-dir != '' && inputs.operation == 'restore' }}
       shell: bash
       run: |
-        entry="$GH_ACTIONS_CACHE_DIR/${{ inputs.key }}"
+        key='${{ inputs.key }}'
+        cache_dir="${{ steps.init.outputs.cache-dir }}"
+        entry="$cache_dir/$key"
         if [ -d "$entry" ]; then
-          echo 'Cache hit: ${{ inputs.key }}'
+          echo "Cache hit: $key"
           touch "$entry"
           mkdir -p "$(dirname '${{ inputs.path }}')"
           ln -s "$entry" '${{ inputs.path }}'
           echo 'cache-hit=true' >> "$GITHUB_OUTPUT"
+
+          [ -n '${{ inputs.user }}' ] || exit 0
+          uname='${{ inputs.user }}'
+          usr_dir="${{ steps.init.outputs.usr-dir }}"
+          [ "$uname" != '%PR%' ] || uname='${{ github.event.pull_request.number }}'
+          ufile="$usr_dir/$uname"
+          mkdir -p "$usr_dir"
+          grep -qF "$key" "$ufile" 2>/dev/null || echo "$key" >> "$ufile"
         else
-          echo 'Cache miss: ${{ inputs.key }}'
+          echo "Cache miss: $key"
           echo 'cache-hit=false' >> "$GITHUB_OUTPUT"
         fi
 
     # ── Local cache: save ─────────────────────────────────────────────────────
     - name: Save to local cache
-      if: ${{ env.GH_ACTIONS_CACHE_DIR != '' && inputs.operation == 'save' }}
+      if: ${{ steps.init.outputs.cache-dir != '' && inputs.operation == 'save' }}
       shell: bash
       run: |
-        entry="$GH_ACTIONS_CACHE_DIR/${{ inputs.key }}"
+        key='${{ inputs.key }}'
+        cache_dir="${{ steps.init.outputs.cache-dir }}"
+        entry="$cache_dir/$key"
         if [ ! -d "$entry" ]; then
-          mkdir -p "$GH_ACTIONS_CACHE_DIR"
+          mkdir -p "$cache_dir"
           cp -rf '${{ inputs.path }}' "$entry"
-          echo 'Saved to local cache: ${{ inputs.key }}'
+          echo "Saved to local cache: $key"
+
+          [ -n '${{ inputs.user }}' ] || exit 0
+          uname='${{ inputs.user }}'
+          usr_dir="${{ steps.init.outputs.usr-dir }}"
+          [ "$uname" != '%PR%' ] || uname='${{ github.event.pull_request.number }}'
+          ufile="$usr_dir/$uname"
+          mkdir -p "$usr_dir"
+          grep -qF "$key" "$ufile" 2>/dev/null || echo "$key" >> "$ufile"
         fi
 
     # ── actions/cache fallback: restore ───────────────────────────────────────
     - name: Restore with actions/cache
       id: actions-restore
-      if: ${{ env.GH_ACTIONS_CACHE_DIR == '' && inputs.operation == 'restore' }}
+      if: ${{ steps.init.outputs.cache-dir == '' && inputs.operation == 'restore' }}
       uses: actions/cache/restore@v4
       with:
         path: ${{ inputs.path }}
@@ -72,7 +106,7 @@ runs:
 
     # ── actions/cache fallback: save ──────────────────────────────────────────
     - name: Save with actions/cache
-      if: ${{ env.GH_ACTIONS_CACHE_DIR == '' && inputs.operation == 'save' }}
+      if: ${{ steps.init.outputs.cache-dir == '' && inputs.operation == 'save' }}
       uses: actions/cache/save@v4
       with:
         path: ${{ inputs.path }}
@@ -80,11 +114,12 @@ runs:
 
     # ── Local cache: cleanup ──────────────────────────────────────────────────
     - name: Cleanup local cache
-      if: ${{ env.GH_ACTIONS_CACHE_DIR != '' && inputs.operation == 'cleanup' }}
+      if: ${{ steps.init.outputs.cache-dir != '' && inputs.operation == 'cleanup' }}
       shell: bash
       run: |
-        [ -d "$GH_ACTIONS_CACHE_DIR" ] || exit 0
-        num_days="${{ inputs.num-days }}"
+        cache_dir="${{ steps.init.outputs.cache-dir }}"
+        [ -d "$cache_dir" ] || exit 0
+        num_days='${{ inputs.num-days }}'
         if [ "$num_days" -lt 0 ]; then
           open_prs=$(gh pr list --state open --json number --jq 'length')
           if [ "$open_prs" -eq 0 ]; then
@@ -93,6 +128,33 @@ runs:
             num_days=7
           fi
         fi
-        find "$GH_ACTIONS_CACHE_DIR" -mindepth 1 -maxdepth 1 -type d \
-          -mtime +"$num_days" -exec rm -rf {} +
-        echo "Cleaned up local cache entries older than $num_days days"
+
+        usr_dir="${{ steps.init.outputs.usr-dir }}"
+        usr_dir_name=$(basename "$usr_dir")
+        find "$cache_dir" -mindepth 1 -maxdepth 1 -type d \
+          ! -name "$usr_dir_name" -mtime +"$num_days" \
+          -exec echo "Removing cache entry older than $num_days days: {}" \; \
+          -exec rm -rf {} \;
+
+        [ -n '${{ inputs.preserve-users }}' ] || exit 0
+        [ -d "$usr_dir" ] || \
+          { echo "Removing cache $cache_dir" && rm -rf "$cache_dir" && exit 0; }
+
+        # Remove users
+        preserve=$(echo '${{ inputs.preserve-users }}' | tr ',' '\n' | while read -r uname; do
+          if [ "$uname" = "%PRs%" ]; then
+            gh pr list --state open --json number --jq '.[].number'
+          else
+            echo "$uname"
+          fi
+        done | xargs -n1 echo -n ' ! -name ')
+        find "$usr_dir" -maxdepth 1 -type f $preserve \
+          -exec echo "Removing cache user: {}" \; -delete
+
+        # Remove unused cache entries
+        preserve=$(cd "$cache_dir" && for f in *; do
+          grep -qE "^${f}\$" -R "$usr_dir" && echo "$f"
+        done | xargs -n1 echo -n ' ! -name ')
+        find "$cache_dir" -mindepth 1 -maxdepth 1 -type d \
+          ! -name "$usr_dir_name" $preserve \
+          -exec echo "Removing unused cache entry: {}" \; -exec rm -rf {} \;

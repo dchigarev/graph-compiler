@@ -1,512 +1,2120 @@
+From 2ac466b9f32759fe8645c799402f35c4359ee777 Mon Sep 17 00:00:00 2001
+From: Jianhui Li <jian.hui.li@intel.com>
+Date: Tue, 11 Aug 2026 21:32:12 +0000
+Subject: [PATCH 1/4] [mlir][xegpu] Lower dynamic high-D nd load/store via
+ base-pointer fold
+
+Replace the per-batch memref.subview scheme for >2D xegpu.create_nd_tdesc /
+load_nd / store_nd / prefetch_nd with a subview-free lowering that keeps the
+original (possibly dynamic) high-D memref as the descriptor source and folds
+the leading (batch) offsets into the base pointer at XeVM lowering time. The
+2D-block surface stays the innermost matrix, so the HW surface-size limits are
+unaffected, and a dynamic-shape source never needs a per-batch subview (which
+could not guarantee a valid base). This fixes flash-attention rank-4 kernels
+with dynamic z,h batch offsets (previously the batch offset was silently
+dropped, so only head (0,0) was correct).
+
+  - VectorToXeGPU: keep the memref as the create_nd source (drop the
+    i64-pointer path); the high-D offsets ride the load/store.
+  - XeGPUToXeVM: encode the leading-dim element strides into spare payload
+    slots at create time and fold `base += sum_d offset[d]*stride[d]*elemBytes`
+    at load/store time (memref and integer/pointer sources); recover a bare
+    dynamic memref's shape/strides via extract_strided_metadata.
+  - XeGPUUnroll / WgToSgDistribute / ArrayLengthOptimization: rebuild create_nd
+    from the full memref (bare-memref builder, no subview); batch is unrolled
+    as unit-leading tiles carried on the offsets.
+  - create_nd_tdesc op: single-arg builder + verifier accept a bare dynamic
+    memref; specifying explicit shape/strides for a memref source is now
+    rejected (deprecated) since the memref is authoritative.
+  - Generalize the transpose optimization (PeepHoleOptimizer, requireTranspose)
+    and the VNNI pack decision (requirePacked) to >2D descriptors with unit
+    leading dims by operating on the innermost 2 dims; the 2D path is
+    unchanged. Convert all non-innermost strides (not just the pitch) to the
+    repacked element unit so the batch fold uses consistent units.
+
+Updates the affected VectorToXeGPU / XeGPUToXeVM / XeGPU dialect tests.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../VectorToXeGPU/VectorToXeGPU.cpp           |  51 +---
+ .../Conversion/XeGPUToXeVM/XeGPUToXeVM.cpp    | 112 ++++++-
+ mlir/lib/Dialect/XeGPU/IR/XeGPUOps.cpp        |  28 +-
+ .../XeGPUArrayLengthOptimization.cpp          |  22 +-
+ .../Transforms/XeGPUPeepHoleOptimizer.cpp     | 176 +++++++----
+ .../Dialect/XeGPU/Transforms/XeGPUUnroll.cpp  | 277 +++++-------------
+ .../Transforms/XeGPUWgToSgDistribute.cpp      |  13 +-
+ mlir/lib/Dialect/XeGPU/Utils/XeGPUUtils.cpp   |  21 +-
+ .../VectorToXeGPU/load-to-xegpu.mlir          |  38 +--
+ .../VectorToXeGPU/store-to-xegpu.mlir         |  38 +--
+ .../VectorToXeGPU/transfer-read-to-xegpu.mlir |  63 +---
+ .../transfer-write-to-xegpu.mlir              |  25 +-
+ .../XeGPUToXeVM/create_nd_tdesc.mlir          |  19 +-
+ .../test/Dialect/XeGPU/array-len-op-unit.mlir |   7 +-
+ mlir/test/Dialect/XeGPU/ops.mlir              |  13 +-
+ 15 files changed, 427 insertions(+), 476 deletions(-)
+
 diff --git a/mlir/lib/Conversion/VectorToXeGPU/VectorToXeGPU.cpp b/mlir/lib/Conversion/VectorToXeGPU/VectorToXeGPU.cpp
-index 8a4583642693..9b659058db72 100644
+index 8a45836426931..083c63198733b 100644
 --- a/mlir/lib/Conversion/VectorToXeGPU/VectorToXeGPU.cpp
 +++ b/mlir/lib/Conversion/VectorToXeGPU/VectorToXeGPU.cpp
-@@ -471,6 +471,101 @@ convertMemrefAndOffsetsToTargetRank(PatternRewriter &rewriter, Location loc,
-   return {subviewOp.getResult(), newOffsets};
+@@ -130,50 +130,17 @@ static xegpu::CreateNdDescOp createNdDescriptor(PatternRewriter &rewriter,
+                                                 Location loc,
+                                                 xegpu::TensorDescType descType,
+                                                 TypedValue<MemRefType> src) {
+-  MemRefType srcTy = src.getType();
++  [[maybe_unused]] MemRefType srcTy = src.getType();
+   assert(srcTy.isStrided() && "Expected strided memref type");
+-  auto [strides, offset] = srcTy.getStridesAndOffset();
+-  bool isStatic = true;
+ 
+-  // Memref is dynamic if any of its shape, offset or strides is dynamic.
+-  if (!srcTy.hasStaticShape())
+-    isStatic = false;
+-
+-  if (!ShapedType::isStatic(offset))
+-    isStatic = false;
+-
+-  for (auto stride : strides) {
+-    if (!ShapedType::isStatic(stride)) {
+-      isStatic = false;
+-      break;
+-    }
+-  }
+-
+-  xegpu::CreateNdDescOp ndDesc;
+-  if (isStatic) {
+-    ndDesc = xegpu::CreateNdDescOp::create(rewriter, loc, descType, src);
+-  } else {
+-    // In case of ranked dynamic memref, instead of passing on the memref,
+-    // i64 base address, source's offset, shape and strides have to be
+-    // explicitly provided.
+-    auto meta = memref::ExtractStridedMetadataOp::create(rewriter, loc, src);
+-    auto baseAddrIndex = memref::ExtractAlignedPointerAsIndexOp::create(
+-        rewriter, loc, meta.getBaseBuffer());
+-    auto offset = meta.getOffset();
+-    auto elemByteSize = srcTy.getElementTypeBitWidth() / 8;
+-    auto offsetInBytes = arith::MulIOp::create(
+-        rewriter, loc, offset,
+-        arith::ConstantIndexOp::create(rewriter, loc, elemByteSize));
+-    auto adjustedBaseAddr = arith::AddIOp::create(
+-        rewriter, loc, baseAddrIndex.getResult(), offsetInBytes);
+-    auto adjustedAddrI64 = arith::IndexCastOp::create(
+-        rewriter, loc, rewriter.getI64Type(), adjustedBaseAddr);
+-    ndDesc = xegpu::CreateNdDescOp::create(
+-        rewriter, loc, descType, adjustedAddrI64,
+-        meta.getConstifiedMixedSizes(), meta.getConstifiedMixedStrides());
+-  }
+-
+-  return ndDesc;
++  // Keep the memref itself as the source (static or dynamic) rather than
++  // collapsing it to an i64 base address. The memref value carries the base
++  // pointer *and* the (possibly dynamic) offset/shape/strides, which the XeGPU
++  // -> XeVM lowering recovers via memref metadata. In particular, for a >2D
++  // descriptor the leading (batch) offsets stay on the load/store and are
++  // folded into the base pointer at lowering time, so a dynamic-shape source
++  // never needs a per-batch subview (which could not guarantee a valid base).
++  return xegpu::CreateNdDescOp::create(rewriter, loc, descType, src);
  }
  
-+// Returns the descriptor shape for an nd block transfer of `shape`. Unit dims
-+// (anywhere, not just leading) around a 2D tile carry no addressing
-+// information beyond their offset, so they are dropped and their offsets
-+// folded into the descriptor's base pointer, which is what XeVM's 2D-only
-+// block load/store requires. A shape with more than two non-unit dims is a
-+// true multi-dim block, kept as-is for the batch-unrolling passes to split.
-+static SmallVector<int64_t> getBlockTransferDescShape(ArrayRef<int64_t> shape) {
-+  if (shape.size() <= 2)
-+    return llvm::to_vector(shape);
-+  SmallVector<int64_t> nonUnit = llvm::to_vector(
-+      llvm::make_filter_range(shape, [](int64_t d) { return d != 1; }));
-+  return nonUnit.size() == 2 ? nonUnit : llvm::to_vector(shape);
-+}
+ // Adjusts the strides of a memref according to a given permutation map for
+diff --git a/mlir/lib/Conversion/XeGPUToXeVM/XeGPUToXeVM.cpp b/mlir/lib/Conversion/XeGPUToXeVM/XeGPUToXeVM.cpp
+index 78d99cf88b768..e30951fdb9e1d 100644
+--- a/mlir/lib/Conversion/XeGPUToXeVM/XeGPUToXeVM.cpp
++++ b/mlir/lib/Conversion/XeGPUToXeVM/XeGPUToXeVM.cpp
+@@ -51,10 +51,15 @@ static constexpr int32_t executionSize{16};
+ 
+ // Offsets to individual fields of the 8xi32 layout nd tensor descriptor.
+ enum class NdTdescOffset : uint32_t {
+-  BasePtr = 0,    // Base pointer (i64)
+-  BaseShapeW = 2, // Base shape width (i32)
+-  BaseShapeH = 3, // Base shape height (i32)
+-  BasePitch = 4,  // Base pitch/stride of dim rank-2 (i32)
++  BasePtr = 0,        // Base pointer (i64)
++  BaseShapeW = 2,     // Base shape width (i32)
++  BaseShapeH = 3,     // Base shape height (i32)
++  BasePitch = 4,      // Base pitch/stride of dim rank-2 (i32)
++  LeadingStride0 = 5, // Element strides of the leading (batch) dims of a >2D
++  LeadingStride1 = 6, // descriptor (i32). The load/store/prefetch lowering
++  LeadingStride2 = 7, // uses these to fold the batch offsets into the base
++                      // pointer, keeping the 2D-block surface at the innermost
++                      // matrix. Left at 0 for 2D descriptors.
+ };
+ 
+ static int32_t getNumericXeVMAddrSpace(xegpu::MemorySpace xeGpuMemspace) {
+@@ -232,28 +237,61 @@ class CreateNdDescToXeVMPattern
+     Value baseShapeH;
+ 
+     // Source can be a memref or a pointer (ui64, ui32, i64 or i32).
+-    SmallVector<OpFoldResult> mixedSizes = op.getMixedSizes();
+-    SmallVector<OpFoldResult> mixedStrides = op.getMixedStrides();
+-    // Descriptor shape is expected to be 2D.
+-    int64_t rank = mixedSizes.size();
+     auto sourceTy = source.getType();
+     auto sourceMemrefTy = dyn_cast<MemRefType>(sourceTy);
 +
-+// Builds a memref.subview that adapts `memref` to `ndDescShape`, the shape
-+// getBlockTransferDescShape picked for the descriptor, so that every offset the
-+// XeVM 2D block IO cannot express is folded into the subview's base pointer.
-+// Each memref dim is classified as:
-+//   - dropped: a leading dim beyond `descShape.size()` (not covered by the
-+//     vector transfer at all), or a unit dim of `descShape` that `ndDescShape`
-+//     dropped. A size-1 dim carries no addressing information beyond its
-+//     offset, so the offset is folded in and the dim is rank-reduced away.
-+//   - folded batch: a retained dim outside the innermost 2D tile. The 2D block
-+//     IO has no offset for such a dim, and the batch-unrolling passes address
-+//     it with offsets *relative to the tile*, so its (possibly dynamic) offset
-+//     must be folded into the base pointer here. The dim itself is kept, sized
-+//     to its tile extent, and its new offset is zero.
-+//   - kept: the innermost two dims, addressed directly by the block IO.
-+// The retained dims stay in their original relative order. Returns the new
-+// memref and the matching offsets for the retained dims, in that order.
-+static std::pair<Value, SmallVector<OpFoldResult>>
-+convertMemrefAndOffsetsToBlockShape(PatternRewriter &rewriter, Location loc,
-+                                    Value memref,
-+                                    ArrayRef<OpFoldResult> offsets,
-+                                    ArrayRef<int64_t> descShape,
-+                                    ArrayRef<int64_t> ndDescShape) {
-+  auto memrefType = cast<MemRefType>(memref.getType());
-+  unsigned rank = memrefType.getRank();
-+  unsigned leadingCount = rank - descShape.size();
-+
-+  SmallVector<unsigned> keptDims;
-+  bool dropUnitDims = ndDescShape.size() != descShape.size();
-+  for (auto [i, d] : llvm::enumerate(descShape))
-+    if (d != 1 || !dropUnitDims)
-+      keptDims.push_back(leadingCount + i);
-+  assert(keptDims.size() == ndDescShape.size() &&
-+         "retained dims must match the descriptor shape");
-+
-+  // Map each folded batch dim to its tile extent.
-+  llvm::SmallDenseMap<unsigned, int64_t> batchDims;
-+  for (unsigned i = 0, e = keptDims.size() > 2 ? keptDims.size() - 2 : 0; i < e;
-+       ++i)
-+    batchDims.try_emplace(keptDims[i], ndDescShape[i]);
-+
-+  if (keptDims.size() == rank && batchDims.empty())
-+    return {memref, SmallVector<OpFoldResult>(offsets)};
-+
-+  llvm::SmallDenseSet<unsigned> keptSet(keptDims.begin(), keptDims.end());
-+  SmallVector<OpFoldResult> subviewOffsets;
-+  SmallVector<OpFoldResult> subviewSizes;
-+  SmallVector<OpFoldResult> subviewStrides(rank, rewriter.getI64IntegerAttr(1));
-+  SmallVector<int64_t> resultShape;
-+  SmallVector<OpFoldResult> newOffsets;
-+  ArrayRef<int64_t> originalShape = memrefType.getShape();
-+  auto meta = memref::ExtractStridedMetadataOp::create(rewriter, loc, memref);
-+  for (unsigned i = 0; i < rank; ++i) {
-+    if (!keptSet.contains(i)) {
-+      subviewOffsets.push_back(offsets[i]);
-+      subviewSizes.push_back(rewriter.getI64IntegerAttr(1));
-+    } else if (auto batch = batchDims.find(i); batch != batchDims.end()) {
-+      subviewOffsets.push_back(offsets[i]);
-+      subviewSizes.push_back(rewriter.getI64IntegerAttr(batch->second));
-+      resultShape.push_back(batch->second);
-+      newOffsets.push_back(rewriter.getI64IntegerAttr(0));
-+    } else {
-+      subviewOffsets.push_back(rewriter.getI64IntegerAttr(0));
-+      if (ShapedType::isDynamic(originalShape[i])) {
-+        subviewSizes.push_back(meta.getSizes()[i]);
-+        resultShape.push_back(ShapedType::kDynamic);
++    // Shape and strides. For a memref source they are recovered from the memref
++    // value itself (a dynamic memref carries them at runtime and does not
++    // attach them as op operands); otherwise they come from the op's explicit
++    // operands.
++    SmallVector<OpFoldResult> mixedSizes;
++    SmallVector<OpFoldResult> mixedStrides;
++    memref::ExtractStridedMetadataOp srcMeta;
++    // Lazily materialize memref metadata (base buffer, offset, sizes, strides).
++    auto getSrcMeta = [&]() -> memref::ExtractStridedMetadataOp {
++      if (!srcMeta)
++        srcMeta =
++            memref::ExtractStridedMetadataOp::create(rewriter, loc, source);
++      return srcMeta;
++    };
+     // If source is a memref, we need to extract the aligned pointer as index.
+     // Pointer type is passed as i32 or i64 by type converter.
+     if (sourceMemrefTy) {
+       if (!sourceMemrefTy.hasRank()) {
+         return rewriter.notifyMatchFailure(op, "Expected ranked Memref.");
+       }
++      SmallVector<int64_t> staticStrides;
++      int64_t staticOffset;
++      if (failed(
++              sourceMemrefTy.getStridesAndOffset(staticStrides, staticOffset)))
++        return rewriter.notifyMatchFailure(op, "Expected strided Memref.");
++      // A memref is authoritative for its own shape/strides (explicit
++      // shape/strides on a memref create_nd are deprecated). A fully static
++      // memref yields constants directly; a dynamic one recovers its dynamic
++      // dims from runtime metadata (getConstified* keeps static dims as attrs).
++      bool allStatic = sourceMemrefTy.hasStaticShape() &&
++                       llvm::none_of(staticStrides, ShapedType::isDynamic);
++      if (allStatic) {
++        mixedSizes = op.getMixedSizes();
++        mixedStrides = op.getMixedStrides();
 +      } else {
-+        subviewSizes.push_back(rewriter.getI64IntegerAttr(originalShape[i]));
-+        resultShape.push_back(originalShape[i]);
++        mixedSizes = getSrcMeta().getConstifiedMixedSizes();
++        mixedStrides = getSrcMeta().getConstifiedMixedStrides();
 +      }
-+      newOffsets.push_back(offsets[i]);
+       // Access adaptor after failure check to avoid rolling back generated code
+       // for materialization cast.
+       baseAddr = adaptor.getSource();
+     } else {
++      mixedSizes = op.getMixedSizes();
++      mixedStrides = op.getMixedStrides();
+       baseAddr = adaptor.getSource();
+       if (baseAddr.getType() != i64Ty) {
+         // Pointer type may be i32. Cast to i64 if needed.
+         baseAddr = arith::ExtUIOp::create(rewriter, loc, i64Ty, baseAddr);
+       }
+     }
++    // Descriptor shape rank.
++    int64_t rank = mixedSizes.size();
+     // 1D tensor descriptor is just the base address.
+     if (rank == 1) {
+       rewriter.replaceOp(op, baseAddr);
+@@ -288,6 +326,27 @@ class CreateNdDescToXeVMPattern
+     payload =
+         vector::InsertOp::create(rewriter, loc, basePitch, payload,
+                                  static_cast<int>(NdTdescOffset::BasePitch));
++    // For a >2D descriptor, encode the leading (batch) dim element strides into
++    // the spare payload slots. The load/store/prefetch lowering folds the batch
++    // offsets into the base pointer using these, so the batch position stays
++    // out of the 2D-block surface (which remains the innermost matrix computed
++    // above). This applies to both memref sources and integer (pointer) sources
++    // with explicit shape/strides -- e.g. a batched descriptor whose source was
++    // rewritten to an i64 base by the transpose peephole; in that case the
++    // strides come from the op's explicit operands. 2D descriptors leave these
++    // slots at 0 and the load/store path skips reading them (2D path
++    // unchanged).
++    if (rank > 2) {
++      if (rank - 2 > 3)
++        return rewriter.notifyMatchFailure(
++            op, "Batched nd descriptor supports at most 3 leading dims.");
++      for (int64_t d = 0; d < rank - 2; ++d) {
++        Value leadingStride = createOffset(mixedStrides, d);
++        payload = vector::InsertOp::create(
++            rewriter, loc, leadingStride, payload,
++            static_cast<int>(NdTdescOffset::LeadingStride0) + d);
++      }
 +    }
-+  }
-+
-+  auto resultType = memref::SubViewOp::inferRankReducedResultType(
-+      resultShape, memrefType, subviewOffsets, subviewSizes, subviewStrides);
-+  auto subviewOp =
-+      memref::SubViewOp::create(rewriter, loc, resultType, memref,
-+                                subviewOffsets, subviewSizes, subviewStrides);
-+  return {subviewOp.getResult(), newOffsets};
-+}
-+
- template <
-     typename OpType,
-     typename = std::enable_if_t<llvm::is_one_of<
-@@ -636,21 +731,25 @@ struct TransferReadLowering : public OpRewritePattern<vector::TransferReadOp> {
-         size_t rank = descShape.size();
-         assert(rank >= 2 && "Transpose requires at least 2 dimensions");
-         std::swap(descShape[rank - 1], descShape[rank - 2]);
--        loadedVecTy = VectorType::get(descShape, elementType);
-       }
-+      // Unit dims around the 2D tile are dropped; they are restored with a
-+      // trailing vector.shape_cast.
-+      SmallVector<int64_t> ndDescShape = getBlockTransferDescShape(descShape);
-+      auto ndVecTy = VectorType::get(ndDescShape, elementType);
-+
-       auto descType = xegpu::TensorDescType::get(
--          descShape, elementType, /*array_length=*/1,
-+          ndDescShape, elementType, /*array_length=*/1,
-           /*boundary_check=*/isOutOfBounds, xegpu::MemorySpace::Global);
--      auto [src, indices] = convertMemrefAndOffsetsToTargetRank(
-+      auto [src, indices] = convertMemrefAndOffsetsToBlockShape(
-           rewriter, loc, readOp.getBase(),
--          getAsOpFoldResult(readOp.getIndices()), loadedVecTy.getRank());
-+          getAsOpFoldResult(readOp.getIndices()), descShape, ndDescShape);
-       // By default, no specific caching policy is assigned.
-       xegpu::CachePolicyAttr hint = nullptr;
-       xegpu::CreateNdDescOp ndDesc = createNdDescriptor(
-           rewriter, loc, descType, dyn_cast<TypedValue<MemRefType>>(src));
+     rewriter.replaceOp(op, payload);
+     return success();
+   }
+@@ -387,9 +446,8 @@ class LoadStorePrefetchNdToXeVMPattern : public OpConversionPattern<OpType> {
+       Value basePitch = vector::ExtractOp::create(
+           rewriter, loc, tdesc, static_cast<int>(NdTdescOffset::BasePitch));
  
-       Operation *loadedOp =
--          xegpu::LoadNdOp::create(rewriter, loc, loadedVecTy, ndDesc, indices,
-+          xegpu::LoadNdOp::create(rewriter, loc, ndVecTy, ndDesc, indices,
-                                   /*packed=*/nullptr, /*transpose=*/nullptr,
-                                   /*l1_hint=*/hint,
-                                   /*l2_hint=*/hint, /*l3_hint=*/hint,
-@@ -659,12 +758,15 @@ struct TransferReadLowering : public OpRewritePattern<vector::TransferReadOp> {
-         // Undo the innermost-two-dims swap with a trailing vector.transpose:
-         // keep the leading dimensions in place and interchange only the last
-         // two.
--        int64_t rank = loadedVecTy.getRank();
-+        int64_t rank = ndVecTy.getRank();
-         SmallVector<int64_t> perm(llvm::to_vector(llvm::seq<int64_t>(0, rank)));
-         std::swap(perm[rank - 1], perm[rank - 2]);
-         loadedOp = vector::TransposeOp::create(rewriter, loc,
-                                                loadedOp->getResult(0), perm);
-       }
-+      if (loadedOp->getResult(0).getType() != loadedVecTy)
-+        loadedOp = vector::ShapeCastOp::create(rewriter, loc, loadedVecTy,
-+                                               loadedOp->getResult(0));
-       rewriter.replaceOp(readOp, loadedOp);
-       return success();
-     }
-@@ -738,12 +840,21 @@ struct TransferWriteLowering
-                              writeMemTy.getElementType().isIntOrFloat();
- 
-     if (canLowerToStoreNd) {
--      auto [src, indices] = convertMemrefAndOffsetsToTargetRank(
-+      // Unit dims around the 2D tile are dropped with a vector.shape_cast.
-+      Value stored = writeOp.getVector();
-+      SmallVector<int64_t> descShape(vecTy.getShape());
-+      SmallVector<int64_t> ndDescShape = getBlockTransferDescShape(descShape);
-+      if (ndDescShape != descShape)
-+        stored = vector::ShapeCastOp::create(
-+            rewriter, loc,
-+            VectorType::get(ndDescShape, vecTy.getElementType()), stored);
-+
-+      auto [src, indices] = convertMemrefAndOffsetsToBlockShape(
-           rewriter, loc, writeOp.getBase(),
--          getAsOpFoldResult(writeOp.getIndices()), vecTy.getRank());
-+          getAsOpFoldResult(writeOp.getIndices()), descShape, ndDescShape);
- 
-       auto descType = xegpu::TensorDescType::get(
--          vecTy.getShape(), vecTy.getElementType(),
-+          ndDescShape, vecTy.getElementType(),
-           /*array_length=*/1, /*boundary_check=*/writeOp.hasOutOfBoundsDim(),
-           xegpu::MemorySpace::Global);
-       // By default, no specific caching policy is assigned.
-@@ -751,11 +862,11 @@ struct TransferWriteLowering
-       xegpu::CreateNdDescOp ndDesc = createNdDescriptor(
-           rewriter, loc, descType, dyn_cast<TypedValue<MemRefType>>(src));
- 
--      auto storeOp = xegpu::StoreNdOp::create(
--          rewriter, loc, writeOp.getVector(), ndDesc, indices,
--          /*l1_hint=*/hint,
--          /*l2_hint=*/hint, /*l3_hint=*/hint,
--          /*layout=*/nullptr);
-+      auto storeOp =
-+          xegpu::StoreNdOp::create(rewriter, loc, stored, ndDesc, indices,
-+                                   /*l1_hint=*/hint,
-+                                   /*l2_hint=*/hint, /*l3_hint=*/hint,
-+                                   /*layout=*/nullptr);
-       rewriter.replaceOp(writeOp, storeOp);
-       return success();
-     }
-diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUBlocking.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUBlocking.cpp
-index 9d1686403a43..76e6133610db 100644
---- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUBlocking.cpp
-+++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUBlocking.cpp
-@@ -492,10 +492,17 @@ void XeGPUBlockingPass::runOnOperation() {
-       xegpu::TensorDescType newTy =
-           xegpu::TensorDescType::get(ctx, tileShape, elemTy, encoding,
-                                      tdescTy.getLayoutAttr().dropInstData());
--      // Compute the product of batch (higher) dimensions.
-+      // Compute the number of batch tiles as the ratio between the batch
-+      // (higher) dimensions of the full shape and of the tile shape.
-       ArrayRef<int64_t> shape = type.getShape();
--      int64_t batchCount =
--          shape.size() > 2 ? computeProduct(shape.drop_back(2)) : 1;
-+      int64_t batchCount = 1;
-+      if (shape.size() > 2) {
-+        std::optional<SmallVector<int64_t>> batchRatio = computeShapeRatio(
-+            shape.drop_back(2), tileShape.drop_back(2));
-+        assert(batchRatio &&
-+               "batch dims of shape must be a multiple of tile batch dims");
-+        batchCount = computeProduct(*batchRatio);
+-      // For rank > 2, leading (batch) dim offsets should be 0 after unrolling
+-      // (batch is baked into the base pointer via memref.subview during
+-      // blocking). Use only the last 2 offsets for the 2D block operation.
++      // x = innermost offset; y = second-to-last offset. These address the 2D
++      // tile within the innermost-matrix surface.
+       Value offsetW = getValueOrCreateConstantIntOp(rewriter, loc,
+                                                     mixedOffsets[tileRank - 1]);
+       offsetW = getValueOrCreateCastToIndexLike(rewriter, loc,
+@@ -398,6 +456,38 @@ class LoadStorePrefetchNdToXeVMPattern : public OpConversionPattern<OpType> {
+                                                     mixedOffsets[tileRank - 2]);
+       offsetH = getValueOrCreateCastToIndexLike(rewriter, loc,
+                                                 rewriter.getI32Type(), offsetH);
++      // For a >2D descriptor, fold the leading (batch) offsets into the base
++      // pointer: basePtr += (sum_d offset[d] * leadingStride[d]) * elemBytes.
++      // The batch element strides were encoded into the payload at create time
++      // (see CreateNdDescToXeVMPattern). This keeps the 2D-block surface at the
++      // innermost matrix (so the HW surface-size limits are unaffected) instead
++      // of baking the batch into a (possibly out-of-range) collapsed surface.
++      if (tileRank > 2) {
++        Type i64Ty = rewriter.getI64Type();
++        Value batchElemOffset;
++        for (int64_t d = 0; d < tileRank - 2; ++d) {
++          Value off =
++              getValueOrCreateConstantIntOp(rewriter, loc, mixedOffsets[d]);
++          off = getValueOrCreateCastToIndexLike(rewriter, loc, i64Ty, off);
++          Value strideI32 = vector::ExtractOp::create(
++              rewriter, loc, tdesc,
++              static_cast<int>(NdTdescOffset::LeadingStride0) + d);
++          Value stride =
++              arith::ExtUIOp::create(rewriter, loc, i64Ty, strideI32);
++          Value term = arith::MulIOp::create(rewriter, loc, off, stride);
++          batchElemOffset =
++              batchElemOffset
++                  ? arith::AddIOp::create(rewriter, loc, batchElemOffset, term)
++                        .getResult()
++                  : term;
++        }
++        Value elemByteSizeI64 =
++            arith::ConstantIntOp::create(rewriter, loc, i64Ty, elemBitSize / 8);
++        Value batchByteOffset = arith::MulIOp::create(
++            rewriter, loc, batchElemOffset, elemByteSizeI64);
++        basePtr =
++            arith::AddIOp::create(rewriter, loc, basePtr, batchByteOffset);
 +      }
-       return SmallVector<Type>(batchCount, newTy);
-     }
-     Type newTy = VectorType::get(tileShape, elemTy);
-diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPULayoutImpl.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPULayoutImpl.cpp
-index eb3c3faf7557..8c1d6b27233f 100644
---- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPULayoutImpl.cpp
-+++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPULayoutImpl.cpp
-@@ -1141,13 +1141,13 @@ static std::optional<SmallVector<int64_t>> get2DBlockIOInstDataLayout(
-   // a multiple of lane_layout * lane_data on each dim (Category A
-   // invariant).
-   SmallVector<int64_t> instData(rank, 1);
--  assert(rank >= 2 && "dataShape must be at least 2D for 2D-block IO");
--  int instWidth =
-+  assert(rank >= 1 && "dataShape must not be empty");
-+  instData.back() =
-       xegpu::getLargestDivisor(static_cast<int>(dataShape.back()), bWidths);
--  int instHeight =
--      xegpu::getLargestDivisor(static_cast<int>(dataShape[rank - 2]), bHeights);
--  instData.back() = instWidth;
--  instData[rank - 2] = instHeight;
-+  // A 1D block IO has no height dim; its single dim is the block width.
-+  if (rank > 1)
-+    instData[rank - 2] = xegpu::getLargestDivisor(
-+        static_cast<int>(dataShape[rank - 2]), bHeights);
+       // Convert base pointer (i64) to LLVM pointer type.
+       Value basePtrLLVM =
+           LLVM::IntToPtrOp::create(rewriter, loc, ptrTypeLLVM, basePtr);
+diff --git a/mlir/lib/Dialect/XeGPU/IR/XeGPUOps.cpp b/mlir/lib/Dialect/XeGPU/IR/XeGPUOps.cpp
+index 1bd5951c9f7f1..9d1624d054bbc 100644
+--- a/mlir/lib/Dialect/XeGPU/IR/XeGPUOps.cpp
++++ b/mlir/lib/Dialect/XeGPU/IR/XeGPUOps.cpp
+@@ -212,9 +212,9 @@ LogicalResult CreateMemDescOp::verify() {
  
-   return instData;
+ void CreateNdDescOp::build(OpBuilder &builder, OperationState &state,
+                            Type tdesc, TypedValue<MemRefType> source) {
+-  [[maybe_unused]] auto ty = source.getType();
+-  assert(ty.hasStaticShape() && "expecting a memref with static shape");
+-
++  // A dynamic-shape memref is allowed: its (possibly dynamic) shape/strides are
++  // carried by the memref value itself and recovered at lowering time via
++  // memref metadata, so no explicit shape/stride operands are attached here.
+   build(builder, state, tdesc, source, ValueRange({}) /* empty dynamic shape */,
+         ValueRange({}) /* empty dynamic strides */,
+         DenseI64ArrayAttr({}) /* empty const shape*/,
+@@ -260,8 +260,13 @@ void CreateNdDescOp::build(OpBuilder &builder, OperationState &state,
  }
-@@ -1772,11 +1772,15 @@ xegpu::setupLoadNdAnchorLayout(xegpu::LayoutKind layoutKind,
-   // vertical lane layout means that the blockload must be transposed
-   // note scaleA on PVC has vertical lane layout even without transposed order
-   // attr
--  bool hasTranspose =
--      consumerLaneLayout[rank - 2] > 1 && consumerLaneLayout[rank - 1] == 1;
--  bool hasTransform = !hasTranspose && consumerLaneData[rank - 2] > 1 &&
-+  // A 1D block IO has a single dim, so it can be neither transposed nor
-+  // transformed.
-+  bool hasTranspose = rank > 1 && consumerLaneLayout[rank - 2] > 1 &&
-+                      consumerLaneLayout[rank - 1] == 1;
-+  bool hasTransform = rank > 1 && !hasTranspose &&
-+                      consumerLaneData[rank - 2] > 1 &&
-                       consumerLaneData[rank - 1] == 1;
--  assert((consumerLaneData[rank - 2] == 1 || consumerLaneData[rank - 1] == 1) &&
-+  assert((rank < 2 || consumerLaneData[rank - 2] == 1 ||
-+          consumerLaneData[rank - 1] == 1) &&
-          "Expected consumer lane data to have at most one non-unit dim");
  
-   if (layoutKind == xegpu::LayoutKind::InstData) {
-@@ -1800,17 +1804,18 @@ xegpu::setupLoadNdAnchorLayout(xegpu::LayoutKind layoutKind,
+ LogicalResult CreateNdDescOp::verify() {
+-  size_t rank = getMixedSizes().size();
+-  bool invalidRank = rank != getMixedStrides().size();
++  // getMixedSizes()/getMixedStrides() cannot represent a *bare dynamic* memref
++  // (a dynamic dim has no SSA operand and no const attr), so derive the rank
++  // from the memref type for a memref source; only an integer source needs the
++  // shape/stride operands (checked below).
++  auto srcMemrefTy = dyn_cast<MemRefType>(getSourceType());
++  size_t rank = srcMemrefTy ? srcMemrefTy.getRank() : getMixedSizes().size();
++  bool invalidRank = false;
+   bool invalidElemTy = false;
+ 
+   // Memory space of created TensorDesc should match with the source.
+@@ -280,11 +285,24 @@ LogicalResult CreateNdDescOp::verify() {
+   if (auto memrefTy = dyn_cast<MemRefType>(getSourceType()))
+     invalidElemTy |= memrefTy.getElementType() != getElementType();
+ 
++  bool hasExplicitShapeStrides =
++      !getShape().empty() || !getStrides().empty() ||
++      (getConstShapeAttr() && !getConstShapeAttr().empty()) ||
++      (getConstStridesAttr() && !getConstStridesAttr().empty());
++
+   if (llvm::isa<IntegerType>(getSourceType())) {
+     // strides and shape must present for integer source.
+     if (getMixedStrides().empty() || getMixedSizes().empty())
+       return emitOpError("expecting strides and shape to be present for "
+                          "integer source.");
++    invalidRank = getMixedSizes().size() != getMixedStrides().size();
++  } else if (srcMemrefTy && hasExplicitShapeStrides) {
++    // Deprecated: a memref source carries its own shape/strides (recovered at
++    // lowering time, including for dynamic dims), so specifying them
++    // explicitly is redundant and no longer supported. Use the bare form:
++    //   xegpu.create_nd_tdesc %memref : memref<...> -> !xegpu.tensor_desc<...>
++    return emitOpError("shape and strides should not be specified for a memref "
++                       "source; they are inferred from the memref.");
+   }
+ 
+   if (invalidRank)
+diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUArrayLengthOptimization.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUArrayLengthOptimization.cpp
+index 590d1804167a5..ffca61128e283 100644
+--- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUArrayLengthOptimization.cpp
++++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUArrayLengthOptimization.cpp
+@@ -137,13 +137,21 @@ class OptimizeCreateNdDescOp : public OpRewritePattern<xegpu::CreateNdDescOp> {
+         tdescType.getBoundaryCheck(), tdescType.getMemorySpace(),
+         tdescType.getLayout());
+ 
+-    // The memory region is unchanged; pass through the existing shape/strides.
+-    // The general builder recognizes the static-memref case and drops the
+-    // redundant attributes.
+-    auto newOp = xegpu::CreateNdDescOp::create(
+-        rewriter, op.getLoc(), newTdescType, source, op.getMixedSizes(),
+-        op.getMixedStrides());
+-    rewriter.replaceOp(op, newOp.getResult());
++    // The memory region is unchanged. A memref source carries its own
++    // (possibly dynamic) shape/strides, so use the bare-memref builder rather
++    // than getMixedSizes/getMixedStrides (which cannot represent a dynamic
++    // memref dim, and for which explicit shape/strides on a memref are no
++    // longer allowed); an integer source still needs its explicit operands.
++    Value newOp;
++    if (isa<MemRefType>(source.getType()))
++      newOp =
++          xegpu::CreateNdDescOp::create(rewriter, op.getLoc(), newTdescType,
++                                        cast<TypedValue<MemRefType>>(source));
++    else
++      newOp = xegpu::CreateNdDescOp::create(rewriter, op.getLoc(), newTdescType,
++                                            source, op.getMixedSizes(),
++                                            op.getMixedStrides());
++    rewriter.replaceOp(op, newOp);
+     return success();
+   }
+ };
+diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUPeepHoleOptimizer.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUPeepHoleOptimizer.cpp
+index 1bf04f1f095a8..4b7ee133006e5 100644
+--- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUPeepHoleOptimizer.cpp
++++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUPeepHoleOptimizer.cpp
+@@ -44,28 +44,39 @@ using namespace mlir;
+ 
+ namespace {
+ 
+-/// Get the 2D lane data from a tensor desc type if it exists.
++/// Get the 2D lane data from a tensor desc type if it exists. The transpose
++/// optimization acts on the innermost 2 dims; a >2D descriptor is accepted only
++/// when its leading (batch) dims are unit, in which case the inner 2 dims are
++/// returned.
+ static std::optional<SmallVector<int64_t>>
+ getMaybeLaneData(xegpu::TensorDescType tdescType) {
+   auto layout = tdescType.getLayoutAttr();
+   if (!layout)
+     return std::nullopt;
+   auto laneData = layout.getEffectiveLaneDataAsInt();
+-  if (laneData.size() != 2)
++  if (laneData.size() < 2)
+     return std::nullopt;
+-  return laneData;
++  for (int64_t d : ArrayRef<int64_t>(laneData).drop_back(2))
++    if (d != 1)
++      return std::nullopt;
++  return SmallVector<int64_t>(laneData.end() - 2, laneData.end());
+ }
+ 
+-/// Get the 2D lane layout from a tensor desc type if it exists.
++/// Get the 2D lane layout from a tensor desc type if it exists. As with
++/// getMaybeLaneData, a >2D descriptor with unit leading dims yields its
++/// inner 2.
+ static std::optional<SmallVector<int64_t>>
+ getMaybeLaneLayout(xegpu::TensorDescType tdescType) {
+   auto layout = tdescType.getLayoutAttr();
+   if (!layout)
+     return std::nullopt;
+   auto laneLayout = layout.getEffectiveLaneLayoutAsInt();
+-  if (laneLayout.size() != 2)
++  if (laneLayout.size() < 2)
+     return std::nullopt;
+-  return laneLayout;
++  for (int64_t d : ArrayRef<int64_t>(laneLayout).drop_back(2))
++    if (d != 1)
++      return std::nullopt;
++  return SmallVector<int64_t>(laneLayout.end() - 2, laneLayout.end());
+ }
+ 
+ /// A layout can be optimized if its lane layout is transposed (lane[0] != 1 &&
+@@ -139,15 +150,22 @@ tryOptimize(xegpu::TensorDescType tdescType,
+   if (counts.size() != 1 || counts[0] != 1)
+     return tdescType;
+   int arrayLen = counts[0];
+-  int supportedHeight =
+-      xegpu::getLargestDivisor(static_cast<int>(requiredShape[0]), heights);
+-  int supportedWidth =
+-      xegpu::getLargestDivisor(static_cast<int>(requiredShape[1]), widths);
++  // The transpose acts on the innermost 2 dims; any leading dims are unit
++  // batch.
++  int64_t rank = requiredShape.size();
++  int supportedHeight = xegpu::getLargestDivisor(
++      static_cast<int>(requiredShape[rank - 2]), heights);
++  int supportedWidth = xegpu::getLargestDivisor(
++      static_cast<int>(requiredShape[rank - 1]), widths);
+   // If no supported height or width found, return the original type.
+   if (supportedHeight == -1 || supportedWidth == -1)
+     return tdescType;
+ 
+-  SmallVector<int64_t> supportedShape = {supportedHeight, supportedWidth};
++  // Preserve leading (unit) batch dims; only the inner 2 dims are reshaped.
++  SmallVector<int64_t> supportedShape(requiredShape.begin(),
++                                      requiredShape.end() - 2);
++  supportedShape.push_back(supportedHeight);
++  supportedShape.push_back(supportedWidth);
+   auto ctx = tdescType.getContext();
+   auto origLayout = tdescType.getLayoutAttr();
+   auto laneLayoutI64 = origLayout.getEffectiveLaneLayoutAsInt();
+@@ -156,7 +174,9 @@ tryOptimize(xegpu::TensorDescType tdescType,
+ 
+   xegpu::LayoutAttr newLayout = xegpu::LayoutAttr::get(
+       ctx, /*lane_layout=*/DenseI32ArrayAttr::get(ctx, laneLayoutI32),
+-      /*lane_data=*/DenseI32ArrayAttr::get(ctx, {1, 1}),
++      /*lane_data=*/
++      DenseI32ArrayAttr::get(ctx,
++                             SmallVector<int32_t>(laneLayoutI32.size(), 1)),
+       /*order=*/origLayout.getOrder());
+ 
+   // Array length can not be larger than 1 for transpose case.
+@@ -201,6 +221,7 @@ static Value generateLoads(ConversionPatternRewriter &rewriter,
+                            xegpu::LoadNdOp origLoadOp) {
+   Location loc = data.getLoc();
+   assert(offsets.size() >= 2 && "Expecting at least 2 offsets for 2D LoadNdOp");
++  int64_t rank = data.getType().getRank();
+   Value offsetDim0 = convertToValue(rewriter, loc, offsets[offsets.size() - 2]);
+   Value offsetDim1 = convertToValue(rewriter, loc, offsets[offsets.size() - 1]);
+   SmallVector<int64_t> supportedShape(newTensorDesc.getType().getShape());
+@@ -209,10 +230,14 @@ static Value generateLoads(ConversionPatternRewriter &rewriter,
+   auto shapeRatio = computeShapeRatio(data.getType().getShape(),
+                                       supportedShape)
+                         .value(); // `ratio` must be defined if we reach here.
+-  for (int64_t h = 0; h < shapeRatio[0]; ++h) {
+-    for (int64_t w = 0; w < shapeRatio[1]; ++w) {
+-      int64_t localOffsetDim0 = h * supportedShape[0];
+-      int64_t localOffsetDim1 = w * supportedShape[1];
++  // The transpose reshapes only the innermost 2 dims; any leading (batch) dims
++  // are unit, so their offsets pass through unchanged and they are not tiled.
++  int64_t suppDim0 = supportedShape[rank - 2];
++  int64_t suppDim1 = supportedShape[rank - 1];
++  for (int64_t h = 0; h < shapeRatio[rank - 2]; ++h) {
++    for (int64_t w = 0; w < shapeRatio[rank - 1]; ++w) {
++      int64_t localOffsetDim0 = h * suppDim0;
++      int64_t localOffsetDim1 = w * suppDim1;
+       Value loadOffsetX = arith::AddIOp::create(
+           rewriter, loc, offsetDim0,
+           arith::ConstantIndexOp::create(rewriter, loc, localOffsetDim0)
+@@ -221,21 +246,28 @@ static Value generateLoads(ConversionPatternRewriter &rewriter,
+           rewriter, loc, offsetDim1,
+           arith::ConstantIndexOp::create(rewriter, loc, localOffsetDim1)
+               .getResult());
++      // Keep the leading (batch) offsets; replace only the inner 2.
++      SmallVector<OpFoldResult> loadOffsets(offsets.begin(), offsets.end());
++      loadOffsets[loadOffsets.size() - 2] = loadOffsetX;
++      loadOffsets[loadOffsets.size() - 1] = loadOffsetY;
+       auto loadOp = xegpu::LoadNdOp::create(
+           rewriter, loc,
+           VectorType::get(supportedShape, data.getType().getElementType()),
+-          newTensorDesc, ArrayRef<OpFoldResult>{loadOffsetX, loadOffsetY},
+-          origLoadOp.getPackedAttr(), origLoadOp.getTransposeAttr(),
+-          origLoadOp.getL1HintAttr(), origLoadOp.getL2HintAttr(),
+-          origLoadOp.getL3HintAttr(), origLoadOp.getLayoutAttr());
++          newTensorDesc, loadOffsets, origLoadOp.getPackedAttr(),
++          origLoadOp.getTransposeAttr(), origLoadOp.getL1HintAttr(),
++          origLoadOp.getL2HintAttr(), origLoadOp.getL3HintAttr(),
++          origLoadOp.getLayoutAttr());
+       // Set the layout for the loadOp.
+       auto layoutAttr = newTensorDesc.getType().getLayoutAttr();
+       loadOp.setAnchorLayout(layoutAttr);
+-      // Insert the loaded block into the right position in data.
++      // Insert the loaded block into the right position in data (leading dims
++      // at 0, inner 2 dims at the local tile offset).
++      SmallVector<int64_t> insertPos(rank, 0);
++      insertPos[rank - 2] = localOffsetDim0;
++      insertPos[rank - 1] = localOffsetDim1;
++      SmallVector<int64_t> insertStrides(rank, 1);
+       auto insertOp = vector::InsertStridedSliceOp::create(
+-          rewriter, loc, loadOp.getResult(), data,
+-          ArrayRef<int64_t>{localOffsetDim0, localOffsetDim1},
+-          ArrayRef<int64_t>{1, 1});
++          rewriter, loc, loadOp.getResult(), data, insertPos, insertStrides);
+       // InsertOp must have the same layout as newTensorDesc.
+       xegpu::setTemporaryLayout(insertOp->getOpResult(0), layoutAttr);
+       data = insertOp.getResult();
+@@ -269,48 +301,90 @@ class XeGPUCreateNdDescOpPattern final
+     auto convertType = tryOptimize(tdescTy, targetuArch);
+     if (convertType == tdescTy)
+       return failure();
+-    auto strides = createNdOp.getMixedStrides();
+-    auto maybeConstInnerStride = getConstantIntValue(strides.back());
++    Location loc = createNdOp.getLoc();
++    Value source = createNdOp.getSource();
++    auto memrefType = dyn_cast<MemRefType>(source.getType());
++
++    // A fully static memref (static shape and strides) can use the op
++    // accessors directly. A dynamic memref cannot -- getMixedSizes/getMixed
++    // Strides can't represent a dynamic dim that has no SSA operand -- so its
++    // shape/strides are recovered from runtime metadata.
++    auto isStaticMemref = [](MemRefType mt) {
++      if (!mt.hasStaticShape())
++        return false;
++      SmallVector<int64_t> st;
++      int64_t off;
++      return succeeded(mt.getStridesAndOffset(st, off)) &&
++             llvm::none_of(st, ShapedType::isDynamic);
++    };
++    bool dynamicMemref = memrefType && !isStaticMemref(memrefType);
++
++    SmallVector<OpFoldResult> mixedSizes;
++    SmallVector<OpFoldResult> mixedStrides;
++    memref::ExtractStridedMetadataOp meta;
++    if (dynamicMemref) {
++      meta = memref::ExtractStridedMetadataOp::create(rewriter, loc, source);
++      mixedSizes = meta.getConstifiedMixedSizes();
++      mixedStrides = meta.getConstifiedMixedStrides();
++    } else {
++      mixedSizes = createNdOp.getMixedSizes();
++      mixedStrides = createNdOp.getMixedStrides();
++    }
++
++    auto maybeConstInnerStride = getConstantIntValue(mixedStrides.back());
+     // Only row-major memrefs are expected for now.
+     if (!maybeConstInnerStride || *maybeConstInnerStride != 1)
+       return rewriter.notifyMatchFailure(
+           createNdOp, "Expecting row-major memref for transpose optimization.");
+-    Value source = createNdOp.getSource();
+     auto optionalLaneData = getMaybeLaneData(tdescTy);
+     assert(optionalLaneData && "Expected 2D lane data");
+     auto laneData = optionalLaneData.value();
+     int64_t innerLaneData = laneData[1];
+-    auto memrefType = dyn_cast<MemRefType>(source.getType());
+     // Inner dimension of the shape must be adjusted based on innerLaneData.
+-    SmallVector<OpFoldResult> modifiedShape(createNdOp.getMixedSizes());
++    SmallVector<OpFoldResult> modifiedShape(mixedSizes);
+     modifiedShape.back() = divideByConstant(
+-        rewriter, createNdOp.getLoc(),
+-        convertToValue(rewriter, createNdOp.getLoc(), modifiedShape.back()),
++        rewriter, loc, convertToValue(rewriter, loc, modifiedShape.back()),
+         innerLaneData);
+-    // Similarly, second to last stride must be adjusted.
+-    assert(strides.size() >= 2 &&
++    // Repacking narrow elements into wider ones (f16 -> i32) reinterprets the
++    // innermost dim, so every stride *except* the innermost (which stays 1)
++    // counts the wider element and must be divided by innerLaneData. This
++    // includes the pitch (second-to-last) and, for a >2D descriptor, the
++    // leading (batch) strides -- the latter are read back by the XeVM load/
++    // store fold, which multiplies them by the *repacked* element byte size,
++    // so they must already be in repacked-element units. (For a 2D descriptor
++    // this is exactly the second-to-last stride, matching prior behavior.)
++    assert(mixedStrides.size() >= 2 &&
+            "Expected at least 2 strides for CreateNdDescOp");
+-    SmallVector<OpFoldResult> modifiedStrides(strides);
+-    modifiedStrides[modifiedStrides.size() - 2] = divideByConstant(
+-        rewriter, createNdOp.getLoc(),
+-        convertToValue(rewriter, createNdOp.getLoc(),
+-                       modifiedStrides[modifiedStrides.size() - 2]),
+-        innerLaneData);
+-
+-    // If the source is a static memref, we need to extract the pointer to
+-    // base address.
+-    if (memrefType && memrefType.hasStaticShape()) {
+-      auto extractOp = memref::ExtractAlignedPointerAsIndexOp::create(
+-          rewriter, createNdOp.getLoc(), source);
+-      source = arith::IndexCastOp::create(rewriter, createNdOp.getLoc(),
+-                                          rewriter.getI64Type(),
+-                                          extractOp.getResult())
+-                   .getResult();
++    SmallVector<OpFoldResult> modifiedStrides(mixedStrides);
++    for (size_t i = 0; i + 1 < modifiedStrides.size(); ++i)
++      modifiedStrides[i] = divideByConstant(
++          rewriter, loc, convertToValue(rewriter, loc, modifiedStrides[i]),
++          innerLaneData);
++
++    // The repacked shape/strides differ from the memref's own layout, so a
++    // memref source must be lowered to an i64 base pointer -- specifying
++    // explicit shape/strides on a memref create_nd is not allowed.
++    if (memrefType) {
++      Value baseIdx;
++      if (dynamicMemref) {
++        // Base = aligned base pointer + structural offset (in bytes).
++        Value alignedPtr = memref::ExtractAlignedPointerAsIndexOp::create(
++            rewriter, loc, meta.getBaseBuffer());
++        Value elemBytes = arith::ConstantIndexOp::create(
++            rewriter, loc, memrefType.getElementTypeBitWidth() / 8);
++        Value offBytes =
++            arith::MulIOp::create(rewriter, loc, meta.getOffset(), elemBytes);
++        baseIdx = arith::AddIOp::create(rewriter, loc, alignedPtr, offBytes);
++      } else {
++        baseIdx = memref::ExtractAlignedPointerAsIndexOp::create(rewriter, loc,
++                                                                 source);
++      }
++      source = arith::IndexCastOp::create(rewriter, loc, rewriter.getI64Type(),
++                                          baseIdx);
      }
- 
-     // See whether the consumer's inst_data satisfies the block constraints.
--    int64_t height = consumerInstData[rank - 2];
-+    // A 1D block IO has no height dim, so only the width is constrained.
-     int64_t width = consumerInstData[rank - 1];
-     auto maxBlockCount = *llvm::max_element(bCounts);
-     auto maxWidth = *llvm::max_element(bWidths);
--    if (llvm::is_contained(bWidths, static_cast<int>(width)) ||
--        (width % maxWidth == 0 && width / maxWidth < maxBlockCount)) {
--      if (llvm::is_contained(bHeights, static_cast<int>(height))) {
--        return buildInstDataLayoutWithLane(context, consumerInstData,
--                                           laneLayout, consumerLaneData,
--                                           consumerOrderAttr);
--      }
-+    bool validHeight =
-+        rank < 2 || llvm::is_contained(bHeights, static_cast<int>(
-+                                                     consumerInstData[rank - 2]));
-+    if (validHeight &&
-+        (llvm::is_contained(bWidths, static_cast<int>(width)) ||
-+         (width % maxWidth == 0 && width / maxWidth < maxBlockCount))) {
-+      return buildInstDataLayoutWithLane(context, consumerInstData, laneLayout,
-+                                         consumerLaneData, consumerOrderAttr);
-     }
- 
-     // if consumer instData size too small, try the larger one. like DPAS_MX's
+     // Create a new CreateNdDescOp with the modified shape and converted type.
+     auto newCreateNdDescOp = xegpu::CreateNdDescOp::create(
+-        rewriter, createNdOp.getLoc(), convertType, source, modifiedShape,
+-        modifiedStrides);
++        rewriter, loc, convertType, source, modifiedShape, modifiedStrides);
+     rewriter.replaceOp(createNdOp, newCreateNdDescOp.getResult());
+     return success();
+   }
 diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp
-index 14061ab24ffe..e2aeff6d07c6 100644
+index 14061ab24ffe0..6f2d34a952eeb 100644
 --- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp
 +++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp
-@@ -13,6 +13,7 @@
- //===----------------------------------------------------------------------===//
+@@ -120,54 +120,6 @@ struct UnrollPattern : public OpRewritePattern<SourceOp> {
+     return SmallVector<Value>();
+   }
  
- #include "mlir/Dialect/Arith/IR/Arith.h"
-+#include "mlir/Dialect/Arith/Utils/Utils.h"
- #include "mlir/Dialect/MemRef/IR/MemRef.h"
- #include "mlir/Dialect/Utils/IndexingUtils.h"
- #include "mlir/Dialect/Vector/IR/VectorOps.h"
-@@ -122,14 +123,13 @@ protected:
- 
-   /// Helper for the rank > 2 case shared by Load/Store/PrefetchNd unroll
-   /// patterns. The matching CreateNdDesc unroll pattern produces one tdesc
+-  /// Helper for the rank > 2 case shared by Load/Store/PrefetchNd unroll
+-  /// patterns. The matching CreateNdDesc unroll pattern produces one tdesc
 -  /// per batch tile (the batch offset is baked into its base pointer via
 -  /// memref.subview), so here we only need to iterate the inner 2D offsets
 -  /// for each batch tdesc.
-+  /// per batch tile (the static batch tile offset is baked into its base
-+  /// pointer via memref.subview), so here we only need to iterate the inner
-+  /// 2D offsets for each batch tdesc.
-   ///
-   /// Packs `srcTdesc` into one tdesc per batch tile, then iterates the inner
-   /// 2D tile offsets for each batch tdesc and invokes `createOp` with
+-  ///
+-  /// Packs `srcTdesc` into one tdesc per batch tile, then iterates the inner
+-  /// 2D tile offsets for each batch tdesc and invokes `createOp` with
 -  /// (batchTdesc, fullOffsets), where fullOffsets is `batchRank` zeros
 -  /// followed by the inner offsets. Returns the values produced by createOp,
-+  /// (batchTdesc, fullOffsets). Returns the values produced by createOp,
-   /// flattened across (batch, inner) iteration order.
-   SmallVector<Value> unrollNdBatch(
-       Value srcTdesc, xegpu::TensorDescType tdescTy,
-@@ -141,6 +141,8 @@ protected:
-     SmallVector<int64_t> innerShape(shape.begin() + batchRank, shape.end());
-     SmallVector<int64_t> innerTarget(targetShape.begin() + batchRank,
-                                      targetShape.end());
-+    ArrayRef<int64_t> batchShape = shape.take_front(batchRank);
-+    ArrayRef<int64_t> batchTileShape = targetShape.take_front(batchRank);
- 
-     SmallVector<Type> batchTdescTypes = getUnrolledTypes(tdescTy, targetShape);
-     SmallVector<Value> batchTdescs =
-@@ -150,14 +152,28 @@ protected:
-         tdescTy.getContext(), innerShape, tdescTy.getElementType(),
-         tdescTy.getEncoding(), /*layout=*/nullptr);
- 
-+    ArrayRef<OpFoldResult> batchOffsets = mixedOffsets.take_front(batchRank);
-     SmallVector<OpFoldResult> innerOffsets(mixedOffsets.begin() + batchRank,
-                                            mixedOffsets.end());
- 
-+    // Each batchTdesc's memref.subview already bakes in the *static* start
-+    // of its batch tile. Any remaining (e.g. dynamic) batch offset from the
-+    // original op is the position within that tile: it must be preserved
-+    // when there is exactly one batch tile (the tile spans the whole batch
-+    // shape, so its static start is all zeros and the offset is unambiguous).
-+    // With multiple static batch tiles there is no single tile the dynamic
-+    // offset could consistently apply to, so it is dropped (existing
-+    // behavior for fully-static batch unrolling).
-+    bool singleBatchTile = llvm::equal(batchShape, batchTileShape);
-+
-     SmallVector<Value> newOps;
-     for (Value batchTdesc : batchTdescs) {
-       auto wrappedCreate = [&](SmallVector<OpFoldResult> offsets) -> Value {
+-  /// flattened across (batch, inner) iteration order.
+-  SmallVector<Value> unrollNdBatch(
+-      Value srcTdesc, xegpu::TensorDescType tdescTy,
+-      ArrayRef<int64_t> targetShape, ArrayRef<OpFoldResult> mixedOffsets,
+-      int64_t batchRank,
+-      llvm::function_ref<Value(Value, SmallVector<OpFoldResult>)> createOp,
+-      Location loc, PatternRewriter &rewriter) const {
+-    ArrayRef<int64_t> shape = tdescTy.getShape();
+-    SmallVector<int64_t> innerShape(shape.begin() + batchRank, shape.end());
+-    SmallVector<int64_t> innerTarget(targetShape.begin() + batchRank,
+-                                     targetShape.end());
+-
+-    SmallVector<Type> batchTdescTypes = getUnrolledTypes(tdescTy, targetShape);
+-    SmallVector<Value> batchTdescs =
+-        pack(srcTdesc, batchTdescTypes, targetShape, loc, rewriter);
+-
+-    auto innerTdescTy = xegpu::TensorDescType::get(
+-        tdescTy.getContext(), innerShape, tdescTy.getElementType(),
+-        tdescTy.getEncoding(), /*layout=*/nullptr);
+-
+-    SmallVector<OpFoldResult> innerOffsets(mixedOffsets.begin() + batchRank,
+-                                           mixedOffsets.end());
+-
+-    SmallVector<Value> newOps;
+-    for (Value batchTdesc : batchTdescs) {
+-      auto wrappedCreate = [&](SmallVector<OpFoldResult> offsets) -> Value {
 -        SmallVector<OpFoldResult> fullOffsets(batchRank,
 -                                              rewriter.getIndexAttr(0));
-+        SmallVector<OpFoldResult> fullOffsets;
-+        if (singleBatchTile)
-+          fullOffsets.assign(batchOffsets.begin(), batchOffsets.end());
-+        else
-+          fullOffsets.assign(batchRank, rewriter.getIndexAttr(0));
-         fullOffsets.append(offsets.begin(), offsets.end());
-         return createOp(batchTdesc, fullOffsets);
-       };
-@@ -251,8 +267,8 @@ struct UnrollCreateNdOp : public UnrollPattern<xegpu::CreateNdDescOp> {
-     int64_t rank = tdescTy.getRank();
-     int64_t batchRank = rank - 2;
+-        fullOffsets.append(offsets.begin(), offsets.end());
+-        return createOp(batchTdesc, fullOffsets);
+-      };
+-      auto perBatch = unrollByTile(innerOffsets, innerTdescTy, innerTarget,
+-                                   wrappedCreate, loc, rewriter);
+-      newOps.append(perBatch.begin(), perBatch.end());
+-    }
+-    return newOps;
+-  }
+-
+   /// Helper to pack operands for DPAS-like operations with early return if
+   /// no unrolling is needed.
+   SmallVector<Value> packOperandForDpas(Value operand,
+@@ -248,63 +200,39 @@ struct UnrollCreateNdOp : public UnrollPattern<xegpu::CreateNdDescOp> {
+     if (!targetShape)
+       return failure();
  
+-    int64_t rank = tdescTy.getRank();
+-    int64_t batchRank = rank - 2;
+-
 -    // For rank <= 2 or non-memref source: existing single-tdesc behavior.
 -    if (batchRank <= 0 || !isa<MemRefType>(op.getSourceType())) {
-+    // For rank <= 2: existing single-tdesc behavior.
-+    if (batchRank <= 0) {
-       SmallVector<Value> newOps;
-       auto newTdescTy = getUnrolledTypes(tdescTy, *targetShape)[0];
-       auto newOp = xegpu::CreateNdDescOp::create(
-@@ -264,19 +280,55 @@ struct UnrollCreateNdOp : public UnrollPattern<xegpu::CreateNdDescOp> {
-       return success();
-     }
- 
+-      SmallVector<Value> newOps;
+-      auto newTdescTy = getUnrolledTypes(tdescTy, *targetShape)[0];
+-      auto newOp = xegpu::CreateNdDescOp::create(
+-          rewriter, loc, newTdescTy, op.getSource(), op.getMixedSizes(),
+-          op.getMixedStrides());
+-      newOps.push_back(newOp);
+-      Value castOp = unpack(newOps, tdescTy, *targetShape, loc, rewriter);
+-      rewriter.replaceOp(op, castOp);
+-      return success();
+-    }
+-
 -    // For rank > 2 with memref source: create one tdesc per batch tile via
 -    // memref.subview. Each subview slices the batch dimensions, so the
 -    // resulting tdesc has the batch offset baked into its base pointer.
 -    // The inner dimensions remain full-size for reuse across multiple
 -    // load/store operations with different offsets.
-     ArrayRef<int64_t> shape = tdescTy.getShape();
-     SmallVector<int64_t> batchBlockSize(targetShape->begin(),
+-    ArrayRef<int64_t> shape = tdescTy.getShape();
+-    SmallVector<int64_t> batchBlockSize(targetShape->begin(),
 -                                        targetShape->begin() + batchRank);
-+                                       targetShape->begin() + batchRank);
-     batchBlockSize.append(shape.begin() + batchRank, shape.end());
+-    batchBlockSize.append(shape.begin() + batchRank, shape.end());
+-
+-    auto newTdescTy =
+-        cast<xegpu::TensorDescType>(getUnrolledTypes(tdescTy, *targetShape)[0]);
++    // Keep the original (possibly high-D) source and only shrink the
++    // descriptor's tile shape. Leading (batch) dims are unrolled to unit tiles
++    // like any other dim; the batch position rides on the load/store/prefetch
++    // offsets (see unrollByTile) and is folded into the base pointer at XeVM
++    // lowering. We therefore never slice the source with a memref.subview,
++    // which for a dynamic-shape source could not guarantee a valid base
++    // address.
++    Value src = op.getSource();
++    auto makeCreateNd = [&](Type tdesc) -> Value {
++      auto ndTy = cast<xegpu::TensorDescType>(tdesc);
++      if (isa<MemRefType>(src.getType()))
++        // A memref source carries its own (possibly dynamic) shape/strides; use
++        // the bare-memref builder rather than getMixedSizes/getMixedStrides,
++        // which cannot represent a dynamic memref dim without an SSA operand.
++        return xegpu::CreateNdDescOp::create(rewriter, loc, ndTy,
++                                             cast<TypedValue<MemRefType>>(src));
++      return xegpu::CreateNdDescOp::create(
++          rewriter, loc, ndTy, src, op.getMixedSizes(), op.getMixedStrides());
++    };
  
-     auto newTdescTy =
-         cast<xegpu::TensorDescType>(getUnrolledTypes(tdescTy, *targetShape)[0]);
- 
-+    // For rank > 2 with an integer base pointer: one tdesc per batch tile,
-+    // each with the batch tile's byte offset added to the base pointer.
-+    if (!isa<MemRefType>(op.getSourceType())) {
-+      auto ptrTy = cast<IntegerType>(op.getSourceType());
-+      unsigned elemBytes =
-+          llvm::divideCeil(tdescTy.getElementType().getIntOrFloatBitWidth(), 8);
-+      SmallVector<OpFoldResult> mixedStrides = op.getMixedStrides();
-+      SmallVector<Value> newOps;
-+
-+      for (SmallVector<int64_t> batchOffsets :
-+           StaticTileOffsetRange(shape, batchBlockSize)) {
-+        Value base = op.getSource();
-+        for (auto [off, stride] :
-+             llvm::zip_equal(ArrayRef(batchOffsets).take_front(batchRank),
-+                             ArrayRef(mixedStrides).take_front(batchRank))) {
-+          if (off == 0)
-+            continue;
-+          Value strideVal = getValueOrCreateConstantIndexOp(rewriter, loc,
-+                                                            stride);
-+          strideVal =
-+              arith::IndexCastOp::create(rewriter, loc, ptrTy, strideVal);
-+          Value bytes = arith::ConstantIntOp::create(
-+              rewriter, loc, ptrTy, off * static_cast<int64_t>(elemBytes));
-+          base = arith::AddIOp::create(
-+              rewriter, loc, base,
-+              arith::MulIOp::create(rewriter, loc, strideVal, bytes));
-+        }
-+        newOps.push_back(xegpu::CreateNdDescOp::create(
-+            rewriter, loc, newTdescTy, base, op.getMixedSizes(), mixedStrides));
-+      }
-+
-+      Value castOp = unpack(newOps, tdescTy, *targetShape, loc, rewriter);
-+      rewriter.replaceOp(op, castOp);
-+      return success();
-+    }
-+
-+    // For rank > 2 with memref source: create one tdesc per batch tile via
-+    // memref.subview. Each subview slices the batch dimensions, so the
-+    // resulting tdesc has the batch offset baked into its base pointer.
-+    // The inner dimensions remain full-size for reuse across multiple
-+    // load/store operations with different offsets.
++    SmallVector<Type> newTdescTys = getUnrolledTypes(tdescTy, *targetShape);
      SmallVector<Value> newOps;
-     for (SmallVector<int64_t> batchOffsets :
-          StaticTileOffsetRange(shape, batchBlockSize)) {
+-    for (SmallVector<int64_t> batchOffsets :
+-         StaticTileOffsetRange(shape, batchBlockSize)) {
+-      // Build memref.subview operands. The subview slices contiguously along
+-      // each batch dimension (no gaps), so the subview's element stride is 1
+-      // for every dim. This is unrelated to the source memref's strides, which
+-      // describe the layout of the original buffer and are propagated by the
+-      // SubViewOp builder onto the resulting memref type.
+-      SmallVector<OpFoldResult> subviewOffsets;
+-      for (int64_t off : batchOffsets)
+-        subviewOffsets.push_back(rewriter.getIndexAttr(off));
+-
+-      SmallVector<OpFoldResult> subviewSizes;
+-      for (int64_t d : batchBlockSize)
+-        subviewSizes.push_back(rewriter.getIndexAttr(d));
+-
+-      SmallVector<OpFoldResult> subviewStrides(rank, rewriter.getIndexAttr(1));
+-
+-      auto subview = memref::SubViewOp::create(rewriter, loc, op.getSource(),
+-                                               subviewOffsets, subviewSizes,
+-                                               subviewStrides);
+-
+-      auto newOp = xegpu::CreateNdDescOp::create(
+-          rewriter, loc, newTdescTy,
+-          cast<TypedValue<MemRefType>>(subview.getResult()));
+-      newOps.push_back(newOp);
++    if (tdescTy.getRank() <= 2) {
++      // For 2D descriptors a single tdesc is reused for every unrolled tile via
++      // offsets; the pack/unpack resolution broadcasts the one source.
++      newOps.push_back(makeCreateNd(newTdescTys[0]));
++    } else {
++      // For >2D (batched) descriptors the unpack expands the leading dims, so
++      // the source count must match the consumer's pack count. Emit one
++      // (identical, full-source) tdesc per tile; the redundant ones fold away.
++      for (Type t : newTdescTys)
++        newOps.push_back(makeCreateNd(t));
+     }
+-
+     Value castOp = unpack(newOps, tdescTy, *targetShape, loc, rewriter);
+     rewriter.replaceOp(op, castOp);
+     return success();
+@@ -326,37 +254,22 @@ struct UnrollPrefetchNdOp : public UnrollPattern<xegpu::PrefetchNdOp> {
+     if (layout)
+       layout = layout.dropInstData();
+ 
+-    int64_t rank = tdescTy.getRank();
+-    int64_t batchRank = rank - 2;
+-
+-    if (batchRank <= 0) {
+-      SmallVector<Type> convertedTdescTypes =
+-          getUnrolledTypes(tdescTy, *targetShape);
+-      SmallVector<Value> convertedTdesc = pack(
+-          op.getTensorDesc(), convertedTdescTypes, *targetShape, loc, rewriter);
+-
+-      auto createPrefetch = [&](SmallVector<OpFoldResult> offsets) -> Value {
+-        xegpu::PrefetchNdOp::create(rewriter, loc, convertedTdesc[0], offsets,
+-                                    op.getL1HintAttr(), op.getL2HintAttr(),
+-                                    op.getL3HintAttr(), layout);
+-        return nullptr;
+-      };
+-      unrollByTile(op.getMixedOffsets(), tdescTy, *targetShape, createPrefetch,
+-                   loc, rewriter);
+-    } else {
+-      // Rank > 2: batch tdescs cover [batchTarget..., innerShape...].
+-      // Each batch tdesc is reused for multiple inner prefetches via offsets.
+-      auto createPrefetch =
+-          [&](Value tdesc, SmallVector<OpFoldResult> fullOffsets) -> Value {
+-        xegpu::PrefetchNdOp::create(rewriter, loc, tdesc, fullOffsets,
+-                                    op.getL1HintAttr(), op.getL2HintAttr(),
+-                                    op.getL3HintAttr(), layout);
+-        return nullptr;
+-      };
+-      this->unrollNdBatch(op.getTensorDesc(), tdescTy, *targetShape,
+-                          op.getMixedOffsets(), batchRank, createPrefetch, loc,
+-                          rewriter);
+-    }
++    // Batch (leading) dims are unrolled to unit tiles by unrollByTile like any
++    // other dim; their offsets ride on the prefetch and are folded into the
++    // base pointer at XeVM lowering, so no per-batch tdesc/subview is needed.
++    SmallVector<Type> convertedTdescTypes =
++        getUnrolledTypes(tdescTy, *targetShape);
++    SmallVector<Value> convertedTdesc = pack(
++        op.getTensorDesc(), convertedTdescTypes, *targetShape, loc, rewriter);
++
++    auto createPrefetch = [&](SmallVector<OpFoldResult> offsets) -> Value {
++      xegpu::PrefetchNdOp::create(rewriter, loc, convertedTdesc[0], offsets,
++                                  op.getL1HintAttr(), op.getL2HintAttr(),
++                                  op.getL3HintAttr(), layout);
++      return nullptr;
++    };
++    unrollByTile(op.getMixedOffsets(), tdescTy, *targetShape, createPrefetch,
++                 loc, rewriter);
+ 
+     rewriter.eraseOp(op);
+     return success();
+@@ -383,39 +296,24 @@ struct UnrollLoadNdOp : public UnrollPattern<xegpu::LoadNdOp> {
+     Type elemTy = tdescTy.getElementType();
+     VectorType newValueTy = valueTy.cloneWith(*targetShape, elemTy);
+ 
+-    int64_t rank = tdescTy.getRank();
+-    int64_t batchRank = rank - 2;
+     SmallVector<Value> newOps;
+ 
+-    if (batchRank <= 0) {
+-      // Rank <= 2: original behavior with single tdesc.
+-      SmallVector<Type> convertedTdescTypes =
+-          getUnrolledTypes(tdescTy, *targetShape);
+-      SmallVector<Value> convertedTdescs = pack(
+-          op.getTensorDesc(), convertedTdescTypes, *targetShape, loc, rewriter);
+-
+-      auto createLoad = [&](SmallVector<OpFoldResult> offsets) -> Value {
+-        return xegpu::LoadNdOp::create(
+-            rewriter, loc, newValueTy, convertedTdescs[0], offsets,
+-            op.getPackedAttr(), op.getTransposeAttr(), op.getL1HintAttr(),
+-            op.getL2HintAttr(), op.getL3HintAttr(), layout);
+-      };
+-      newOps = unrollByTile(op.getMixedOffsets(), tdescTy, *targetShape,
+-                            createLoad, loc, rewriter);
+-    } else {
+-      // Rank > 2: batch tdescs cover [batchTarget..., innerShape...].
+-      // Each batch tdesc is reused for multiple inner loads via offsets.
+-      auto createLoad = [&](Value tdesc,
+-                            SmallVector<OpFoldResult> fullOffsets) -> Value {
+-        return xegpu::LoadNdOp::create(
+-            rewriter, loc, newValueTy, tdesc, fullOffsets, op.getPackedAttr(),
+-            op.getTransposeAttr(), op.getL1HintAttr(), op.getL2HintAttr(),
+-            op.getL3HintAttr(), layout);
+-      };
+-      newOps = this->unrollNdBatch(op.getTensorDesc(), tdescTy, *targetShape,
+-                                   op.getMixedOffsets(), batchRank, createLoad,
+-                                   loc, rewriter);
+-    }
++    // Batch (leading) dims are unrolled to unit tiles by unrollByTile like any
++    // other dim; their offsets ride on the load and are folded into the base
++    // pointer at XeVM lowering, so a single tdesc is reused for all tiles.
++    SmallVector<Type> convertedTdescTypes =
++        getUnrolledTypes(tdescTy, *targetShape);
++    SmallVector<Value> convertedTdescs = pack(
++        op.getTensorDesc(), convertedTdescTypes, *targetShape, loc, rewriter);
++
++    auto createLoad = [&](SmallVector<OpFoldResult> offsets) -> Value {
++      return xegpu::LoadNdOp::create(
++          rewriter, loc, newValueTy, convertedTdescs[0], offsets,
++          op.getPackedAttr(), op.getTransposeAttr(), op.getL1HintAttr(),
++          op.getL2HintAttr(), op.getL3HintAttr(), layout);
++    };
++    newOps = unrollByTile(op.getMixedOffsets(), tdescTy, *targetShape,
++                          createLoad, loc, rewriter);
+ 
+     Value castOp = unpack(newOps, op.getType(), *targetShape, loc, rewriter);
+     rewriter.replaceOp(op, castOp);
+@@ -445,42 +343,25 @@ struct UnrollStoreNdOp : public UnrollPattern<xegpu::StoreNdOp> {
+     SmallVector<Value> convertedValues =
+         pack(op.getValue(), convertedValTypes, *targetShape, loc, rewriter);
+ 
+-    int64_t rank = tdescTy.getRank();
+-    int64_t batchRank = rank - 2;
+     size_t valueIndex = 0;
+ 
+-    if (batchRank <= 0) {
+-      SmallVector<Type> convertedTdescTypes =
+-          getUnrolledTypes(tdescTy, *targetShape);
+-      SmallVector<Value> convertedTdescs = pack(
+-          op.getTensorDesc(), convertedTdescTypes, *targetShape, loc, rewriter);
+-
+-      auto createStore = [&](SmallVector<OpFoldResult> offsets) {
+-        xegpu::StoreNdOp::create(rewriter, loc, convertedValues[valueIndex++],
+-                                 convertedTdescs[0], offsets,
+-                                 op.getL1HintAttr(), op.getL2HintAttr(),
+-                                 op.getL3HintAttr(), layout);
+-        return (Value) nullptr;
+-      };
+-      unrollByTile(op.getMixedOffsets(), tdescTy, *targetShape, createStore,
+-                   loc, rewriter);
+-    } else {
+-      // Rank > 2: batch tdescs cover [batchTarget..., innerShape...].
+-      // Each batch tdesc is reused for multiple inner stores via offsets.
+-      // valueIndex advances across (batch, inner) iterations in the same
+-      // order unrollNdBatch invokes the callback, so it stays in sync with
+-      // the pre-packed convertedValues.
+-      auto createStore = [&](Value tdesc,
+-                             SmallVector<OpFoldResult> fullOffsets) -> Value {
+-        xegpu::StoreNdOp::create(
+-            rewriter, loc, convertedValues[valueIndex++], tdesc, fullOffsets,
+-            op.getL1HintAttr(), op.getL2HintAttr(), op.getL3HintAttr(), layout);
+-        return nullptr;
+-      };
+-      this->unrollNdBatch(op.getTensorDesc(), tdescTy, *targetShape,
+-                          op.getMixedOffsets(), batchRank, createStore, loc,
+-                          rewriter);
+-    }
++    // Batch (leading) dims are unrolled to unit tiles by unrollByTile like any
++    // other dim; their offsets ride on the store and are folded into the base
++    // pointer at XeVM lowering. valueIndex advances in the same tile order
++    // unrollByTile iterates, so it stays in sync with the pre-packed values.
++    SmallVector<Type> convertedTdescTypes =
++        getUnrolledTypes(tdescTy, *targetShape);
++    SmallVector<Value> convertedTdescs = pack(
++        op.getTensorDesc(), convertedTdescTypes, *targetShape, loc, rewriter);
++
++    auto createStore = [&](SmallVector<OpFoldResult> offsets) {
++      xegpu::StoreNdOp::create(rewriter, loc, convertedValues[valueIndex++],
++                               convertedTdescs[0], offsets, op.getL1HintAttr(),
++                               op.getL2HintAttr(), op.getL3HintAttr(), layout);
++      return (Value) nullptr;
++    };
++    unrollByTile(op.getMixedOffsets(), tdescTy, *targetShape, createStore, loc,
++                 rewriter);
+ 
+     rewriter.eraseOp(op);
+     return success();
 diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUWgToSgDistribute.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUWgToSgDistribute.cpp
-index afea358dafe2..8c6e2d1583f2 100644
+index afea358dafe29..92eb62ce4744c 100644
 --- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUWgToSgDistribute.cpp
 +++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUWgToSgDistribute.cpp
-@@ -189,7 +189,10 @@ struct WgToSgCreateNdOp : public OpConversionPattern<xegpu::CreateNdDescOp> {
-     Location loc = op.getLoc();
-     MLIRContext *ctx = op.getContext();
-     xegpu::TensorDescType tdescTy = op.getType();
--    auto layout = dyn_cast<xegpu::LayoutAttr>(tdescTy.getLayout());
-+    // Accept any DistributeLayoutAttr, not just LayoutAttr: a tdesc feeding a
-+    // unit-dim-expanding shape_cast carries a SliceAttr of the expanded
-+    // layout, and must be distributed alongside it.
-+    auto layout = dyn_cast<xegpu::DistributeLayoutAttr>(tdescTy.getLayout());
-     if (!layout || !layout.isForWorkgroup())
-       return failure();
+@@ -203,10 +203,17 @@ struct WgToSgCreateNdOp : public OpConversionPattern<xegpu::CreateNdDescOp> {
+         xegpu::TensorDescType::get(ctx, sgShape, elemTy, tdescTy.getEncoding(),
+                                    layout.dropSgLayoutAndData());
  
-@@ -1599,8 +1602,11 @@ void XeGPUWgToSgDistributePass::runOnOperation() {
-                                xegpu::StoreNdOp, xegpu::PrefetchNdOp>(
-       [=](Operation *op) -> bool {
-         auto tdescTy = getTensorDescType(op);
--        auto layout =
--            dyn_cast_if_present<xegpu::LayoutAttr>(tdescTy.getLayout());
-+        // Match WgToSgCreateNdOp: accept any DistributeLayoutAttr, since a
-+        // tdesc feeding a unit-dim-expanding shape_cast carries a SliceAttr
-+        // of the expanded layout and still needs distributing.
-+        auto layout = dyn_cast_if_present<xegpu::DistributeLayoutAttr>(
-+            tdescTy.getLayout());
-         return isLegal(layout);
-       });
++    Value src = op.getSource();
+     SmallVector<Value> newCreateNdOps(count);
+-    std::generate(newCreateNdOps.begin(), newCreateNdOps.end(), [&]() {
+-      return xegpu::CreateNdDescOp::create(rewriter, loc, newTdescTy,
+-                                           op.getSource(), op.getMixedSizes(),
++    std::generate(newCreateNdOps.begin(), newCreateNdOps.end(), [&]() -> Value {
++      // A memref source carries its own (possibly dynamic) shape/strides; use
++      // the bare-memref builder rather than getMixedSizes/getMixedStrides,
++      // which cannot represent a dynamic memref dim without an SSA operand.
++      if (isa<MemRefType>(src.getType()))
++        return xegpu::CreateNdDescOp::create(rewriter, loc, newTdescTy,
++                                             cast<TypedValue<MemRefType>>(src));
++      return xegpu::CreateNdDescOp::create(rewriter, loc, newTdescTy, src,
++                                           op.getMixedSizes(),
+                                            op.getMixedStrides());
+     });
  
 diff --git a/mlir/lib/Dialect/XeGPU/Utils/XeGPUUtils.cpp b/mlir/lib/Dialect/XeGPU/Utils/XeGPUUtils.cpp
-index 07dcb438ca55..7d788cabb572 100644
+index 07dcb438ca553..7f32e2c37b425 100644
 --- a/mlir/lib/Dialect/XeGPU/Utils/XeGPUUtils.cpp
 +++ b/mlir/lib/Dialect/XeGPU/Utils/XeGPUUtils.cpp
-@@ -773,13 +773,22 @@ template int
- xegpu::getLargestDivisor<unsigned>(unsigned dim, ArrayRef<unsigned> candidates,
-                                    ArrayRef<unsigned> candidateMultiples);
- 
-+/// A rank>2 layout describes a 2D block IO only if all its batch dims are unit;
-+/// the packed/transpose effects are then decided by the innermost two dims.
-+/// Returns an empty range if `dims` is not such a layout.
-+static ArrayRef<int64_t> innermost2D(ArrayRef<int64_t> dims) {
-+  if (dims.size() < 2 ||
-+      !llvm::all_of(dims.drop_back(2), [](int64_t d) { return d == 1; }))
-+    return {};
-+  return dims.take_back(2);
-+}
-+
- bool xegpu::requirePacked(const xegpu::DistributeLayoutAttr layout) {
+@@ -777,9 +777,15 @@ bool xegpu::requirePacked(const xegpu::DistributeLayoutAttr layout) {
    if (!layout)
      return false;
--  auto laneData = layout.getEffectiveLaneDataAsInt();
+   auto laneData = layout.getEffectiveLaneDataAsInt();
 -  if (laneData.size() != 2)
--    return false;
++  // Packing (VNNI) applies to the innermost 2 dims. A >2D layout is accepted
++  // only when its leading (batch) dims are unit; packed iff lane_data[rank-2]
++  // (the second-to-last, "col") dim is not 1.
++  if (laneData.size() < 2)
+     return false;
 -  return laneData[0] != 1;
-+  SmallVector<int64_t> laneData = layout.getEffectiveLaneDataAsInt();
-+  ArrayRef<int64_t> inner = innermost2D(laneData);
-+  return !inner.empty() && inner[0] != 1;
++  for (int64_t d : ArrayRef<int64_t>(laneData).drop_back(2))
++    if (d != 1)
++      return false;
++  return laneData[laneData.size() - 2] != 1;
  }
  
  bool xegpu::requireTranspose(const xegpu::DistributeLayoutAttr layout,
-@@ -790,10 +799,10 @@ bool xegpu::requireTranspose(const xegpu::DistributeLayoutAttr layout,
-     return false;
+@@ -791,9 +797,16 @@ bool xegpu::requireTranspose(const xegpu::DistributeLayoutAttr layout,
    if (!layout)
      return false;
--  auto laneLayout = layout.getEffectiveLaneLayoutAsInt();
+   auto laneLayout = layout.getEffectiveLaneLayoutAsInt();
 -  if (laneLayout.size() != 2)
--    return false;
++  // The transpose acts on the innermost 2 dims. A >2D layout is accepted only
++  // when its leading (batch) dims are unit; the inner 2 dims must be the
++  // transposed [subgroupSize, 1] form.
++  if (laneLayout.size() < 2)
+     return false;
 -  return laneLayout[0] == uArch->getSubgroupSize() && laneLayout[1] == 1;
-+  SmallVector<int64_t> laneLayout = layout.getEffectiveLaneLayoutAsInt();
-+  ArrayRef<int64_t> inner = innermost2D(laneLayout);
-+  return !inner.empty() && inner[0] == uArch->getSubgroupSize() &&
-+         inner[1] == 1;
++  for (int64_t d : ArrayRef<int64_t>(laneLayout).drop_back(2))
++    if (d != 1)
++      return false;
++  return laneLayout[laneLayout.size() - 2] == uArch->getSubgroupSize() &&
++         laneLayout[laneLayout.size() - 1] == 1;
  }
  
  // Check if dst shape is an expansion of src shape by inserting unit dimensions.
+diff --git a/mlir/test/Conversion/VectorToXeGPU/load-to-xegpu.mlir b/mlir/test/Conversion/VectorToXeGPU/load-to-xegpu.mlir
+index c77efa03f3483..d037fd30dc3c0 100644
+--- a/mlir/test/Conversion/VectorToXeGPU/load-to-xegpu.mlir
++++ b/mlir/test/Conversion/VectorToXeGPU/load-to-xegpu.mlir
+@@ -9,18 +9,8 @@ func.func @load_1D_vector(%source: memref<8x16x32xf32>, %offset: index) -> vecto
+ // CHECK-LABEL: @load_1D_vector(
+ // CHECK-SAME:  %[[SRC:.+]]: memref<8x16x32xf32>,
+ // CHECK-SAME:  %[[OFFSET:.+]]: index
+-// CHECK:       %[[ELEM_BYTES:.+]] = arith.constant 4 : index
+-// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], %[[OFFSET]], 0]
+-// CHECK:       %[[BASE_BUFFER:.+]], %[[OFFSET1:.+]], %[[SIZES:.+]], %[[STRIDES:.+]] = memref.extract_strided_metadata %[[COLLAPSED]]
+-// CHECK-SAME:    : memref<32xf32, strided<[1], offset: ?>> -> memref<f32>, index, index, index
+-// CHECK:       %[[INTPTR:.+]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]]
+-// CHECK-SAME:    : memref<f32> -> index
+-// CHECK:       %[[MUL:.+]] = arith.muli %[[OFFSET1]], %[[ELEM_BYTES]] : index
+-// CHECK:       %[[ADD:.+]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// CHECK:       %[[I64PTR:.+]] = arith.index_cast %[[ADD]] : index to i64
+-// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [32],
+-// CHECK-SAME:                   strides : [1] : i64  -> !xegpu.tensor_desc<8xf32,
+-// CHECK-SAME:    boundary_check = false
++// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], %[[OFFSET]], 0] [1, 1, 32] [1, 1, 1] : memref<8x16x32xf32> to memref<32xf32, strided<[1], offset: ?>>
++// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<32xf32, strided<[1], offset: ?>> -> !xegpu.tensor_desc<8xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+ // CHECK:       %[[VEC:.+]] = xegpu.load_nd %[[DESC]][%[[OFFSET]]]{{.*}}-> vector<8xf32>
+ // CHECK:       return %[[VEC]]
+ 
+@@ -36,16 +26,8 @@ func.func @load_2D_vector(%source: memref<8x16x32xf32>,
+ // CHECK-LABEL: @load_2D_vector(
+ // CHECK-SAME:  %[[SRC:.+]]: memref<8x16x32xf32>,
+ // CHECK-SAME:  %[[OFFSET:.+]]: index
+-// CHECK:       %[[ELEM_BYTES:.+]] = arith.constant 4 : index
+-// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], 0, 0]
+-// CHECK:       %[[BASE_BUFFER:.*]], %[[OFF1:.*]], %[[SIZES:.*]]:2, %[[STRIDES:.*]]:2 = memref.extract_strided_metadata %[[COLLAPSED]]
+-// CHECK:       %[[INTPTR:.*]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]]
+-// CHECK-SAME:    : memref<f32> -> index
+-// CHECK:       %[[MUL:.+]] = arith.muli %[[OFF1]], %[[ELEM_BYTES]] : index
+-// CHECK:       %[[ADD:.+]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// CHECK:       %[[I64PTR:.+]] = arith.index_cast %[[ADD]] : index to i64
+-// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [16, 32],
+-// CHECK-SAME:                   strides : [32, 1] : i64 -> !xegpu.tensor_desc<8x16xf32>
++// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], 0, 0] [1, 16, 32] [1, 1, 1] : memref<8x16x32xf32> to memref<16x32xf32, strided<[32, 1], offset: ?>>
++// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<16x32xf32, strided<[32, 1], offset: ?>> -> !xegpu.tensor_desc<8x16xf32>
+ // CHECK:       %[[VEC:.+]] = xegpu.load_nd %[[DESC]][%[[OFFSET]], %[[OFFSET]]]{{.*}}-> vector<8x16xf32>
+ // CHECK:       return %[[VEC]]
+ 
+@@ -61,15 +43,9 @@ func.func @load_dynamic_source(%source: memref<?x?x?xf32>,
+ // CHECK-LABEL: @load_dynamic_source(
+ // CHECK-SAME:  %[[SRC:.+]]: memref<?x?x?xf32>,
+ // CHECK-SAME:  %[[OFF0:.+]]: index, %[[OFF1:.+]]: index, %[[OFF2:.+]]: index
+-// CHECK:       %[[ELEM_BYTES:.+]] = arith.constant 4 : index
+-// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0]
+-// CHECK:       %[[BASE_BUFFER:.*]], %[[OFFSET:.*]], %[[SIZES:.+]]:2, %[[STRIDES:.+]]:2 = memref.extract_strided_metadata %[[COLLAPSED]]
+-// CHECK:       %[[INTPTR:.+]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]] : memref<f32> -> index
+-// CHECK:       %[[MUL:.+]] = arith.muli %[[OFFSET]], %[[ELEM_BYTES]] : index
+-// CHECK:       %[[ADD:.+]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// CHECK:       %[[I64PTR:.+]] = arith.index_cast %[[ADD]] : index to i64
+-// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [%[[SIZES]]#0, %[[SIZES]]#1],
+-// CHECK-SAME:                   strides : [%[[STRIDES]]#0, 1] : i64 -> !xegpu.tensor_desc<8x16xf32>
++// CHECK:       %{{.*}}, %{{.*}}, %[[SIZES:.+]]:3, %{{.+}}:3 = memref.extract_strided_metadata %[[SRC]]
++// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0] [1, %[[SIZES]]#1, %[[SIZES]]#2] [1, 1, 1] : memref<?x?x?xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
++// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<?x?xf32, strided<[?, 1], offset: ?>> -> !xegpu.tensor_desc<8x16xf32>
+ // CHECK:       %[[VEC:.+]] = xegpu.load_nd %[[DESC]][%[[OFF1]], %[[OFF2]]]{{.*}}-> vector<8x16xf32>
+ // CHECK:       return %[[VEC]]
+ 
+diff --git a/mlir/test/Conversion/VectorToXeGPU/store-to-xegpu.mlir b/mlir/test/Conversion/VectorToXeGPU/store-to-xegpu.mlir
+index 8ff2e6ee7d13c..dc9cabe0dbb18 100644
+--- a/mlir/test/Conversion/VectorToXeGPU/store-to-xegpu.mlir
++++ b/mlir/test/Conversion/VectorToXeGPU/store-to-xegpu.mlir
+@@ -11,18 +11,8 @@ func.func @store_1D_vector(%vec: vector<8xf32>,
+ // CHECK-SAME:  %[[VEC:.+]]: vector<8xf32>,
+ // CHECK-SAME:  %[[SRC:.+]]: memref<8x16x32xf32>,
+ // CHECK-SAME:  %[[OFFSET:.+]]: index
+-// CHECK:       %[[ELEM_BYTES:.*]] = arith.constant 4 : index
+-// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], %[[OFFSET]], 0]
+-// CHECK:       %[[BASE_BUFFER:.+]], %[[OFFSET1:.+]], %[[SIZES:.+]], %[[STRIDES:.+]] = memref.extract_strided_metadata %[[COLLAPSED]]
+-// CHECK-SAME:    : memref<32xf32, strided<[1], offset: ?>> -> memref<f32>, index, index, index
+-// CHECK:       %[[INTPTR:.+]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]]
+-// CHECK-SAME:    : memref<f32> -> index
+-// CHECK:       %[[MUL:.+]] = arith.muli %[[OFFSET1]], %[[ELEM_BYTES]] : index
+-// CHECK:       %[[ADD:.+]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// CHECK:       %[[I64PTR:.+]] = arith.index_cast %[[ADD]] : index to i64
+-// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [32],
+-// CHECK-SAME:                   strides : [1] : i64  -> !xegpu.tensor_desc<8xf32,
+-// CHECK-SAME:    boundary_check = false
++// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], %[[OFFSET]], 0] [1, 1, 32] [1, 1, 1] : memref<8x16x32xf32> to memref<32xf32, strided<[1], offset: ?>>
++// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<32xf32, strided<[1], offset: ?>> -> !xegpu.tensor_desc<8xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+ // CHECK:       xegpu.store_nd %[[VEC]], %[[DESC]][%[[OFFSET]]] : vector<8xf32>
+ 
+ // -----
+@@ -38,16 +28,8 @@ func.func @store_2D_vector(%vec: vector<8x16xf32>,
+ // CHECK-SAME:  %[[VEC:.+]]: vector<8x16xf32>,
+ // CHECK-SAME:  %[[SRC:.+]]: memref<8x16x32xf32>,
+ // CHECK-SAME:  %[[OFFSET:.+]]: index
+-// CHECK:       %[[ELEM_BYTES:.*]] = arith.constant 4 : index
+-// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], 0, 0]
+-// CHECK:       %[[BASE_BUFFER:.*]], %[[OFF1:.*]], %[[SIZES:.*]]:2, %[[STRIDES:.*]]:2 = memref.extract_strided_metadata %[[COLLAPSED]]
+-// CHECK:       %[[INTPTR:.*]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]]
+-// CHECK-SAME:    : memref<f32> -> index
+-// CHECK:       %[[MUL:.+]] = arith.muli %[[OFF1]], %[[ELEM_BYTES]] : index
+-// CHECK:       %[[ADD:.+]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// CHECK:       %[[I64PTR:.+]] = arith.index_cast %[[ADD]] : index to i64
+-// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [16, 32],
+-// CHECK-SAME:                   strides : [32, 1] : i64 -> !xegpu.tensor_desc<8x16xf32>
++// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], 0, 0] [1, 16, 32] [1, 1, 1] : memref<8x16x32xf32> to memref<16x32xf32, strided<[32, 1], offset: ?>>
++// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<16x32xf32, strided<[32, 1], offset: ?>> -> !xegpu.tensor_desc<8x16xf32>
+ // CHECK:       xegpu.store_nd %[[VEC]], %[[DESC]][%[[OFFSET]], %[[OFFSET]]] : vector<8x16xf32>
+ 
+ // -----
+@@ -63,15 +45,9 @@ func.func @store_dynamic_source(%vec: vector<8x16xf32>,
+ // CHECK-SAME:  %[[VEC:.+]]: vector<8x16xf32>,
+ // CHECK-SAME:  %[[SRC:.+]]: memref<?x?x?xf32>,
+ // CHECK-SAME:  %[[OFF0:.+]]: index, %[[OFF1:.+]]: index, %[[OFF2:.+]]: index
+-// CHECK:       %[[ELEM_BYTES:.*]] = arith.constant 4 : index
+-// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0]
+-// CHECK:       %[[BASE_BUFFER:.*]], %[[OFFSET:.*]], %[[SIZES:.+]]:2, %[[STRIDES:.+]]:2 = memref.extract_strided_metadata %[[COLLAPSED]]
+-// CHECK:       %[[INTPTR:.+]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]] : memref<f32> -> index
+-// CHECK:       %[[MUL:.+]] = arith.muli %[[OFFSET]], %[[ELEM_BYTES]] : index
+-// CHECK:       %[[ADD:.+]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// CHECK:       %[[I64PTR:.+]] = arith.index_cast %[[ADD]] : index to i64
+-// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [%[[SIZES]]#0, %[[SIZES]]#1],
+-// CHECK-SAME:                   strides : [%[[STRIDES]]#0, 1] : i64 -> !xegpu.tensor
++// CHECK:       %{{.*}}, %{{.*}}, %[[SIZES:.+]]:3, %{{.+}}:3 = memref.extract_strided_metadata %[[SRC]]
++// CHECK:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0] [1, %[[SIZES]]#1, %[[SIZES]]#2] [1, 1, 1] : memref<?x?x?xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
++// CHECK:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<?x?xf32, strided<[?, 1], offset: ?>> -> !xegpu.tensor_desc<8x16xf32>
+ // CHECK:       xegpu.store_nd %[[VEC]], %[[DESC]][%[[OFF1]], %[[OFF2]]] : vector<8x16xf32>
+ 
+ // -----
+diff --git a/mlir/test/Conversion/VectorToXeGPU/transfer-read-to-xegpu.mlir b/mlir/test/Conversion/VectorToXeGPU/transfer-read-to-xegpu.mlir
+index 4cc4a0db5b63c..b252c2a7a5cde 100644
+--- a/mlir/test/Conversion/VectorToXeGPU/transfer-read-to-xegpu.mlir
++++ b/mlir/test/Conversion/VectorToXeGPU/transfer-read-to-xegpu.mlir
+@@ -35,17 +35,8 @@ gpu.func @load_2D_vector(%source: memref<8x16x32xf32>,
+ // LOAD-ND-LABEL:  @load_2D_vector(
+ // LOAD-ND-SAME:   %[[SRC:.+]]: memref<8x16x32xf32>,
+ // LOAD-ND-SAME:   %[[OFFSET:.+]]: index
+-// LOAD-ND:        %[[ELEM_BYTES:.+]] = arith.constant 4 : index
+-// LOAD-ND:        %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], 0, 0]
+-// LOAD-ND:        %[[BASE_BUFFER:.*]], %[[OFF1:.*]], %[[SIZES:.*]]:2, %[[STRIDES:.*]]:2 = memref.extract_strided_metadata %[[COLLAPSED]]
+-// LOAD-ND:        %[[INTPTR:.*]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]]
+-// LOAD-ND-SAME:     : memref<f32> -> index
+-// LOAD-ND:        %[[MUL:.*]] = arith.muli %[[OFF1]], %[[ELEM_BYTES]] : index
+-// LOAD-ND:        %[[ADD:.*]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// LOAD-ND:        %[[I64PTR:.*]] = arith.index_cast %[[ADD]] : index to i64
+-// LOAD-ND:        %[[DESC:.+]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [16, 32],
+-// LOAD-ND-SAME:                   strides : [32, 1] : i64 -> !xegpu.tensor_desc<8x16xf32,
+-// LOAD-ND-SAME:     boundary_check = false
++// LOAD-ND:        %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], 0, 0] [1, 16, 32] [1, 1, 1] : memref<8x16x32xf32> to memref<16x32xf32, strided<[32, 1], offset: ?>>
++// LOAD-ND:        %[[DESC:.+]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<16x32xf32, strided<[32, 1], offset: ?>> -> !xegpu.tensor_desc<8x16xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+ // LOAD-ND:        %[[VEC:.+]] = xegpu.load_nd %[[DESC]][%[[OFFSET]], %[[OFFSET]]]{{.*}}-> vector<8x16xf32>
+ // LOAD-ND:        return %[[VEC]]
+ 
+@@ -137,17 +128,8 @@ gpu.func @load_transpose_3d_memref(%source: memref<32x64x128xf32>,
+ // LOAD-ND-LABEL:  @load_transpose_3d_memref(
+ // LOAD-ND-SAME:   %[[SRC:.+]]: memref<32x64x128xf32>,
+ // LOAD-ND-SAME:   %[[OFF0:.+]]: index, %[[OFF1:.+]]: index, %[[OFF2:.+]]: index) -> vector<8x16xf32> {
+-// LOAD-ND:        %[[ELEM_BYTES:.+]] = arith.constant 4 : index
+-// LOAD-ND:        %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0]
+-// LOAD-ND:        %[[BASE_BUFFER:.*]], %[[OFFSET:.*]], %[[SIZES:.*]]:2, %[[STRIDES:.*]]:2 = memref.extract_strided_metadata %[[COLLAPSED]]
+-// LOAD-ND:        %[[INTPTR:.*]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]]
+-// LOAD-ND-SAME:     : memref<f32> -> index
+-// LOAD-ND:        %[[MUL:.*]] = arith.muli %[[OFFSET]], %[[ELEM_BYTES]] : index
+-// LOAD-ND:        %[[ADD:.*]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// LOAD-ND:        %[[I64PTR:.*]] = arith.index_cast %[[ADD]] : index to i64
+-// LOAD-ND:        %[[DESC:.+]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [64, 128],
+-// LOAD-ND-SAME:                   strides : [128, 1] : i64 -> !xegpu.tensor_desc<16x8xf32,
+-// LOAD-ND-SAME:     #xegpu.block_tdesc_attr<boundary_check = false>>
++// LOAD-ND:        %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0] [1, 64, 128] [1, 1, 1] : memref<32x64x128xf32> to memref<64x128xf32, strided<[128, 1], offset: ?>>
++// LOAD-ND:        %[[DESC:.+]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<64x128xf32, strided<[128, 1], offset: ?>> -> !xegpu.tensor_desc<16x8xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+ // LOAD-ND:        %[[VEC:.+]] = xegpu.load_nd %[[DESC]][%[[OFF1]], %[[OFF2]]]
+ // LOAD-ND-SAME:     : !xegpu.tensor_desc<16x8xf32, #xegpu.block_tdesc_attr<boundary_check = false>> -> vector<16x8xf32>
+ // LOAD-ND:        %[[VEC_TRANSPOSED:.+]] = vector.transpose %[[VEC]], [1, 0] : vector<16x8xf32> to vector<8x16xf32>
+@@ -201,16 +183,9 @@ gpu.func @load_dynamic_source(%source: memref<?x?x?xf32>,
+ // LOAD-ND-LABEL:  @load_dynamic_source(
+ // LOAD-ND-SAME:   %[[SRC:.+]]: memref<?x?x?xf32>,
+ // LOAD-ND-SAME:   %[[OFF0:.+]]: index, %[[OFF1:.+]]: index, %[[OFF2:.+]]: index
+-// LOAD-ND:        %[[ELEM_BYTES:.+]] = arith.constant 4 : index
+-// LOAD-ND:        %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0]
+-// LOAD-ND:        %[[BASE_BUFFER:.*]], %[[OFFSET:.*]], %[[SIZES:.+]]:2, %[[STRIDES:.+]]:2 = memref.extract_strided_metadata %[[COLLAPSED]]
+-// LOAD-ND:        %[[INTPTR:.*]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]] : memref<f32> -> index
+-// LOAD-ND:        %[[MUL:.*]] = arith.muli %[[OFFSET]], %[[ELEM_BYTES]] : index
+-// LOAD-ND:        %[[ADD:.*]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// LOAD-ND:        %[[I64PTR:.*]] = arith.index_cast %[[ADD]] : index to i64
+-// LOAD-ND:        %[[DESC:.+]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [%[[SIZES]]#0, %[[SIZES]]#1],
+-// LOAD-ND-SAME:                    strides : [%[[STRIDES]]#0, 1] : i64 -> !xegpu.tensor_desc<8x16xf32,
+-// LOAD-ND-SAME:                      #xegpu.block_tdesc_attr<boundary_check = false>>
++// LOAD-ND:        %{{.+}}, %{{.+}}, %[[SIZES:.+]]:3, %{{.+}}:3 = memref.extract_strided_metadata %[[SRC]]
++// LOAD-ND:        %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0] [1, %[[SIZES]]#1, %[[SIZES]]#2] [1, 1, 1] : memref<?x?x?xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
++// LOAD-ND:        %[[DESC:.+]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<?x?xf32, strided<[?, 1], offset: ?>> -> !xegpu.tensor_desc<8x16xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+ // LOAD-ND:        %[[VEC:.+]] = xegpu.load_nd %[[DESC]][%[[OFF1]], %[[OFF2]]]{{.*}}-> vector<8x16xf32>
+ // LOAD-ND:        return %[[VEC]]
+ 
+@@ -244,15 +219,8 @@ gpu.func @load_dynamic_source2(%source: memref<?x8x16xf32>,
+ // LOAD-ND-LABEL:  @load_dynamic_source2(
+ // LOAD-ND-SAME:   %[[SRC:.+]]: memref<?x8x16xf32>,
+ // LOAD-ND-SAME:   %[[OFF0:.+]]: index, %[[OFF1:.+]]: index, %[[OFF2:.+]]: index
+-// LOAD-ND:        %[[ELEM_BYTES:.+]] = arith.constant 4 : index
+-// LOAD-ND:        %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0]
+-// LOAD-ND:        %[[BASE_BUFFER:.*]], %[[OFFSET:.*]], %[[SIZES:.*]]:2, %[[STRIDES:.*]]:2 = memref.extract_strided_metadata %[[COLLAPSED]]
+-// LOAD-ND:        %[[INTPTR:.*]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]]
+-// LOAD-ND:        %[[MUL:.*]] = arith.muli %[[OFFSET]], %[[ELEM_BYTES]] : index
+-// LOAD-ND:        %[[ADD:.*]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// LOAD-ND:        %[[I64PTR:.*]] = arith.index_cast %[[ADD]] : index to i64
+-// LOAD-ND:        %[[DESC:.*]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [8, 16], strides : [16, 1] :
+-// LOAD-ND-SAME:                    i64 -> !xegpu.tensor_desc<8x16xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
++// LOAD-ND:        %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0] [1, 8, 16] [1, 1, 1] : memref<?x8x16xf32> to memref<8x16xf32, strided<[16, 1], offset: ?>>
++// LOAD-ND:        %[[DESC:.*]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<8x16xf32, strided<[16, 1], offset: ?>> -> !xegpu.tensor_desc<8x16xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+ // LOAD-ND:        %[[VEC:.+]] = xegpu.load_nd %[[DESC]][%{{.*}}, %{{.*}}] : !xegpu.tensor_desc<8x16xf32, #xegpu.block_tdesc_attr<boundary_check = false>> -> vector<8x16xf32>
+ // LOAD-ND:        return %[[VEC]] : vector<8x16xf32>
+ 
+@@ -283,8 +251,8 @@ gpu.func @load_dynamic_source3(%source: memref<?x?x?x?x?xf32>,
+ // LOAD-ND-LABEL:  @load_dynamic_source3(
+ // LOAD-ND-SAME:   %[[SRC:.+]]: memref<?x?x?x?x?xf32>
+ // LOAD-ND:        %[[SUBVIEW:.+]] = memref.subview %[[SRC]]
+-// LOAD-ND:        %[[BASE_BUFFER:.*]], %[[OFF1:.*]], %[[SIZES:.*]]:4, %[[STRIDES:.*]]:4 = memref.extract_strided_metadata %[[SUBVIEW]]
+-// LOAD-ND:        %[[DESC:.+]] = xegpu.create_nd_tdesc
++// LOAD-ND-SAME:     to memref<?x?x?x?xf32, strided<[?, ?, ?, 1], offset: ?>>
++// LOAD-ND:        %[[DESC:.+]] = xegpu.create_nd_tdesc %[[SUBVIEW]]
+ // LOAD-ND-SAME:     -> !xegpu.tensor_desc<2x4x8x16xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+ // LOAD-ND:        %[[VEC:.+]] = xegpu.load_nd %[[DESC]]
+ // LOAD-ND-SAME:     -> vector<2x4x8x16xf32>
+@@ -530,15 +498,8 @@ gpu.func @load_from_subview_2D(%source: memref<4096x4096xf16>, %off1: index, %of
+ // LOAD-ND-LABEL:  @load_from_subview_2D(
+ // LOAD-ND-SAME:   %[[SRC:.+]]: memref<4096x4096xf16>,
+ // LOAD-ND-SAME:   %[[OFF1:.+]]: index, %[[OFF2:.+]]: index
+-// LOAD-ND:        %[[ELEM_BYTES:.+]] = arith.constant 2 : index
+ // LOAD-ND:        %[[SUBVIEW:.+]] = memref.subview %[[SRC]][%[[OFF1]], %[[OFF2]]] [256, 256] [1, 1] : memref<4096x4096xf16> to memref<256x256xf16, strided<[4096, 1], offset: ?>>
+-// LOAD-ND:        %[[BASE_BUFFER:.*]], %[[OFFSET:.*]], %[[SIZES:.*]]:2, %[[STRIDES:.*]]:2 = memref.extract_strided_metadata %[[SUBVIEW]]
+-// LOAD-ND:        %[[INTPTR:.*]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]]
+-// LOAD-ND:        %[[MUL:.*]] = arith.muli %[[OFFSET]], %[[ELEM_BYTES]] : index
+-// LOAD-ND:        %[[ADD:.*]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// LOAD-ND:        %[[I64PTR:.*]] = arith.index_cast %[[ADD]] : index to i64
+-// LOAD-ND:        %[[DESC:.*]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [256, 256], strides : [4096, 1] :
+-// LOAD-ND-SAME:                    i64 -> !xegpu.tensor_desc<8x16xf16, #xegpu.block_tdesc_attr<boundary_check = false>>
++// LOAD-ND:        %[[DESC:.*]] = xegpu.create_nd_tdesc %[[SUBVIEW]] : memref<256x256xf16, strided<[4096, 1], offset: ?>> -> !xegpu.tensor_desc<8x16xf16, #xegpu.block_tdesc_attr<boundary_check = false>>
+ // LOAD-ND:        %[[VEC:.+]] = xegpu.load_nd %[[DESC]][%[[OFF2]], %[[OFF2]]]{{.*}}-> vector<8x16xf16>
+ // LOAD-ND:        return %[[VEC]]
+ 
+diff --git a/mlir/test/Conversion/VectorToXeGPU/transfer-write-to-xegpu.mlir b/mlir/test/Conversion/VectorToXeGPU/transfer-write-to-xegpu.mlir
+index dad2740f5c0ea..e262bbdc4073c 100644
+--- a/mlir/test/Conversion/VectorToXeGPU/transfer-write-to-xegpu.mlir
++++ b/mlir/test/Conversion/VectorToXeGPU/transfer-write-to-xegpu.mlir
+@@ -38,17 +38,8 @@ gpu.func @store_2D_vector(%vec: vector<8x16xf32>,
+ // STORE-ND-SAME:  %[[VEC:.+]]: vector<8x16xf32>,
+ // STORE-ND-SAME:  %[[SRC:.+]]: memref<8x16x32xf32>,
+ // STORE-ND-SAME:  %[[OFFSET:.+]]: index
+-// STORE-ND:       %[[ELEM_BYTES:.+]] = arith.constant 4 : index
+-// STORE-ND:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], 0, 0]
+-// STORE-ND:       %[[BASE_BUFFER:.*]], %[[OFF1:.*]], %[[SIZES:.*]]:2, %[[STRIDES:.*]]:2 = memref.extract_strided_metadata %[[COLLAPSED]]
+-// STORE-ND:       %[[INTPTR:.*]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]]
+-// STORE-ND-SAME:    : memref<f32> -> index
+-// STORE-ND:       %[[MUL:.+]] = arith.muli %[[OFF1]], %[[ELEM_BYTES]] : index
+-// STORE-ND:       %[[ADD:.+]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// STORE-ND:       %[[I64PTR:.*]] = arith.index_cast %[[ADD]] : index to i64
+-// STORE-ND:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [16, 32],
+-// STORE-ND-SAME:                   strides : [32, 1] : i64 -> !xegpu.tensor_desc<8x16xf32,
+-// STORE-ND-SAME:    boundary_check = false
++// STORE-ND:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFFSET]], 0, 0] [1, 16, 32] [1, 1, 1] : memref<8x16x32xf32> to memref<16x32xf32, strided<[32, 1], offset: ?>>
++// STORE-ND:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<16x32xf32, strided<[32, 1], offset: ?>> -> !xegpu.tensor_desc<8x16xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+ // STORE-ND:       xegpu.store_nd %[[VEC]], %[[DESC]][%[[OFFSET]], %[[OFFSET]]] : vector<8x16xf32>
+ 
+ // STORE-SCATTER-LABEL:  @store_2D_vector(
+@@ -80,15 +71,9 @@ gpu.func @store_dynamic_source(%vec: vector<8x16xf32>,
+ // STORE-ND-SAME:  %[[VEC:.+]]: vector<8x16xf32>,
+ // STORE-ND-SAME:  %[[SRC:.+]]: memref<?x?x?xf32>,
+ // STORE-ND-SAME:  %[[OFF0:.+]]: index, %[[OFF1:.+]]: index, %[[OFF2:.+]]: index
+-// STORE-ND:       %[[ELEM_BYTES:.+]] = arith.constant 4 : index
+-// STORE-ND:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0]
+-// STORE-ND:       %[[BASE_BUFFER:.*]], %[[OFFSET:.*]], %[[SIZES:.+]]:2, %[[STRIDES:.+]]:2 = memref.extract_strided_metadata %[[COLLAPSED]]
+-// STORE-ND:       %[[INTPTR:.+]] = memref.extract_aligned_pointer_as_index %[[BASE_BUFFER]] : memref<f32> -> index
+-// STORE-ND:       %[[MUL:.+]] = arith.muli %[[OFFSET]], %[[ELEM_BYTES]] : index
+-// STORE-ND:       %[[ADD:.+]] = arith.addi %[[INTPTR]], %[[MUL]] : index
+-// STORE-ND:       %[[I64PTR:.*]] = arith.index_cast %[[ADD]] : index to i64
+-// STORE-ND:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[I64PTR]], shape : [%[[SIZES]]#0, %[[SIZES]]#1],
+-// STORE-ND-SAME:                   strides : [%[[STRIDES]]#0, 1] : i64 -> !xegpu.tensor
++// STORE-ND:       %{{.*}}, %{{.*}}, %[[SIZES:.+]]:3, %{{.+}}:3 = memref.extract_strided_metadata %[[SRC]]
++// STORE-ND:       %[[COLLAPSED:.+]] = memref.subview %[[SRC]][%[[OFF0]], 0, 0] [1, %[[SIZES]]#1, %[[SIZES]]#2] [1, 1, 1] : memref<?x?x?xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
++// STORE-ND:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[COLLAPSED]] : memref<?x?xf32, strided<[?, 1], offset: ?>> -> !xegpu.tensor_desc<8x16xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+ // STORE-ND:       xegpu.store_nd %[[VEC]], %[[DESC]][%[[OFF1]], %[[OFF2]]] : vector<8x16xf32>
+ 
+ // STORE-SCATTER-LABEL: @store_dynamic_source(
+diff --git a/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc.mlir b/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc.mlir
+index 34654126ce8d2..78c9919aebb6c 100644
+--- a/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc.mlir
++++ b/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc.mlir
+@@ -44,23 +44,20 @@ gpu.module @create_nd_tdesc {
+         // CHECK: %[[VAR19:.*]] = vector.insert %[[PITCH2]], %[[VAR18]] [4] : i32 into vector<8xi32>
+         %src_tdesc = xegpu.create_nd_tdesc %srcce : memref<16x32xf32> -> !xegpu.tensor_desc<8x16xf32>
+ 
+-        // CHECK: %[[C1:.*]] = arith.constant 1 : index
+-        %c1 = arith.constant 1 : index
+-        // CHECK: %[[C64:.*]] = arith.constant 64 : index
+-        %size_x = arith.constant 64 : index
+-        // CHECK: %[[C16:.*]] = arith.constant 16 : index
+-        %BLOCK_DMODEL = arith.constant 16 : index
++        // A dynamic memref uses the bare form: its shape/strides are recovered
++        // from the memref via extract_strided_metadata (no explicit operands).
+         // CHECK: %[[CST_3:.*]] = arith.constant dense<0> : vector<8xi32>
+-        // CHECK: %[[SHAPE_W3:.*]] = arith.index_cast %[[C16]] : index to i32
+-        // CHECK: %[[SHAPE_H3:.*]] = arith.index_cast %[[C64]] : index to i32
+-        // CHECK: %[[PITCH3:.*]] = arith.index_cast %[[C16]] : index to i32
++        // CHECK: %{{.*}}, %{{.*}}, %[[SIZES:.*]]:2, %[[STRIDES:.*]]:2 = memref.extract_strided_metadata %[[DYN]] : memref<?x?xf16>
++        // CHECK: %[[SHAPE_W3:.*]] = arith.index_cast %[[SIZES]]#1 : index to i32
++        // CHECK: %[[SHAPE_H3:.*]] = arith.index_cast %[[SIZES]]#0 : index to i32
++        // CHECK: %[[PITCH3:.*]] = arith.index_cast %[[STRIDES]]#0 : index to i32
+         // CHECK: %[[VAR25:.*]] = vector.bitcast %[[CST_3]] : vector<8xi32> to vector<4xi64>
+-        // CHECK: %[[VAR26:.*]] = vector.insert %[[DYN_ADDR_OFFSET:.*]], %[[VAR25]] [0] : i64 into vector<4xi64>
++        // CHECK: %[[VAR26:.*]] = vector.insert %{{.*}}, %[[VAR25]] [0] : i64 into vector<4xi64>
+         // CHECK: %[[VAR27:.*]] = vector.bitcast %[[VAR26]] : vector<4xi64> to vector<8xi32>
+         // CHECK: %[[VAR28:.*]] = vector.insert %[[SHAPE_W3]], %[[VAR27]] [2] : i32 into vector<8xi32>
+         // CHECK: %[[VAR29:.*]] = vector.insert %[[SHAPE_H3]], %[[VAR28]] [3] : i32 into vector<8xi32>
+         // CHECK: %[[VAR30:.*]] = vector.insert %[[PITCH3]], %[[VAR29]] [4] : i32 into vector<8xi32>
+-        %dyn_tdesc  = xegpu.create_nd_tdesc %dyn, shape: [%size_x, %BLOCK_DMODEL], strides: [%BLOCK_DMODEL, %c1] : memref<?x?xf16> -> !xegpu.tensor_desc<16x16xf16>
++        %dyn_tdesc  = xegpu.create_nd_tdesc %dyn : memref<?x?xf16> -> !xegpu.tensor_desc<16x16xf16>
+         gpu.return
+     }
+ }
+diff --git a/mlir/test/Dialect/XeGPU/array-len-op-unit.mlir b/mlir/test/Dialect/XeGPU/array-len-op-unit.mlir
+index 340a10a99cb88..8397b956fd165 100644
+--- a/mlir/test/Dialect/XeGPU/array-len-op-unit.mlir
++++ b/mlir/test/Dialect/XeGPU/array-len-op-unit.mlir
+@@ -201,11 +201,10 @@ gpu.module @test {
+ // CHECK-SAME:    (%[[ARG0:.*]]: memref<?x?xf16>, %[[H:.*]]: index, %[[W:.*]]: index)
+ func.func @test_dynamic_memref_source(%arg0: memref<?x?xf16>, %h: index, %w: index) -> vector<16x16xf16> {
+   %c0 = arith.constant 0 : index
+-  %c1 = arith.constant 1 : index
+ 
+-  // CHECK: %[[TDESC:.*]] = xegpu.create_nd_tdesc %[[ARG0]], shape : [%[[H]], %[[W]]], strides : [%[[W]], %{{.*}}]
+-  // CHECK-SAME: memref<?x?xf16> -> !xegpu.tensor_desc<32x16xf16, #xegpu.block_tdesc_attr<array_length = 2 : i64>>
+-  %tdesc = xegpu.create_nd_tdesc %arg0, shape : [%h, %w], strides : [%w, %c1] : memref<?x?xf16> -> !xegpu.tensor_desc<32x32xf16>
++  // A dynamic memref uses the bare form; its shape/strides come from the memref.
++  // CHECK: %[[TDESC:.*]] = xegpu.create_nd_tdesc %[[ARG0]] : memref<?x?xf16> -> !xegpu.tensor_desc<32x16xf16, #xegpu.block_tdesc_attr<array_length = 2 : i64>>
++  %tdesc = xegpu.create_nd_tdesc %arg0 : memref<?x?xf16> -> !xegpu.tensor_desc<32x32xf16>
+ 
+   // CHECK: %[[LOAD:.*]] = xegpu.load_nd %[[TDESC]][%{{.*}}, %{{.*}}]
+   // CHECK-SAME: -> vector<64x16xf16>
+diff --git a/mlir/test/Dialect/XeGPU/ops.mlir b/mlir/test/Dialect/XeGPU/ops.mlir
+index f733491bfb7ee..38f7f09cfc3d6 100644
+--- a/mlir/test/Dialect/XeGPU/ops.mlir
++++ b/mlir/test/Dialect/XeGPU/ops.mlir
+@@ -81,19 +81,18 @@ gpu.func @test_create_nd_tdesc_8(%src: ui64, %w : index, %h : index, %x : index,
+ // CHECK-LABEL: func @test_create_nd_tdesc_9({{.*}})
+ 
+ gpu.func @test_create_nd_tdesc_9(%src: memref<?x?xf16>, %w : index, %h : index, %x : index, %y : index) {
+-
+-  %c1 = arith.constant 1 : index
+-  // CHECK: %[[REG:.*]] = xegpu.create_nd_tdesc %arg0, shape : [%arg2, %arg1], strides : [%arg1, %c1] : memref<?x?xf16> -> !xegpu.tensor_desc<8x16xf16>
+-  %1 = xegpu.create_nd_tdesc %src , shape:[%h, %w], strides:[%w, %c1]  : memref<?x?xf16> -> !xegpu.tensor_desc<8x16xf16>
++  // A dynamic-shape memref uses the bare form; its shape/strides are inferred
++  // from the memref (explicit shape/strides for a memref source is deprecated).
++  // CHECK: %[[REG:.*]] = xegpu.create_nd_tdesc %arg0 : memref<?x?xf16> -> !xegpu.tensor_desc<8x16xf16>
++  %1 = xegpu.create_nd_tdesc %src : memref<?x?xf16> -> !xegpu.tensor_desc<8x16xf16>
+ 
+   gpu.return
+ }
+ 
+ // CHECK-LABEL: func @test_create_nd_tdesc_10({{.*}})
+ gpu.func @test_create_nd_tdesc_10(%src: memref<?x?xf16>, %w : index, %h : index, %x : index, %y : index) {
+-  %c1 = arith.constant 1 : index
+-  // CHECK: %[[REG:.*]] = xegpu.create_nd_tdesc %arg0, shape : [%arg2, %arg1], strides : [%arg1, %c1] : memref<?x?xf16> -> !xegpu.tensor_desc<8x16xf16>
+-  %2 = xegpu.create_nd_tdesc %src, shape:[%h, %w], strides:[%w, %c1]  : memref<?x?xf16> -> !xegpu.tensor_desc<8x16xf16>
++  // CHECK: %[[REG:.*]] = xegpu.create_nd_tdesc %arg0 : memref<?x?xf16> -> !xegpu.tensor_desc<8x16xf16>
++  %2 = xegpu.create_nd_tdesc %src : memref<?x?xf16> -> !xegpu.tensor_desc<8x16xf16>
+ 
+   gpu.return
+ }
+
+From 23c40e0bf03cc62b0fad7a8d9323ce48cfa0a2ee Mon Sep 17 00:00:00 2001
+From: Jianhui Li <jian.hui.li@intel.com>
+Date: Tue, 11 Aug 2026 23:52:28 +0000
+Subject: [PATCH 2/4] [mlir][xegpu] Add tests for batched nd descriptor
+ lowering + deprecation
+
+- create_nd_tdesc_batch.mlir: check that a >2D (batched) create_nd encodes the
+  innermost matrix as the 2D-block surface and the leading (batch) dim element
+  strides into the spare payload slots (slot 5..), which the load/store fold
+  reads to fold batch offsets into the base pointer.
+- invalid.mlir: check that specifying explicit shape/strides for a memref
+  source is now rejected (a memref is authoritative for its own shape/strides).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../XeGPUToXeVM/create_nd_tdesc_batch.mlir    | 29 +++++++++++++++++++
+ mlir/test/Dialect/XeGPU/invalid.mlir          | 13 +++++++++
+ 2 files changed, 42 insertions(+)
+ create mode 100644 mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc_batch.mlir
+
+diff --git a/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc_batch.mlir b/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc_batch.mlir
+new file mode 100644
+index 0000000000000..432f589060535
+--- /dev/null
++++ b/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc_batch.mlir
+@@ -0,0 +1,29 @@
++// RUN: mlir-opt -convert-xegpu-to-xevm %s | FileCheck %s
++
++// A >2D (batched) create_nd descriptor keeps the innermost matrix as the
++// 2D-block surface (base_shape_w/h and pitch come from the innermost two memref
++// dims) and encodes the leading (batch) dim element strides into the spare
++// payload slots (5..). The matching load/store lowering reads those strides to
++// fold the batch offsets into the base pointer, so the batch position stays out
++// of the surface. Here memref<4x64x128xf16> has strides [8192, 128, 1]:
++//   base_shape_w = 128 (size[2]), base_shape_h = 64 (size[1]),
++//   base_pitch   = 128 (stride[1]),  leading stride slot 5 = 8192 (stride[0]).
++gpu.module @create_nd_batch {
++  // CHECK-LABEL: gpu.func @create_nd_3d
++  gpu.func @create_nd_3d(%src: memref<4x64x128xf16>) -> vector<8xi32> {
++    // CHECK: %[[W:.+]] = arith.trunci %{{.*}} : i64 to i32
++    // CHECK: %[[H:.+]] = arith.trunci %{{.*}} : i64 to i32
++    // CHECK: %[[PITCH:.+]] = arith.trunci %{{.*}} : i64 to i32
++    // CHECK: %[[P0:.+]] = vector.insert %{{.*}}, %{{.*}} [0] : i64 into vector<4xi64>
++    // CHECK: %[[P1:.+]] = vector.bitcast %[[P0]] : vector<4xi64> to vector<8xi32>
++    // CHECK: %[[P2:.+]] = vector.insert %[[W]], %[[P1]] [2] : i32 into vector<8xi32>
++    // CHECK: %[[P3:.+]] = vector.insert %[[H]], %[[P2]] [3] : i32 into vector<8xi32>
++    // CHECK: %[[P4:.+]] = vector.insert %[[PITCH]], %[[P3]] [4] : i32 into vector<8xi32>
++    // CHECK: %[[C8192:.+]] = arith.constant 8192 : i64
++    // CHECK: %[[LS0:.+]] = arith.trunci %[[C8192]] : i64 to i32
++    // CHECK: %{{.+}} = vector.insert %[[LS0]], %[[P4]] [5] : i32 into vector<8xi32>
++    %t = xegpu.create_nd_tdesc %src : memref<4x64x128xf16> -> !xegpu.tensor_desc<1x8x16xf16>
++    %c = builtin.unrealized_conversion_cast %t : !xegpu.tensor_desc<1x8x16xf16> to vector<8xi32>
++    gpu.return %c : vector<8xi32>
++  }
++}
+diff --git a/mlir/test/Dialect/XeGPU/invalid.mlir b/mlir/test/Dialect/XeGPU/invalid.mlir
+index dc68f5136b4a9..c8b39e43ef0c3 100644
+--- a/mlir/test/Dialect/XeGPU/invalid.mlir
++++ b/mlir/test/Dialect/XeGPU/invalid.mlir
+@@ -9,6 +9,19 @@ func.func @create_nd_tdesc_1(%src: memref<24xf32>) {
+ 
+ // -----
+ 
++// A memref source is authoritative for its own shape/strides, so specifying
++// them explicitly is deprecated and rejected. Use the bare form instead.
++func.func @create_nd_tdesc_memref_explicit_shape(%src: memref<?x?xf16>,
++    %h: index, %w: index) {
++  %c1 = arith.constant 1 : index
++  // expected-error@+1 {{shape and strides should not be specified for a memref source}}
++  %1 = xegpu.create_nd_tdesc %src, shape: [%h, %w], strides: [%w, %c1]
++    : memref<?x?xf16> -> !xegpu.tensor_desc<8x16xf16>
++  return
++}
++
++// -----
++
+ func.func @create_nd_tdesc_2(%src: memref<24x32xf32>) {
+   // expected-error@+1 {{TensorDesc should have the same element type with the source if it is a memref}}
+   %1 = xegpu.create_nd_tdesc %src : memref<24x32xf32> -> !xegpu.tensor_desc<8x16xf16>
+
+From a6956cf45e3d6f24d75e6dbcaba8919b014ba51e Mon Sep 17 00:00:00 2001
+From: Jianhui Li <jian.hui.li@intel.com>
+Date: Wed, 12 Aug 2026 02:19:51 +0000
+Subject: [PATCH 3/4] [mlir][xegpu] Add lit tests for dynamic high-D nd
+ lowering
+
+Positive tests for the base-pointer-fold lowering of >2D (batched)
+create_nd_tdesc/load_nd/store_nd that keeps the full high-D memref as the
+create_nd source (no per-batch subview) and folds leading offsets into the
+base pointer. The tests are folded into the existing per-pass test files and
+use dynamic-shape sources wherever the pass allows:
+
+- VectorToXeGPU (transfer-read-to-xegpu.mlir @load_high_dim_dyn,
+  transfer-write-to-xegpu.mlir @store_high_dim_dyn): an equal-rank high-D
+  transfer on a dynamic memref keeps the whole memref as the create_nd source
+  -- no rank-collapsing subview -- on the nd path.
+- XeGPU peephole (peephole-optimize.mlir @transpose_4d): the transpose
+  optimization fires on a >2D descriptor with unit leading dims over a dynamic
+  memref, repacking the innermost 2D tile f16->i32, preserving leading dims,
+  and dividing every non-innermost stride by the pack factor (the dynamic
+  leading stride via arith.shrui).
+- SgToLaneDistribute (sg-to-lane-distribute-unit.mlir @load_nd_packed_4d /
+  @load_nd_transpose_4d): the packed (VNNI) and transpose attributes are set
+  from the innermost lane layout when leading dims are unit.
+- XeGPU unroll (xegpu-unroll-patterns.mlir @load_store_nd_3d): a 3D descriptor
+  unrolls to N full-source descriptors (no subview) with the batch index
+  carried on each load/store offset (the unrolled batch dim is static by
+  construction).
+- XeGPUToXeVM (create_nd_tdesc.mlir @create_nd_tdesc_batch_dyn,
+  loadstore_nd.mlir @load_store_batch_dyn): a batched create_nd on a dynamic
+  memref encodes the recovered leading stride into the payload, and the
+  matching load/store folds the batch offset into the base pointer while the
+  2D-block surface stays the innermost matrix.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../VectorToXeGPU/transfer-read-to-xegpu.mlir | 33 +++++++++++++
+ .../transfer-write-to-xegpu.mlir              | 30 ++++++++++++
+ .../XeGPUToXeVM/create_nd_tdesc.mlir          | 26 ++++++++++
+ .../XeGPUToXeVM/create_nd_tdesc_batch.mlir    | 29 -----------
+ .../Conversion/XeGPUToXeVM/loadstore_nd.mlir  | 48 +++++++++++++++++++
+ .../test/Dialect/XeGPU/peephole-optimize.mlir | 37 ++++++++++++++
+ .../XeGPU/sg-to-lane-distribute-unit.mlir     | 29 +++++++++++
+ .../Dialect/XeGPU/xegpu-unroll-patterns.mlir  | 34 +++++++++++++
+ 8 files changed, 237 insertions(+), 29 deletions(-)
+ delete mode 100644 mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc_batch.mlir
+
+diff --git a/mlir/test/Conversion/VectorToXeGPU/transfer-read-to-xegpu.mlir b/mlir/test/Conversion/VectorToXeGPU/transfer-read-to-xegpu.mlir
+index b252c2a7a5cde..14bec1bbaf231 100644
+--- a/mlir/test/Conversion/VectorToXeGPU/transfer-read-to-xegpu.mlir
++++ b/mlir/test/Conversion/VectorToXeGPU/transfer-read-to-xegpu.mlir
+@@ -275,6 +275,39 @@ gpu.func @load_dynamic_source3(%source: memref<?x?x?x?x?xf32>,
+ // LOAD-GATHER:        return %[[VEC]]
+ }
+ 
++// -----
++// A dynamic high-D read whose vector rank equals the memref rank keeps the
++// *whole* memref as the create_nd source on the nd path: no rank-collapsing
++// memref.subview is emitted and the leading (batch) offsets stay on the
++// load_nd (they are folded into the base pointer later, at XeVM lowering).
++gpu.module @xevm_module {
++gpu.func @load_high_dim_dyn(%source: memref<?x?x8x16xf16>,
++    %i: index, %j: index, %k: index, %l: index) -> vector<1x1x8x16xf16> {
++  %pad = arith.constant 0.0 : f16
++  %0 = vector.transfer_read %source[%i, %j, %k, %l], %pad
++    {in_bounds = [true, true, true, true]}
++    : memref<?x?x8x16xf16>, vector<1x1x8x16xf16>
++  gpu.return %0 : vector<1x1x8x16xf16>
++}
++
++// LOAD-ND-LABEL:  @load_high_dim_dyn(
++// LOAD-ND-SAME:   %[[SRC:.+]]: memref<?x?x8x16xf16>,
++// LOAD-ND-SAME:   %[[OFF0:.+]]: index, %[[OFF1:.+]]: index, %[[OFF2:.+]]: index, %[[OFF3:.+]]: index
++// LOAD-ND-NOT:    memref.subview
++// LOAD-ND:        %[[DESC:.+]] = xegpu.create_nd_tdesc %[[SRC]] : memref<?x?x8x16xf16> -> !xegpu.tensor_desc<1x1x8x16xf16, #xegpu.block_tdesc_attr<boundary_check = false>>
++// LOAD-ND:        %[[VEC:.+]] = xegpu.load_nd %[[DESC]][%[[OFF0]], %[[OFF1]], %[[OFF2]], %[[OFF3]]]{{.*}}-> vector<1x1x8x16xf16>
++// LOAD-ND:        return %[[VEC]]
++
++// LOAD-GATHER-LABEL:  @load_high_dim_dyn(
++// LOAD-GATHER-SAME:   %[[SRC:.+]]: memref<?x?x8x16xf16>
++// LOAD-GATHER:        %[[CST:.+]] = arith.constant dense<true> : vector<1x1x8x16xi1>
++// LOAD-GATHER:        memref.extract_strided_metadata %[[SRC]]
++// LOAD-GATHER:        %[[PTR:.+]] = memref.extract_aligned_pointer_as_index %[[SRC]] : memref<?x?x8x16xf16> -> index
++// LOAD-GATHER:        %[[PTR_I:.+]] = arith.index_cast %[[PTR]] : index to i64
++// LOAD-GATHER:        %[[VEC:.+]] = xegpu.load %[[PTR_I]]{{\[}}%{{.+}}{{\]}}, %[[CST]] : i64, vector<1x1x8x16xindex>, vector<1x1x8x16xi1> -> vector<1x1x8x16xf16>
++// LOAD-GATHER:        return %[[VEC]]
++}
++
+ // -----
+ gpu.module @xevm_module {
+ gpu.func @load_high_dim_vector(%source: memref<16x32x64xf32>,
+diff --git a/mlir/test/Conversion/VectorToXeGPU/transfer-write-to-xegpu.mlir b/mlir/test/Conversion/VectorToXeGPU/transfer-write-to-xegpu.mlir
+index e262bbdc4073c..71c586f0ca54d 100644
+--- a/mlir/test/Conversion/VectorToXeGPU/transfer-write-to-xegpu.mlir
++++ b/mlir/test/Conversion/VectorToXeGPU/transfer-write-to-xegpu.mlir
+@@ -91,6 +91,36 @@ gpu.func @store_dynamic_source(%vec: vector<8x16xf32>,
+ // STORE-SCATTER:       xegpu.store %[[VEC]], %[[COLLAPSE_I]]{{\[}}%[[IDX]]{{\]}}, %[[CST]] : vector<8x16xf32>, i64, vector<8x16xindex>, vector<8x16xi1>
+ }
+ 
++// -----
++// A dynamic high-D write whose vector rank equals the memref rank keeps the
++// *whole* memref as the create_nd source on the nd path: no rank-collapsing
++// memref.subview is emitted and the leading (batch) offsets stay on the
++// store_nd (they are folded into the base pointer later, at XeVM lowering).
++gpu.module @xevm_module {
++gpu.func @store_high_dim_dyn(%vec: vector<1x1x8x16xf16>, %source: memref<?x?x8x16xf16>,
++    %i: index, %j: index, %k: index, %l: index) {
++  vector.transfer_write %vec, %source[%i, %j, %k, %l]
++    {in_bounds = [true, true, true, true]}
++    : vector<1x1x8x16xf16>, memref<?x?x8x16xf16>
++  gpu.return
++}
++
++// STORE-ND-LABEL: @store_high_dim_dyn(
++// STORE-ND-SAME:  %[[VEC:.+]]: vector<1x1x8x16xf16>, %[[SRC:.+]]: memref<?x?x8x16xf16>,
++// STORE-ND-SAME:  %[[OFF0:.+]]: index, %[[OFF1:.+]]: index, %[[OFF2:.+]]: index, %[[OFF3:.+]]: index
++// STORE-ND-NOT:   memref.subview
++// STORE-ND:       %[[DESC:.+]] = xegpu.create_nd_tdesc %[[SRC]] : memref<?x?x8x16xf16> -> !xegpu.tensor_desc<1x1x8x16xf16, #xegpu.block_tdesc_attr<boundary_check = false>>
++// STORE-ND:       xegpu.store_nd %[[VEC]], %[[DESC]][%[[OFF0]], %[[OFF1]], %[[OFF2]], %[[OFF3]]] : vector<1x1x8x16xf16>
++
++// STORE-SCATTER-LABEL: @store_high_dim_dyn(
++// STORE-SCATTER-SAME:  %[[VEC:.+]]: vector<1x1x8x16xf16>, %[[SRC:.+]]: memref<?x?x8x16xf16>
++// STORE-SCATTER:       %[[CST:.+]] = arith.constant dense<true> : vector<1x1x8x16xi1>
++// STORE-SCATTER:       memref.extract_strided_metadata %[[SRC]]
++// STORE-SCATTER:       %[[PTR:.+]] = memref.extract_aligned_pointer_as_index %[[SRC]] : memref<?x?x8x16xf16> -> index
++// STORE-SCATTER:       %[[PTR_I:.+]] = arith.index_cast %[[PTR]] : index to i64
++// STORE-SCATTER:       xegpu.store %[[VEC]], %[[PTR_I]]{{\[}}%{{.+}}{{\]}}, %[[CST]] : vector<1x1x8x16xf16>, i64, vector<1x1x8x16xindex>, vector<1x1x8x16xi1>
++}
++
+ // -----
+ gpu.module @xevm_module {
+ gpu.func @store_out_of_bounds(%vec: vector<8x16xf32>,
+diff --git a/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc.mlir b/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc.mlir
+index 78c9919aebb6c..66990487d2805 100644
+--- a/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc.mlir
++++ b/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc.mlir
+@@ -60,4 +60,30 @@ gpu.module @create_nd_tdesc {
+         %dyn_tdesc  = xegpu.create_nd_tdesc %dyn : memref<?x?xf16> -> !xegpu.tensor_desc<16x16xf16>
+         gpu.return
+     }
++
++    // A >2D (batched) create_nd descriptor keeps the innermost matrix as the
++    // 2D-block surface (base_shape_w/h and pitch come from the innermost two
++    // memref dims) and encodes the leading (batch) dim element strides into the
++    // spare payload slots (5..). For a dynamic source the sizes/strides are
++    // recovered via extract_strided_metadata: base_shape_w = sizes#2,
++    // base_shape_h = sizes#1, base_pitch = strides#1, and leading stride slot 5 =
++    // strides#0. The matching load/store lowering reads those strides to fold the
++    // batch offsets into the base pointer, so the batch position stays out of the
++    // surface.
++    // CHECK-LABEL: gpu.func @create_nd_tdesc_batch_dyn(
++    // CHECK-SAME:  %[[SRC:.+]]: memref<?x?x?xf16>
++    gpu.func @create_nd_tdesc_batch_dyn(%src: memref<?x?x?xf16>) -> vector<8xi32> {
++        // CHECK: %{{.+}}, %{{.+}}, %[[SIZES:.+]]:3, %[[STRIDES:.+]]:3 = memref.extract_strided_metadata %[[SRC]]
++        // CHECK: %[[W:.+]] = arith.index_cast %[[SIZES]]#2 : index to i32
++        // CHECK: %[[H:.+]] = arith.index_cast %[[SIZES]]#1 : index to i32
++        // CHECK: %[[PITCH:.+]] = arith.index_cast %[[STRIDES]]#1 : index to i32
++        // CHECK: %[[P2:.+]] = vector.insert %[[W]], %{{.+}} [2] : i32 into vector<8xi32>
++        // CHECK: %[[P3:.+]] = vector.insert %[[H]], %[[P2]] [3] : i32 into vector<8xi32>
++        // CHECK: %[[P4:.+]] = vector.insert %[[PITCH]], %[[P3]] [4] : i32 into vector<8xi32>
++        // CHECK: %[[LS0:.+]] = arith.index_cast %[[STRIDES]]#0 : index to i32
++        // CHECK: vector.insert %[[LS0]], %[[P4]] [5] : i32 into vector<8xi32>
++        %t = xegpu.create_nd_tdesc %src : memref<?x?x?xf16> -> !xegpu.tensor_desc<1x8x16xf16>
++        %c = builtin.unrealized_conversion_cast %t : !xegpu.tensor_desc<1x8x16xf16> to vector<8xi32>
++        gpu.return %c : vector<8xi32>
++    }
+ }
+diff --git a/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc_batch.mlir b/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc_batch.mlir
+deleted file mode 100644
+index 432f589060535..0000000000000
+--- a/mlir/test/Conversion/XeGPUToXeVM/create_nd_tdesc_batch.mlir
++++ /dev/null
+@@ -1,29 +0,0 @@
+-// RUN: mlir-opt -convert-xegpu-to-xevm %s | FileCheck %s
+-
+-// A >2D (batched) create_nd descriptor keeps the innermost matrix as the
+-// 2D-block surface (base_shape_w/h and pitch come from the innermost two memref
+-// dims) and encodes the leading (batch) dim element strides into the spare
+-// payload slots (5..). The matching load/store lowering reads those strides to
+-// fold the batch offsets into the base pointer, so the batch position stays out
+-// of the surface. Here memref<4x64x128xf16> has strides [8192, 128, 1]:
+-//   base_shape_w = 128 (size[2]), base_shape_h = 64 (size[1]),
+-//   base_pitch   = 128 (stride[1]),  leading stride slot 5 = 8192 (stride[0]).
+-gpu.module @create_nd_batch {
+-  // CHECK-LABEL: gpu.func @create_nd_3d
+-  gpu.func @create_nd_3d(%src: memref<4x64x128xf16>) -> vector<8xi32> {
+-    // CHECK: %[[W:.+]] = arith.trunci %{{.*}} : i64 to i32
+-    // CHECK: %[[H:.+]] = arith.trunci %{{.*}} : i64 to i32
+-    // CHECK: %[[PITCH:.+]] = arith.trunci %{{.*}} : i64 to i32
+-    // CHECK: %[[P0:.+]] = vector.insert %{{.*}}, %{{.*}} [0] : i64 into vector<4xi64>
+-    // CHECK: %[[P1:.+]] = vector.bitcast %[[P0]] : vector<4xi64> to vector<8xi32>
+-    // CHECK: %[[P2:.+]] = vector.insert %[[W]], %[[P1]] [2] : i32 into vector<8xi32>
+-    // CHECK: %[[P3:.+]] = vector.insert %[[H]], %[[P2]] [3] : i32 into vector<8xi32>
+-    // CHECK: %[[P4:.+]] = vector.insert %[[PITCH]], %[[P3]] [4] : i32 into vector<8xi32>
+-    // CHECK: %[[C8192:.+]] = arith.constant 8192 : i64
+-    // CHECK: %[[LS0:.+]] = arith.trunci %[[C8192]] : i64 to i32
+-    // CHECK: %{{.+}} = vector.insert %[[LS0]], %[[P4]] [5] : i32 into vector<8xi32>
+-    %t = xegpu.create_nd_tdesc %src : memref<4x64x128xf16> -> !xegpu.tensor_desc<1x8x16xf16>
+-    %c = builtin.unrealized_conversion_cast %t : !xegpu.tensor_desc<1x8x16xf16> to vector<8xi32>
+-    gpu.return %c : vector<8xi32>
+-  }
+-}
+diff --git a/mlir/test/Conversion/XeGPUToXeVM/loadstore_nd.mlir b/mlir/test/Conversion/XeGPUToXeVM/loadstore_nd.mlir
+index d45fa79bb2e63..1fde43119d8cf 100644
+--- a/mlir/test/Conversion/XeGPUToXeVM/loadstore_nd.mlir
++++ b/mlir/test/Conversion/XeGPUToXeVM/loadstore_nd.mlir
+@@ -91,4 +91,52 @@ gpu.module @load_store_check {
+         vector.store %loaded, %dstte[%c0, %c0] : memref<32x16xi8>, vector<32xi8>
+         gpu.return
+     }
++
++    // A >2D (batched) load_nd / store_nd folds the leading (batch) offsets into
++    // the base pointer -- base += (sum_d offset[d] * leadingStride[d]) *
++    // elemByteSize -- while the 2D-block surface stays the innermost matrix. For
++    // a dynamic-shape source the sizes/strides are recovered via
++    // extract_strided_metadata: the leading (batch) element stride is carried in
++    // payload slot 5, folding batch index %z contributes %z * stride#0 * 4 bytes
++    // to the base, and the surface is the innermost sizes#2 x sizes#1 matrix.
++    // CHECK-LABEL: gpu.func @load_store_batch_dyn(
++    // CHECK-SAME:  %[[SRC:.+]]: memref<?x?x?xf32>, %[[DST:.+]]: memref<?x?x?xf32>, %[[Z:.+]]: index
++    gpu.func @load_store_batch_dyn(%src: memref<?x?x?xf32>, %dst: memref<?x?x?xf32>,
++                                   %z: index) kernel {
++        %c0 = arith.constant 0 : index
++        // CHECK-DAG: %[[C4I32:.+]] = arith.constant 4 : i32
++        // CHECK-DAG: %[[C4I64:.+]] = arith.constant 4 : i64
++
++        // Load: recover shape/strides, encode the leading stride into slot 5, and
++        // fold the batch index into the base pointer.
++        // CHECK: %{{.+}}, %{{.+}}, %[[LSZ:.+]]:3, %[[LSTR:.+]]:3 = memref.extract_strided_metadata %[[SRC]]
++        // CHECK: %[[LSTRIDE:.+]] = arith.index_cast %[[LSTR]]#0 : index to i32
++        // CHECK: vector.insert %[[LSTRIDE]], %{{.+}} [5] : i32 into vector<8xi32>
++        // CHECK: %[[LBASE:.+]] = vector.extract %{{.+}}[0] : i64 from vector<4xi64>
++        // CHECK: %[[LZ:.+]] = arith.index_cast %[[Z]] : index to i64
++        // CHECK: %[[LSE:.+]] = arith.extui %[[LSTRIDE]] : i32 to i64
++        // CHECK: %[[LMUL:.+]] = arith.muli %[[LZ]], %[[LSE]] : i64
++        // CHECK: %[[LOFF:.+]] = arith.muli %[[LMUL]], %[[C4I64]] : i64
++        // CHECK: %[[LADDR:.+]] = arith.addi %[[LBASE]], %[[LOFF]] : i64
++        // CHECK: %[[LPTR:.+]] = llvm.inttoptr %[[LADDR]] : i64 to !llvm.ptr<1>
++        // CHECK: xevm.blockload2d %[[LPTR]]{{.*}}tile_height = 8 : i32, tile_width = 16 : i32
++        %st = xegpu.create_nd_tdesc %src : memref<?x?x?xf32> -> !xegpu.tensor_desc<1x8x16xf32>
++        %v = xegpu.load_nd %st[%z, %c0, %c0] : !xegpu.tensor_desc<1x8x16xf32> -> vector<8xf32>
++
++        // Store: same batch fold on the base.
++        // CHECK: %{{.+}}, %{{.+}}, %[[SSZ:.+]]:3, %[[SSTR:.+]]:3 = memref.extract_strided_metadata %[[DST]]
++        // CHECK: %[[SSTRIDE:.+]] = arith.index_cast %[[SSTR]]#0 : index to i32
++        // CHECK: vector.insert %[[SSTRIDE]], %{{.+}} [5] : i32 into vector<8xi32>
++        // CHECK: %[[SBASE:.+]] = vector.extract %{{.+}}[0] : i64 from vector<4xi64>
++        // CHECK: %[[SZ:.+]] = arith.index_cast %[[Z]] : index to i64
++        // CHECK: %[[SSE:.+]] = arith.extui %[[SSTRIDE]] : i32 to i64
++        // CHECK: %[[SMUL:.+]] = arith.muli %[[SZ]], %[[SSE]] : i64
++        // CHECK: %[[SOFF:.+]] = arith.muli %[[SMUL]], %[[C4I64]] : i64
++        // CHECK: %[[SADDR:.+]] = arith.addi %[[SBASE]], %[[SOFF]] : i64
++        // CHECK: %[[SPTR:.+]] = llvm.inttoptr %[[SADDR]] : i64 to !llvm.ptr<1>
++        // CHECK: xevm.blockstore2d %[[SPTR]]{{.*}}tile_height = 8 : i32, tile_width = 16 : i32
++        %dt = xegpu.create_nd_tdesc %dst : memref<?x?x?xf32> -> !xegpu.tensor_desc<1x8x16xf32>
++        xegpu.store_nd %v, %dt[%z, %c0, %c0] : vector<8xf32>, !xegpu.tensor_desc<1x8x16xf32>
++        gpu.return
++    }
+ }
+diff --git a/mlir/test/Dialect/XeGPU/peephole-optimize.mlir b/mlir/test/Dialect/XeGPU/peephole-optimize.mlir
+index fa5ff9ca56d34..9ccbb0de861ad 100644
+--- a/mlir/test/Dialect/XeGPU/peephole-optimize.mlir
++++ b/mlir/test/Dialect/XeGPU/peephole-optimize.mlir
+@@ -504,3 +504,40 @@ gpu.module @xevm_test {
+     gpu.return
+   }
+ }
++
++// -----
++// The transpose optimization also fires for a >2D descriptor whose leading
++// (batch) dims are unit: it operates on the innermost two dims, repacking
++// f16->i32 for the HW transpose load. The leading unit dims are preserved on
++// the descriptor/result, lane_data is rank-matched to all ones, and every
++// non-innermost stride is divided by the pack factor (2) so the later XeVM
++// batch fold uses repacked-element units. For a dynamic-shape source the
++// sizes/strides are recovered via extract_strided_metadata; the dynamic
++// leading (batch) stride is divided by the pack factor with arith.shrui, while
++// the static inner strides fold to constants (4096 -> 2048, 64 -> 32).
++// CHECK-LABEL: gpu.func @transpose_4d(
++// CHECK-SAME:    %[[ARG0:[0-9a-zA-Z]+]]: memref<?x?x64x64xf16>) -> vector<1x1x16x16xf16> {
++// CHECK-DAG:     %[[C2048:.*]] = arith.constant 2048 : index
++// CHECK-DAG:     %[[C32:.*]] = arith.constant 32 : index
++// CHECK-DAG:     %[[C1:.*]] = arith.constant 1 : index
++// CHECK:         %{{.+}}, %{{.+}}, %[[SIZES:.+]]:4, %[[STRIDES:.+]]:4 = memref.extract_strided_metadata %[[ARG0]]
++// CHECK:         %[[LSTRIDE:.*]] = arith.shrui %[[STRIDES]]#0, %[[C1]] : index
++// CHECK:         %[[PTR:.*]] = memref.extract_aligned_pointer_as_index %{{.+}} : memref<f16> -> index
++// CHECK:         %[[T0:.*]] = arith.index_cast %[[PTR]] : index to i64
++// CHECK:         %[[BDESC:.*]] = xegpu.create_nd_tdesc %[[T0]], shape : [%[[SIZES]]#0, %[[SIZES]]#1, 64, %[[C32]]], strides : [%[[LSTRIDE]], %[[C2048]], %[[C32]], 1] : i64
++// CHECK-SAME:      -> !xegpu.tensor_desc<1x1x16x8xi32, #xegpu.layout<lane_layout = [1, 1, 16, 1], lane_data = [1, 1, 1, 1], order = [2, 3, 1, 0]>>
++// CHECK:         %[[B:.*]] = xegpu.load_nd %[[BDESC]][%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}]{{.*}} -> vector<1x1x16x8xi32>
++// CHECK:         %[[BITCAST:.*]] = vector.bitcast %[[B]] : vector<1x1x16x8xi32> to vector<1x1x16x16xf16>
++// CHECK:         vector.transpose %[[BITCAST]], [0, 1, 3, 2] : vector<1x1x16x16xf16> to vector<1x1x16x16xf16>
++#b4 = #xegpu.layout<lane_layout = [1, 1, 16, 1], lane_data = [1, 1, 1, 2], order = [2, 3, 1, 0]>
++#bt4 = #xegpu.layout<lane_layout = [1, 1, 1, 16], lane_data = [1, 1, 2, 1]>
++gpu.module @xevm_module {
++gpu.func @transpose_4d(%arg0: memref<?x?x64x64xf16>) -> vector<1x1x16x16xf16> {
++  %c0 = arith.constant 0 : index
++  %c32 = arith.constant 32 : index
++  %0 = xegpu.create_nd_tdesc %arg0 : memref<?x?x64x64xf16> -> !xegpu.tensor_desc<1x1x16x16xf16, #b4>
++  %1 = xegpu.load_nd %0[%c0, %c0, %c0, %c32] { result_layout = #b4 } : !xegpu.tensor_desc<1x1x16x16xf16, #b4> -> vector<1x1x16x16xf16>
++  %2 = vector.transpose %1, [0, 1, 3, 2] { layout_result_0 = #bt4 } : vector<1x1x16x16xf16> to vector<1x1x16x16xf16>
++  gpu.return %2 : vector<1x1x16x16xf16>
++}
++}
+diff --git a/mlir/test/Dialect/XeGPU/sg-to-lane-distribute-unit.mlir b/mlir/test/Dialect/XeGPU/sg-to-lane-distribute-unit.mlir
+index a7fe2d9534351..e95e6788ab5e6 100644
+--- a/mlir/test/Dialect/XeGPU/sg-to-lane-distribute-unit.mlir
++++ b/mlir/test/Dialect/XeGPU/sg-to-lane-distribute-unit.mlir
+@@ -60,6 +60,35 @@ gpu.func @load_nd_transpose() {
+   gpu.return
+ }
+ 
++// A >2D load with unit leading dims is treated as its innermost 2D tile: the
++// packed attribute is still set when the inner lane_data marks a packed
++// (VNNI) B operand.
++// CHECK-LABEL: gpu.func @load_nd_packed_4d
++// CHECK: %[[C0:.*]] = arith.constant 0 : index
++// CHECK: %[[LOAD:.*]] = xegpu.load_nd %{{.*}}[%[[C0]], %[[C0]], %[[C0]], %[[C0]]] <{packed}> : !xegpu.tensor_desc<1x1x16x16xf16> -> vector<16xf16>
++// CHECK: %[[CAST:.*]] = vector.shape_cast %[[LOAD]] : vector<16xf16> to vector<1x1x16x1xf16>
++gpu.func @load_nd_packed_4d() {
++  %c0 = arith.constant 0 : index
++  %0 = "some_op"() : () -> !xegpu.tensor_desc<1x1x16x16xf16>
++  %1 = xegpu.load_nd %0[%c0, %c0, %c0, %c0] {layout = #xegpu.layout<lane_layout = [1, 1, 1, 16], lane_data = [1, 1, 2, 1]>}
++    : !xegpu.tensor_desc<1x1x16x16xf16> -> vector<1x1x16x16xf16>
++  gpu.return
++}
++
++// A >2D load with unit leading dims is likewise transposed on its innermost 2D
++// tile when the inner lane layout requires it.
++// CHECK-LABEL: gpu.func @load_nd_transpose_4d
++// CHECK: %[[C0:.*]] = arith.constant 0 : index
++// CHECK: %[[LOAD:.*]] = xegpu.load_nd %{{.*}}[%[[C0]], %[[C0]], %[[C0]], %[[C0]]] <{transpose = array<i64: 1, 0>}> : !xegpu.tensor_desc<1x1x16x8xf32> -> vector<8xf32>
++// CHECK: %[[CAST:.*]] = vector.shape_cast %[[LOAD]] : vector<8xf32> to vector<1x1x1x8xf32>
++gpu.func @load_nd_transpose_4d() {
++  %c0 = arith.constant 0 : index
++  %0 = "some_op"() : () -> !xegpu.tensor_desc<1x1x16x8xf32>
++  %1 = xegpu.load_nd %0[%c0, %c0, %c0, %c0] {layout = #xegpu.layout<lane_layout = [1, 1, 16, 1], lane_data = [1, 1, 1, 1]>}
++    : !xegpu.tensor_desc<1x1x16x8xf32> -> vector<1x1x16x8xf32>
++  gpu.return
++}
++
+ // CHECK-LABEL: gpu.func @load_nd_array_length
+ // CHECK: %[[C0:.*]] = arith.constant 0 : index
+ // CHECK: %[[LOAD:.*]] = xegpu.load_nd %{{.*}}[%[[C0]], %[[C0]]] : !xegpu.tensor_desc<32x16xf16, #xegpu.block_tdesc_attr<array_length = 2 : i64>> -> vector<64xf16>
+diff --git a/mlir/test/Dialect/XeGPU/xegpu-unroll-patterns.mlir b/mlir/test/Dialect/XeGPU/xegpu-unroll-patterns.mlir
+index 49fdf1cbee174..dafc4d7339a27 100644
+--- a/mlir/test/Dialect/XeGPU/xegpu-unroll-patterns.mlir
++++ b/mlir/test/Dialect/XeGPU/xegpu-unroll-patterns.mlir
+@@ -360,5 +360,39 @@ gpu.module @test {
+     gpu.return %0 : vector<32xf32>
+   }
+ 
++//-----
++  // Unrolling a >2D (batched) nd descriptor keeps the whole memref as the
++  // create_nd source -- no memref.subview -- and yields a single unit-leading
++  // tdesc that is reused across the batch tiles. The leading (batch) offset
++  // stays on each unrolled load/store and is incremented per tile (it is *not*
++  // zeroed and baked into a subview base). inst_data [1, 8, 16] unrolls the
++  // size-4 batch dim into 4 tiles.
++  // CHECK-LABEL: gpu.func @load_store_nd_3d
++  // CHECK-SAME: [[arg0:%.+]]: memref<4x8x16xf32>, [[z:%.+]]: index
++  // CHECK-NOT: memref.subview
++  // CHECK: [[t:%.+]] = xegpu.create_nd_tdesc [[arg0]] : memref<4x8x16xf32> -> !xegpu.tensor_desc<1x8x16xf32>
++  // CHECK: xegpu.load_nd [[t]]{{\[}}[[z]], {{.*}}] : !xegpu.tensor_desc<1x8x16xf32> -> vector<1x8x16xf32>
++  // CHECK: [[z1:%.+]] = arith.addi [[z]], {{%.+}}
++  // CHECK: xegpu.load_nd [[t]]{{\[}}[[z1]], {{.*}}]
++  // CHECK: [[z2:%.+]] = arith.addi [[z]], {{%.+}}
++  // CHECK: xegpu.load_nd [[t]]{{\[}}[[z2]], {{.*}}]
++  // CHECK: [[z3:%.+]] = arith.addi [[z]], {{%.+}}
++  // CHECK: xegpu.load_nd [[t]]{{\[}}[[z3]], {{.*}}]
++  // CHECK: xegpu.store_nd {{%.+}}, [[t]]{{\[}}[[z]], {{.*}}]
++  // CHECK-COUNT-3: xegpu.store_nd {{%.+}}, [[t]]
++  // CHECK-NOT: memref.subview
++  gpu.func @load_store_nd_3d(%src: memref<4x8x16xf32>, %z: index) {
++    %c0 = arith.constant 0 : index
++    %t = xegpu.create_nd_tdesc %src : memref<4x8x16xf32>
++      -> !xegpu.tensor_desc<4x8x16xf32, #xegpu.layout<inst_data = [1, 8, 16]>>
++    %v = xegpu.load_nd %t[%z, %c0, %c0]
++      : !xegpu.tensor_desc<4x8x16xf32, #xegpu.layout<inst_data = [1, 8, 16]>>
++      -> vector<4x8x16xf32>
++    xegpu.store_nd %v, %t[%z, %c0, %c0]
++      : vector<4x8x16xf32>,
++        !xegpu.tensor_desc<4x8x16xf32, #xegpu.layout<inst_data = [1, 8, 16]>>
++    gpu.return
++  }
++
+ }
+ 
+
+From 5a5b993f0fb6ba5f7649cdf9e960bb93bd998e71 Mon Sep 17 00:00:00 2001
+From: Jianhui Li <jian.hui.li@intel.com>
+Date: Wed, 12 Aug 2026 03:14:12 +0000
+Subject: [PATCH 4/4] [mlir][xegpu] Trim comments and simplify dynamic high-D
+ nd lowering
+
+Review cleanup of the batched/high-D nd lowering: reduce verbose in-function
+comments to the genuinely non-obvious motivation (no memref.subview for a
+dynamic source, dividing all non-innermost strides on repack, 1-vs-N unrolled
+tdescs, the base-pointer batch-fold formula), and drop mechanical narration.
+
+Also replace the lazy getSrcMeta lambda in CreateNdDescToXeVMPattern with a
+plain local -- it was only used on the dynamic-memref path -- matching the
+metadata-recovery pattern used elsewhere. No functional change.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../Conversion/XeGPUToXeVM/XeGPUToXeVM.cpp    | 55 ++++++-------------
+ .../Transforms/XeGPUPeepHoleOptimizer.cpp     | 18 +++---
+ .../Dialect/XeGPU/Transforms/XeGPUUnroll.cpp  | 42 ++++++--------
+ 3 files changed, 42 insertions(+), 73 deletions(-)
+
+diff --git a/mlir/lib/Conversion/XeGPUToXeVM/XeGPUToXeVM.cpp b/mlir/lib/Conversion/XeGPUToXeVM/XeGPUToXeVM.cpp
+index e30951fdb9e1d..269360cafe0d6 100644
+--- a/mlir/lib/Conversion/XeGPUToXeVM/XeGPUToXeVM.cpp
++++ b/mlir/lib/Conversion/XeGPUToXeVM/XeGPUToXeVM.cpp
+@@ -56,10 +56,8 @@ enum class NdTdescOffset : uint32_t {
+   BaseShapeH = 3,     // Base shape height (i32)
+   BasePitch = 4,      // Base pitch/stride of dim rank-2 (i32)
+   LeadingStride0 = 5, // Element strides of the leading (batch) dims of a >2D
+-  LeadingStride1 = 6, // descriptor (i32). The load/store/prefetch lowering
+-  LeadingStride2 = 7, // uses these to fold the batch offsets into the base
+-                      // pointer, keeping the 2D-block surface at the innermost
+-                      // matrix. Left at 0 for 2D descriptors.
++  LeadingStride1 = 6, // descriptor (i32); folded into the base pointer by the
++  LeadingStride2 = 7, // load/store lowering. Left at 0 for 2D descriptors.
+ };
+ 
+ static int32_t getNumericXeVMAddrSpace(xegpu::MemorySpace xeGpuMemspace) {
+@@ -240,20 +238,11 @@ class CreateNdDescToXeVMPattern
+     auto sourceTy = source.getType();
+     auto sourceMemrefTy = dyn_cast<MemRefType>(sourceTy);
+ 
+-    // Shape and strides. For a memref source they are recovered from the memref
+-    // value itself (a dynamic memref carries them at runtime and does not
+-    // attach them as op operands); otherwise they come from the op's explicit
+-    // operands.
++    // For a memref source, shape/strides come from the memref (dynamic dims are
++    // recovered from runtime metadata); an integer source carries them as
++    // explicit op operands.
+     SmallVector<OpFoldResult> mixedSizes;
+     SmallVector<OpFoldResult> mixedStrides;
+-    memref::ExtractStridedMetadataOp srcMeta;
+-    // Lazily materialize memref metadata (base buffer, offset, sizes, strides).
+-    auto getSrcMeta = [&]() -> memref::ExtractStridedMetadataOp {
+-      if (!srcMeta)
+-        srcMeta =
+-            memref::ExtractStridedMetadataOp::create(rewriter, loc, source);
+-      return srcMeta;
+-    };
+     // If source is a memref, we need to extract the aligned pointer as index.
+     // Pointer type is passed as i32 or i64 by type converter.
+     if (sourceMemrefTy) {
+@@ -265,18 +254,18 @@ class CreateNdDescToXeVMPattern
+       if (failed(
+               sourceMemrefTy.getStridesAndOffset(staticStrides, staticOffset)))
+         return rewriter.notifyMatchFailure(op, "Expected strided Memref.");
+-      // A memref is authoritative for its own shape/strides (explicit
+-      // shape/strides on a memref create_nd are deprecated). A fully static
+-      // memref yields constants directly; a dynamic one recovers its dynamic
+-      // dims from runtime metadata (getConstified* keeps static dims as attrs).
++      // A fully static memref yields constants directly; a dynamic one recovers
++      // its dynamic dims from runtime metadata.
+       bool allStatic = sourceMemrefTy.hasStaticShape() &&
+                        llvm::none_of(staticStrides, ShapedType::isDynamic);
+       if (allStatic) {
+         mixedSizes = op.getMixedSizes();
+         mixedStrides = op.getMixedStrides();
+       } else {
+-        mixedSizes = getSrcMeta().getConstifiedMixedSizes();
+-        mixedStrides = getSrcMeta().getConstifiedMixedStrides();
++        auto srcMeta =
++            memref::ExtractStridedMetadataOp::create(rewriter, loc, source);
++        mixedSizes = srcMeta.getConstifiedMixedSizes();
++        mixedStrides = srcMeta.getConstifiedMixedStrides();
+       }
+       // Access adaptor after failure check to avoid rolling back generated code
+       // for materialization cast.
+@@ -327,15 +316,9 @@ class CreateNdDescToXeVMPattern
+         vector::InsertOp::create(rewriter, loc, basePitch, payload,
+                                  static_cast<int>(NdTdescOffset::BasePitch));
+     // For a >2D descriptor, encode the leading (batch) dim element strides into
+-    // the spare payload slots. The load/store/prefetch lowering folds the batch
+-    // offsets into the base pointer using these, so the batch position stays
+-    // out of the 2D-block surface (which remains the innermost matrix computed
+-    // above). This applies to both memref sources and integer (pointer) sources
+-    // with explicit shape/strides -- e.g. a batched descriptor whose source was
+-    // rewritten to an i64 base by the transpose peephole; in that case the
+-    // strides come from the op's explicit operands. 2D descriptors leave these
+-    // slots at 0 and the load/store path skips reading them (2D path
+-    // unchanged).
++    // the spare payload slots; the load/store/prefetch lowering folds the batch
++    // offsets into the base pointer with these, keeping the 2D-block surface at
++    // the innermost matrix. 2D descriptors leave these slots at 0.
+     if (rank > 2) {
+       if (rank - 2 > 3)
+         return rewriter.notifyMatchFailure(
+@@ -456,12 +439,10 @@ class LoadStorePrefetchNdToXeVMPattern : public OpConversionPattern<OpType> {
+                                                     mixedOffsets[tileRank - 2]);
+       offsetH = getValueOrCreateCastToIndexLike(rewriter, loc,
+                                                 rewriter.getI32Type(), offsetH);
+-      // For a >2D descriptor, fold the leading (batch) offsets into the base
+-      // pointer: basePtr += (sum_d offset[d] * leadingStride[d]) * elemBytes.
+-      // The batch element strides were encoded into the payload at create time
+-      // (see CreateNdDescToXeVMPattern). This keeps the 2D-block surface at the
+-      // innermost matrix (so the HW surface-size limits are unaffected) instead
+-      // of baking the batch into a (possibly out-of-range) collapsed surface.
++      // Fold the leading (batch) offsets into the base pointer:
++      //   basePtr += (sum_d offset[d] * leadingStride[d]) * elemBytes
++      // using the batch strides encoded at create time. This keeps the 2D-block
++      // surface at the innermost matrix, avoiding the HW surface-size limits.
+       if (tileRank > 2) {
+         Type i64Ty = rewriter.getI64Type();
+         Value batchElemOffset;
+diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUPeepHoleOptimizer.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUPeepHoleOptimizer.cpp
+index 4b7ee133006e5..0124b700ac1dc 100644
+--- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUPeepHoleOptimizer.cpp
++++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUPeepHoleOptimizer.cpp
+@@ -305,10 +305,9 @@ class XeGPUCreateNdDescOpPattern final
+     Value source = createNdOp.getSource();
+     auto memrefType = dyn_cast<MemRefType>(source.getType());
+ 
+-    // A fully static memref (static shape and strides) can use the op
+-    // accessors directly. A dynamic memref cannot -- getMixedSizes/getMixed
+-    // Strides can't represent a dynamic dim that has no SSA operand -- so its
+-    // shape/strides are recovered from runtime metadata.
++    // A dynamic memref's shape/strides are recovered from runtime metadata
++    // (getMixedSizes/getMixedStrides can't represent a dynamic dim); a static
++    // one uses the op accessors directly.
+     auto isStaticMemref = [](MemRefType mt) {
+       if (!mt.hasStaticShape())
+         return false;
+@@ -346,13 +345,10 @@ class XeGPUCreateNdDescOpPattern final
+         rewriter, loc, convertToValue(rewriter, loc, modifiedShape.back()),
+         innerLaneData);
+     // Repacking narrow elements into wider ones (f16 -> i32) reinterprets the
+-    // innermost dim, so every stride *except* the innermost (which stays 1)
+-    // counts the wider element and must be divided by innerLaneData. This
+-    // includes the pitch (second-to-last) and, for a >2D descriptor, the
+-    // leading (batch) strides -- the latter are read back by the XeVM load/
+-    // store fold, which multiplies them by the *repacked* element byte size,
+-    // so they must already be in repacked-element units. (For a 2D descriptor
+-    // this is exactly the second-to-last stride, matching prior behavior.)
++    // innermost dim, so every stride except the innermost (which stays 1) must
++    // be divided by innerLaneData to count the wider element -- the pitch and,
++    // for a >2D descriptor, the leading (batch) strides (the XeVM fold reads
++    // the latter back in repacked-element units).
+     assert(mixedStrides.size() >= 2 &&
+            "Expected at least 2 strides for CreateNdDescOp");
+     SmallVector<OpFoldResult> modifiedStrides(mixedStrides);
+diff --git a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp
+index 6f2d34a952eeb..f14df6de90c20 100644
+--- a/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp
++++ b/mlir/lib/Dialect/XeGPU/Transforms/XeGPUUnroll.cpp
+@@ -200,20 +200,17 @@ struct UnrollCreateNdOp : public UnrollPattern<xegpu::CreateNdDescOp> {
+     if (!targetShape)
+       return failure();
+ 
+-    // Keep the original (possibly high-D) source and only shrink the
+-    // descriptor's tile shape. Leading (batch) dims are unrolled to unit tiles
+-    // like any other dim; the batch position rides on the load/store/prefetch
+-    // offsets (see unrollByTile) and is folded into the base pointer at XeVM
+-    // lowering. We therefore never slice the source with a memref.subview,
+-    // which for a dynamic-shape source could not guarantee a valid base
+-    // address.
++    // Keep the original (possibly high-D) source and only shrink the tile
++    // shape; batch dims unroll to unit tiles and their offsets ride on the
++    // load/store/prefetch, folded into the base pointer at XeVM lowering. We
++    // never slice the source with a memref.subview -- for a dynamic-shape
++    // source it could not guarantee a valid base address.
+     Value src = op.getSource();
+     auto makeCreateNd = [&](Type tdesc) -> Value {
+       auto ndTy = cast<xegpu::TensorDescType>(tdesc);
++      // A memref source uses the bare-memref builder: a dynamic dim has no SSA
++      // operand for getMixedSizes/getMixedStrides.
+       if (isa<MemRefType>(src.getType()))
+-        // A memref source carries its own (possibly dynamic) shape/strides; use
+-        // the bare-memref builder rather than getMixedSizes/getMixedStrides,
+-        // which cannot represent a dynamic memref dim without an SSA operand.
+         return xegpu::CreateNdDescOp::create(rewriter, loc, ndTy,
+                                              cast<TypedValue<MemRefType>>(src));
+       return xegpu::CreateNdDescOp::create(
+@@ -223,13 +220,11 @@ struct UnrollCreateNdOp : public UnrollPattern<xegpu::CreateNdDescOp> {
+     SmallVector<Type> newTdescTys = getUnrolledTypes(tdescTy, *targetShape);
+     SmallVector<Value> newOps;
+     if (tdescTy.getRank() <= 2) {
+-      // For 2D descriptors a single tdesc is reused for every unrolled tile via
+-      // offsets; the pack/unpack resolution broadcasts the one source.
++      // 2D: one tdesc, broadcast across tiles by pack/unpack.
+       newOps.push_back(makeCreateNd(newTdescTys[0]));
+     } else {
+-      // For >2D (batched) descriptors the unpack expands the leading dims, so
+-      // the source count must match the consumer's pack count. Emit one
+-      // (identical, full-source) tdesc per tile; the redundant ones fold away.
++      // >2D: unpack expands the leading dims, so the source count must match
++      // the pack count. Emit one (identical) tdesc per tile; CSE folds them.
+       for (Type t : newTdescTys)
+         newOps.push_back(makeCreateNd(t));
+     }
+@@ -254,9 +249,8 @@ struct UnrollPrefetchNdOp : public UnrollPattern<xegpu::PrefetchNdOp> {
+     if (layout)
+       layout = layout.dropInstData();
+ 
+-    // Batch (leading) dims are unrolled to unit tiles by unrollByTile like any
+-    // other dim; their offsets ride on the prefetch and are folded into the
+-    // base pointer at XeVM lowering, so no per-batch tdesc/subview is needed.
++    // Batch (leading) dims unroll to unit tiles like any other dim; a single
++    // tdesc serves all tiles (offsets are folded into the base at XeVM).
+     SmallVector<Type> convertedTdescTypes =
+         getUnrolledTypes(tdescTy, *targetShape);
+     SmallVector<Value> convertedTdesc = pack(
+@@ -298,9 +292,8 @@ struct UnrollLoadNdOp : public UnrollPattern<xegpu::LoadNdOp> {
+ 
+     SmallVector<Value> newOps;
+ 
+-    // Batch (leading) dims are unrolled to unit tiles by unrollByTile like any
+-    // other dim; their offsets ride on the load and are folded into the base
+-    // pointer at XeVM lowering, so a single tdesc is reused for all tiles.
++    // Batch (leading) dims unroll to unit tiles like any other dim; a single
++    // tdesc serves all tiles (offsets are folded into the base at XeVM).
+     SmallVector<Type> convertedTdescTypes =
+         getUnrolledTypes(tdescTy, *targetShape);
+     SmallVector<Value> convertedTdescs = pack(
+@@ -345,10 +338,9 @@ struct UnrollStoreNdOp : public UnrollPattern<xegpu::StoreNdOp> {
+ 
+     size_t valueIndex = 0;
+ 
+-    // Batch (leading) dims are unrolled to unit tiles by unrollByTile like any
+-    // other dim; their offsets ride on the store and are folded into the base
+-    // pointer at XeVM lowering. valueIndex advances in the same tile order
+-    // unrollByTile iterates, so it stays in sync with the pre-packed values.
++    // Batch (leading) dims unroll to unit tiles like any other dim. valueIndex
++    // advances in unrollByTile's tile order, staying in sync with the packed
++    // values.
+     SmallVector<Type> convertedTdescTypes =
+         getUnrolledTypes(tdescTy, *targetShape);
+     SmallVector<Value> convertedTdescs = pack(

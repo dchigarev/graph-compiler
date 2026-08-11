@@ -1,4 +1,5 @@
 .*/
+.venv
 !.github/
 !.gitignore
 build/
