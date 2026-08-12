@@ -20,9 +20,8 @@ if(NOT GC_ENABLE_OPT)
 endif()
 
 gc_add_mlir_tool(gc-opt GcOpt.cpp)
-gc_link_mlir_tool(gc-opt GcGpuPasses)
-
+target_link_libraries(gc-opt PRIVATE ${PROJECT_NAME})
 if(NOT GC_DYLINK)
-  gc_link_mlir_tool(gc-opt MLIROptLib MLIRLinalgTransformOps
-                    MLIRLLVMIRTransforms MLIRTransformDialect)
+  target_link_libraries(gc-opt PRIVATE MLIROptLib MLIRLinalgTransformOps
+                                       MLIRTransformDialectTransforms)
 endif()

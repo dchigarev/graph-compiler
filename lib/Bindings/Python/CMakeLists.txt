@@ -20,7 +20,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wno-covered-switch-default)
 endif()
 nanobind_add_module(graph_compiler Nanobind.cpp)
-gc_link_mlir_tool(graph_compiler PRIVATE GcGpuOclRuntime)
+target_link_libraries(graph_compiler PRIVATE ${PROJECT_NAME})
 
 set_target_properties(
   graph_compiler PROPERTIES LIBRARY_OUTPUT_DIRECTORY

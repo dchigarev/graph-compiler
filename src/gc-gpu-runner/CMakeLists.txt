@@ -20,4 +20,4 @@ if(NOT GC_ENABLE_GPU_RUNNER)
 endif()
 
 gc_add_mlir_tool(gc-gpu-runner GpuRunner.cpp)
-gc_link_mlir_tool(gc-gpu-runner GcGpuOclRuntime)
+target_link_libraries(gc-gpu-runner PRIVATE ${PROJECT_NAME})
