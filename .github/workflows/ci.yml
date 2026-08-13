@@ -57,7 +57,7 @@ jobs:
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 2
 
