@@ -50,9 +50,10 @@ JitEngine::loadFromFile(SmallString<128> &filePath,
 
   if (!sharedLibPaths.empty()) {
     auto &mainJD = jit->getMainJITDylib();
-    mainJD.addGenerator(
-        cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(
-            jit->getDataLayout().getGlobalPrefix())));
+    // Not using GetForCurrentProcess(): it's an inline wrapper that moves a
+    // null unique_function, which trips -Wmaybe-uninitialized on GCC.
+    mainJD.addGenerator(cantFail(DynamicLibrarySearchGenerator::Load(
+        nullptr, jit->getDataLayout().getGlobalPrefix())));
 
     for (auto lib : sharedLibPaths) {
       auto gen = DynamicLibrarySearchGenerator::Load(
