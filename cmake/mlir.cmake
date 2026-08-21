@@ -20,6 +20,15 @@ list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(TableGen)
 include(AddLLVM)
 include(AddMLIR)
+
+# GCC's uninitialized use analysis produces false positives on LLVM's ADT.
+# Upstream disables it in llvm/cmake/config-ix.cmake, which is not exported for
+# out-of-tree builds, so setting the variable for 'HandleLLVMOptions' manually
+# (flang does the same for its standalone build).
+if(CMAKE_COMPILER_IS_GNUCXX)
+  set(USE_NO_MAYBE_UNINITIALIZED 1)
+endif()
+
 include(HandleLLVMOptions)
 
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
