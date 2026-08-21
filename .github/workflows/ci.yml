@@ -284,7 +284,7 @@ jobs:
           cmake -G Ninja -S "$ov_dir" -B "$ov_dir/build" \
             -DLLVM_DIR=$llvm_dir/lib/cmake/llvm \
             -DMLIR_DIR=$llvm_dir/lib/cmake/mlir \
-            -DENABLE_GRAPH_COMPILER=ON \
+            -DENABLE_GPU_MLIR=ON \
             -DLLVM_DYLINK=ON \
             -DENABLE_INTEL_GPU=ON \
             -DENABLE_TESTS=ON \
