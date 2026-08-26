@@ -31,6 +31,7 @@
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Extensions/AllExtensions.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Bufferization/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
@@ -160,6 +161,8 @@ DialectRegistry &getDialectRegistry() {
     mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
     mlir::arith::registerBufferDeallocationOpInterfaceExternalModels(registry);
     mlir::bufferization::registerAllExtensions(registry);
+    mlir::bufferization::registerBufferizableOpInterfaceExternalModels(
+        registry);
     mlir::bufferization::func_ext::
         registerBufferizableOpInterfaceExternalModels(registry);
     mlir::func::registerAllExtensions(registry);

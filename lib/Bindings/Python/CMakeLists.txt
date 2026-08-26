@@ -15,7 +15,7 @@ execute_process(
 find_package(nanobind CONFIG REQUIRED)
 
 add_compile_options(-Wno-error=cast-qual -Wno-error=missing-declarations
-                    -Wno-switch-default)
+                    -Wno-error=unused-template -Wno-switch-default)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wno-covered-switch-default)
 endif()

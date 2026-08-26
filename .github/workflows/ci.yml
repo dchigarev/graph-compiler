@@ -280,7 +280,7 @@ jobs:
           git init $ov_dir
           git -C $ov_dir fetch --depth 1 $OV_URL $OV_TAG
           git -C $ov_dir checkout FETCH_HEAD
-          git -C $ov_dir submodule update --init --depth 1 --jobs $(nproc)
+          git -C $ov_dir submodule update --init --recursive --depth 1 --jobs $(nproc)
           cmake -G Ninja -S "$ov_dir" -B "$ov_dir/build" \
             -DLLVM_DIR=$llvm_dir/lib/cmake/llvm \
             -DMLIR_DIR=$llvm_dir/lib/cmake/mlir \

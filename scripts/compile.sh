@@ -85,7 +85,7 @@ repo_hash() {
   local hash=$( (echo "$PROJECT_DIR/scripts/compile.sh" && \
     git ls-files --modified --others --exclude-standard && \
     git diff --name-only --cached) \
-    | sort -u | xargs sha1sum)
+    | sort -u | xargs sha1sum 2>&1 || true)
   echo "${rev}-$( (echo "$hash" "$@") | sha1sum | cut -d' ' -f1)"
 }
 
