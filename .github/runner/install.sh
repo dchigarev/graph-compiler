@@ -30,9 +30,9 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
     software-properties-common
 
 export LLVM_VERSION=24
-wget -qO- https://apt.llvm.org/llvm.sh \
-  | sed -e "s|LLVM_VERSION_PATTERNS\[23\]|LLVM_VERSION_PATTERNS[${LLVM_VERSION}]|g" \
-  | sudo bash -s -- "${LLVM_VERSION}" all
+curl -fsSL https://apt.llvm.org/llvm.sh \
+  | sudo --preserve-env=http_proxy,https_proxy,no_proxy,HTTP_PROXY,HTTPS_PROXY,NO_PROXY \
+    bash -s -- "${LLVM_VERSION}" all
 sudo apt purge -y clang lld llvm-14-linker-tools clang-format-14  libclang-cpp14 libclang-common-18-dev libllvm18 || true
 sudo apt auto-remove -y
 sudo apt-get install -y --no-install-recommends \
