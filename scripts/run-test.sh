@@ -15,8 +15,6 @@
 # and limitations under the License.
 # SPDX-License-Identifier: Apache-2.0
 ################################################################################
-set -e
-
 DUMP_DIR="$1"
 shift
 
