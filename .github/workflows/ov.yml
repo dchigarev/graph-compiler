@@ -1,0 +1,156 @@
+name: OpenVINO integration
+
+on:
+  pull_request:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      LLVM_URL:
+        description: 'URL of the LLVM repository.'
+        default: ''
+      LLVM_TAG:
+        description: 'Tag, branch, or hash of the LLVM repository.'
+        default: ''
+      LLVM_NO_PATCH:
+        description: 'Do not apply patches to LLVM.'
+        type: boolean
+        default: false
+      OV_URL:
+        description: 'URL of the OpenVINO repository.'
+        default: ''
+      OV_TAG:
+        description: 'Tag, branch, or hash of the OpenVINO repository.'
+        default: ''
+      GC_DUMP_IR:
+        description: 'Dump IRs after each phase.'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  # Build folders are intentionally out of git tree to avoid deletion on 
+  # checkout action. It allows reusing build artifacts across different
+  # workflow runs. On build failure, clean rebuild is triggered.
+  GC_BUILD_DIR: ${{ github.workspace }}/../build
+  GC_EXTERNALS_DIR: ${{ github.workspace }}/../externals
+  SINGLE_RUNNER: ${{ vars.TEST_RUNNER == vars.BUILD_RUNNER }}
+
+jobs:
+  build:
+    name: Build
+    runs-on: ${{ vars.BUILD_RUNNER }}
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Set up env
+        id: setup-env
+        run: |
+          . scripts/utils.sh
+          set_gh_env_var LLVM_URL '${{ github.event.inputs.LLVM_URL }}'
+          set_gh_env_var LLVM_NO_PATCH '${{ github.event.inputs.LLVM_NO_PATCH }}'
+          set_gh_env_var OV_URL '${{ github.event.inputs.OV_URL }}'
+          set_gh_env_var OV_TAG '${{ github.event.inputs.OV_TAG }}'
+          set_gh_env_var GC_DUMP_IR '${{ github.event.inputs.GC_DUMP_IR }}'
+          if [ '${{ github.event_name }}' = 'schedule' ]; then
+            set_gh_env_var LLVM_TAG main
+          else
+            set_gh_env_var LLVM_TAG '${{ github.event.inputs.LLVM_TAG }}'
+          fi
+          if is_true "$GC_DUMP_IR"; then
+            echo 'OV_MLIR_DEBUG=1' >> "$GITHUB_ENV"
+            echo 'GC_FILE_CACHE_OFF=1' >> "$GITHUB_ENV"
+          fi
+
+      - name: Create Python venv
+        run: |
+          ./scripts/create-venv.sh -m
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: ./scripts/ov-build.sh
+
+      - name: Clean rebuild if failed
+        if: steps.build.outcome == 'failure'
+        run: ./scripts/ov-build.sh -c
+
+      - name: Pack OpenVINO tests
+        if: ${{ env.SINGLE_RUNNER != 'true' }}
+        run: |
+          PROJECT_DIR="$PWD"
+          . ./scripts/ov-build.sh
+          tar -czf ov-tests.tar.gz \
+            -C "$(dirname "$OV_INSTALL_DIR")" "$(basename "$OV_INSTALL_DIR")" \
+            -C "$GITHUB_WORKSPACE" scripts
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ env.SINGLE_RUNNER != 'true' }}
+        with:
+          name: ov-tests
+          path: ov-tests.tar.gz
+          if-no-files-found: error
+
+  test:
+    name: Test
+    needs: build
+    runs-on: ${{ vars.TEST_RUNNER }}
+
+    steps:
+      - uses: actions/download-artifact@v7
+        if: ${{ env.SINGLE_RUNNER != 'true' }}
+        with:
+          name: ov-tests
+
+      - name: Unpack OpenVINO tests
+        if: ${{ env.SINGLE_RUNNER != 'true' }}
+        run: tar -xzf ov-tests.tar.gz
+
+      - name: Run OpenVINO tests
+        run: |
+          export PROJECT_DIR="$PWD"
+          [ "$SINGLE_RUNNER" = 'true' ] || export OV_INSTALL_DIR="$PROJECT_DIR/install"
+          "$PROJECT_DIR/scripts/ov-test.sh"
+
+      - name: Upload failed OV test dumps
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failed-ov-test-dumps
+          path: failed_test_dumps/ov
+          retention-days: 5
+          if-no-files-found: ignore
+
+  cleanup:
+    name: Cleanup
+    if: ${{ always() && vars.TEST_RUNNER != vars.BUILD_RUNNER }}
+    needs:
+      - build
+      - test
+    runs-on: ${{ vars.BUILD_RUNNER }}
+
+    steps:
+      - name: Delete uploaded test artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifact_ids=$(gh api --paginate \
+            "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+            --jq '.artifacts[]
+              | select(.name == "ov-tests" and .expired == false)
+              | .id' || true)
+
+          for artifact_id in $artifact_ids; do
+            gh api --method DELETE \
+              "/repos/${GITHUB_REPOSITORY}/actions/artifacts/$artifact_id"
+          done

@@ -16,4 +16,5 @@ fi
 pgrep -f "$GH_RUNNER_DIR/bin/Runner.Listener" > /dev/null && return 0
 
 echo "Starting GitHub runner"
-screen -dmS runner bash -c "$GH_RUNNER_DIR/run.sh"
+: ${GH_RUNNER_LAUNCHER:="screen -dmS runner bash -c"}
+$GH_RUNNER_LAUNCHER "$GH_RUNNER_DIR/run.sh"

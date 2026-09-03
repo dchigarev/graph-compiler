@@ -17,7 +17,7 @@ def compile():
             print(f"Removing env.PYTHONPATH={py_path}", file=os.sys.stderr)
             env = env.copy()
             env.pop("PYTHONPATH")
-    script_path = os.path.join(PROJ_DIR, "scripts", "compile.sh")
+    script_path = os.path.join(PROJ_DIR, "scripts", "build.sh")
     print(f"Running build script: {script_path}", file=os.sys.stderr)
     subprocess.check_call(["/bin/sh", script_path], env=env)
 

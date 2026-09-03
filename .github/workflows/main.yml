@@ -1,4 +1,4 @@
-name: CI
+name: Build and test
 run-name: >
   ${{
     github.event_name == 'schedule' && 'CI (nightly)' ||
@@ -23,6 +23,12 @@ on:
         description: 'Do not apply patches to LLVM.'
         type: boolean
         default: false
+      OV_URL:
+        description: 'URL of the OpenVINO repository.'
+        default: ''
+      OV_TAG:
+        description: 'Tag, branch, or hash of the OpenVINO repository.'
+        default: ''
       GC_DUMP_IR:
         description: 'Dump IRs after each phase.'
         type: boolean
@@ -39,22 +45,22 @@ permissions:
   contents: read
   pull-requests: read
 
-env:
-  GC_DYLINK: ON
-  GC_BUILD_TYPE: Debug
-  LLVM_BUILD_TYPE: RelWithDebInfo
-  LLVM_INSTALL_DIR: ${{ github.workspace }}/externals/llvm
-  OV_URL: https://x-access-token:${{ secrets.OV_TOKEN }}@github.com/dchigarev/openvino.git
-  OV_TAG: mlir-gpu-gc-integration
-  OV_INSTALL_DIR: ${{ github.workspace }}/externals/openvino
-  TEST_RUNNER: ${{ github.workspace }}/.github/scripts/run_test.sh
-
 jobs:
-  ci:
+  dylink:
+    name: Dynamic linking
     runs-on: ${{ vars.RUNNER }}
     concurrency:
       group: ci-${{ github.head_ref || github.ref_name }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+    env:
+      GC_DYLINK: ON
+      GC_BUILD_TYPE: Debug
+      LLVM_BUILD_TYPE: Release
+      OV_BUILD_TYPE: Release
+      LLVM_INSTALL_DIR: ${{ github.workspace }}/externals/llvm
+      OV_INSTALL_DIR: ${{ github.workspace }}/externals/openvino
+      TEST_RUNNER: ${{ github.workspace }}/scripts/run-test.sh
 
     steps:
       - uses: actions/checkout@v7.0.1
@@ -64,43 +70,28 @@ jobs:
       - name: Set up env
         id: setup-env
         run: |
+          . scripts/utils.sh
+          set_gh_env_var LLVM_URL '${{ github.event.inputs.LLVM_URL }}'
+          set_gh_env_var LLVM_NO_PATCH '${{ github.event.inputs.LLVM_NO_PATCH }}'
+          set_gh_env_var OV_URL '${{ github.event.inputs.OV_URL }}'
+          set_gh_env_var OV_TAG '${{ github.event.inputs.OV_TAG }}'
+          set_gh_env_var GC_DUMP_IR '${{ github.event.inputs.GC_DUMP_IR }}'
+          set_gh_env_var GC_DEBUG '${{ github.event.inputs.GC_DEBUG }}'
           if [ '${{ github.event_name }}' = 'schedule' ]; then
-            echo 'LLVM_TAG=main' >> "$GITHUB_ENV" # Use the main branch for nightly builds
-          elif [ -n '${{ github.event.inputs.LLVM_TAG }}' ]; then
-            echo 'LLVM_TAG=${{ github.event.inputs.LLVM_TAG }}' >> "$GITHUB_ENV"
+            set_gh_env_var LLVM_TAG main
+          else
+            set_gh_env_var LLVM_TAG '${{ github.event.inputs.LLVM_TAG }}'
           fi
-          [ -z '${{ github.event.inputs.LLVM_URL }}' ] || \
-            echo 'LLVM_URL=${{ github.event.inputs.LLVM_URL }}' >> "$GITHUB_ENV"
-          [ '${{ github.event.inputs.LLVM_NO_PATCH }}' = 'true' ] && \
-            echo 'LLVM_NO_PATCH=1' >> "$GITHUB_ENV"
-          if [ '${{ github.event.inputs.GC_DUMP_IR }}' = 'true' ]; then
-            echo 'GC_DUMP_IR=1' >> "$GITHUB_ENV"
+          if is_true "$GC_DUMP_IR"; then
             echo 'OV_MLIR_DEBUG=1' >> "$GITHUB_ENV"
             echo 'GC_FILE_CACHE_OFF=1' >> "$GITHUB_ENV"
           fi
-          [ -z '${{ github.event.inputs.GC_DEBUG }}' ] || \
-            echo 'GC_DEBUG=${{ github.event.inputs.GC_DEBUG }}' >> "$GITHUB_ENV"
 
-          grep -F '${LLVM_URL:=' scripts/compile.sh >> "$GITHUB_ENV"
-          grep -F '${LLVM_TAG:=' scripts/compile.sh >> "$GITHUB_ENV"
           PROJECT_DIR="$PWD"
-          . "$GITHUB_ENV"
-          sed -i '/LLVM_URL/d' "$GITHUB_ENV"
-          sed -i '/LLVM_TAG/d' "$GITHUB_ENV"
-
-          resolve_sha() {
-            echo "$2" | grep -qE '^[0-9a-f]{40}$' && { echo "$2"; return; }
-            git ls-remote "$1" "refs/heads/$2" "refs/tags/$2" | awk '{print $1}' | head -1
-          }
-          LLVM_TAG=$(resolve_sha "$LLVM_URL" "$LLVM_TAG")
-          OV_TAG=$(resolve_sha "$OV_URL" "$OV_TAG")
-          echo "LLVM_URL=$LLVM_URL" >> "$GITHUB_ENV"
-          echo "LLVM_TAG=$LLVM_TAG" >> "$GITHUB_ENV"
-          echo "OV_TAG=$OV_TAG" >> "$GITHUB_ENV"
-
-          echo "GITHUB_ENV - $GITHUB_ENV:"
-          cat "$GITHUB_ENV"
-
+          . scripts/build.sh
+          echo "LLVM_TAG=$(git_sha "$LLVM_URL" "$LLVM_TAG")" >> "$GITHUB_ENV"
+          echo "OV_TAG=$(git_sha "$OV_URL" "$OV_TAG")" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$GC_INSTALL_DIR/lib:$LLVM_INSTALL_DIR/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
 
       - name: List changed files
         id: ls
@@ -133,16 +124,10 @@ jobs:
       - name: Set up cache
         id: setup-cache
         run: |
-          sha() { \
-            echo "$@" | tr ' ' '\n' | sort | \
-            while read i; do \
-              [ -f "$i" ] && sha1sum "$i" || echo "$i"; \
-            done | sha1sum | cut -d' ' -f1; \
-          }
-
-          venv_sha=$(sha scripts/create_venv.sh)
-          llvm_sha=$(sha $venv_sha "$LLVM_TAG" "$LLVM_NO_PATCH" scripts/compile.sh patches/*.patch)
-          ov_sha=$(sha $llvm_sha "$OV_TAG")
+          . scripts/utils.sh
+          venv_sha=$(sha1 scripts/create-venv.sh)
+          llvm_sha=$(sha1 $venv_sha "$LLVM_TAG" "$LLVM_NO_PATCH" scripts/build.sh patches/*.patch)
+          ov_sha=$(sha1 $llvm_sha "$OV_TAG")
           echo "venv-key=venv-${venv_sha}" >> "$GITHUB_OUTPUT"
           echo "llvm-key=llvm-${llvm_sha}" >> "$GITHUB_OUTPUT"
           echo "ov-key=ov-${ov_sha}" >> "$GITHUB_OUTPUT"
@@ -172,7 +157,7 @@ jobs:
       - name: Create Python venv if not found in cache
         if: steps.load-venv.outputs.cache-hit != 'true'
         run: |
-          bash -c scripts/create_venv.sh
+          bash -c scripts/create-venv.sh
 
       - name: Activate Python venv
         run: |
@@ -195,9 +180,9 @@ jobs:
 
       - name: Build and install
         run: |
-          [ -z "$ONEAPI_ROOT" ] && . /opt/intel/oneapi/setvars.sh
+          export LLVM_BUILD_TARGET=install
           pip install -v -e python
-          echo "LD_LIBRARY_PATH=${{ env.LLVM_INSTALL_DIR }}/lib:$PWD/build/install/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+
           lit_dir=externals/llvm-project/llvm/utils/lit
           if [ -d "$lit_dir" ]; then
             pip install "$lit_dir"
@@ -238,11 +223,11 @@ jobs:
       # - name: clang-tidy
       #   run: |
       #     echo "${{ steps.ls.outputs.files }}" | tr ':' '\n' | sed -nE '/\.(h|cpp)$/p' \
-      #     | xargs -r -P $(nproc) clang-tidy -p build --warnings-as-errors='*'
+      #     | xargs -r -P $(nproc) clang-tidy -p build/$GC_BUILD_TYPE --warnings-as-errors='*'
 
       - name: Run lit tests
         run: |
-          cmake --build build --target gc-check
+          cmake --build build/$GC_BUILD_TYPE --target gc-check
 
       - name: Run Python tests
         run: |
@@ -259,6 +244,7 @@ jobs:
         with:
           name: failed-python-test-dumps
           path: failed_test_dumps/python
+          retention-days: 1
           if-no-files-found: ignore
 
       - name: Load OpenVINO from cache
@@ -273,37 +259,10 @@ jobs:
       - name: Build OpenVINO if not found in cache
         if: steps.load-ov.outputs.cache-hit != 'true'
         run: |
-          llvm_dir="${{env.LLVM_INSTALL_DIR}}"
-          gc_dir="$PWD/build/install"
-          ov_dir="${{env.OV_INSTALL_DIR}}"
-          export GIT_LFS_SKIP_SMUDGE=1
-          git init $ov_dir
-          git -C $ov_dir fetch --depth 1 $OV_URL $OV_TAG
-          git -C $ov_dir checkout FETCH_HEAD
-          git -C $ov_dir submodule update --init --recursive --depth 1 --jobs $(nproc)
-          cmake -G Ninja -S "$ov_dir" -B "$ov_dir/build" \
-            -DLLVM_DIR=$llvm_dir/lib/cmake/llvm \
-            -DMLIR_DIR=$llvm_dir/lib/cmake/mlir \
-            -DENABLE_GPU_MLIR=ON \
-            -DLLVM_DYLINK=ON \
-            -DENABLE_INTEL_GPU=ON \
-            -DENABLE_TESTS=ON \
-            -DENABLE_ONEDNN_FOR_GPU=OFF \
-            -DENABLE_INTEL_CPU=OFF \
-            -DENABLE_INTEL_NPU=OFF \
-            -DCMAKE_CXX_FLAGS="-DOV_GPU_OPENCL_HPP_HAS_UUID -DOV_GPU_OPENCL_HPP_HAS_BUS_INFO" \
-            -DGraphCompiler_DIR=$gc_dir/lib/cmake/GraphCompiler \
-            -DOpenCL_HPP_INCLUDE_DIR="$ov_dir/thirdparty/ocl/clhpp_headers/include" \
-            -DOpenCL_HPP="$ov_dir/thirdparty/ocl/clhpp_headers/include/CL/opencl.hpp"
-          cmake --build "$ov_dir/build" --parallel $(nproc)
-          # Remove unnecessary files to reduce the cache size
-          bk=$ov_dir.bk
-          mv $ov_dir $bk
-          mkdir -p $ov_dir/bin/intel64/Release
-          mkdir -p $ov_dir/src/plugins/intel_gpu/tests/functional/mlir_op
-          cp $bk/bin/intel64/Release/ov_gpu_func_tests $ov_dir/bin/intel64/Release/
-          cp $bk/bin/intel64/Release/*.so* $ov_dir/bin/intel64/Release/
-          rm -rf $bk
+          export LLVM_BUILD_TARGET=install
+          export OV_DIR="${{env.OV_INSTALL_DIR}}-src"
+          GC_BUILD_SKIP=1 LLVM_BUILD_SKIP=1 ./scripts/ov-build.sh
+          rm -rf "$OV_DIR"
 
       - name: Save OpenVINO to cache
         if: steps.load-ov.outputs.cache-hit != 'true'
@@ -325,27 +284,7 @@ jobs:
 
       - name: Run OpenVINO tests
         run: |
-          export OV_GPU_ENABLE_MLIR=1
-          export OV_GPU_QUEUE_TYPE=out-of-order
-          ov_test_runner="${{env.OV_INSTALL_DIR}}/bin/intel64/Release/ov_gpu_func_tests"
-          test_dump_dir="$PWD/failed_test_dumps/ov"
-          rm -rf "$test_dump_dir"
-
-          # Regex patterns of tests to exclude from the run.
-          exclude=''
-          filter=$(printf '%s:' \
-            'MLIRExecution.SimpleMatmulf16' \
-            'MLIRExecution.SDPABasic' \
-            '*ScaledAttnLayerGPUMlirTest*' \
-            'mlir_*' \
-          )
-          tests=$("$ov_test_runner" --gtest_list_tests --gtest_filter="${filter%:}" \
-            | awk -v exclude="$exclude" '/^  /{print suite $1} /^[^ ]/{suite=$1}')
-          [ -n "$exclude" ] && tests=$(echo "$tests" | grep -v -E "$exclude")
-
-          start=$SECONDS
-          echo "$tests" | xargs -P 32 -I{} "$TEST_RUNNER" "$test_dump_dir" "$ov_test_runner" --gtest_filter='{}'
-          echo "Run $(echo "$tests" | wc -l) OV tests in $((SECONDS - start))s"
+          ./scripts/ov-test.sh
 
       - name: Upload failed OV test dumps
         if: always()
@@ -353,4 +292,5 @@ jobs:
         with:
           name: failed-ov-test-dumps
           path: failed_test_dumps/ov
+          retention-days: 1
           if-no-files-found: ignore

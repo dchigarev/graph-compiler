@@ -147,14 +147,14 @@ runs:
           else
             echo "$uname"
           fi
-        done | xargs -n1 echo -n ' ! -name ')
+        done | xargs -r -n1 echo -n ' ! -name ')
         find "$usr_dir" -maxdepth 1 -type f $preserve \
           -exec echo "Removing cache user: {}" \; -delete
 
         # Remove unused cache entries
         preserve=$(cd "$cache_dir" && for f in *; do
-          grep -qE "^${f}\$" -R "$usr_dir" && echo "$f"
-        done | xargs -n1 echo -n ' ! -name ')
+          ! grep -qE "^${f}\$" -R "$usr_dir" || echo "$f"
+        done | xargs -r -n1 echo -n ' ! -name ')
         find "$cache_dir" -mindepth 1 -maxdepth 1 -type d \
           ! -name "$usr_dir_name" $preserve \
           -exec echo "Removing unused cache entry: {}" \; -exec rm -rf {} \;
