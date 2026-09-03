@@ -25,8 +25,10 @@ struct TileAttention final
     tg.tiles[tg.tiles.size() - 4] = 128;
   }
 
-  SmallVector<size_t> computeThreads(Target &tg) override {
-    return {128, 1, 1};
+  SmallVector<size_t> computeSgLayout(Target &tg) override {
+    size_t m = 1, n = 1;
+    for (size_t i = 128 / getSgSize(tg); i > 1; i /= 2) (m <= n ? m : n) *= 2;
+    return {m, n};
   }
 };
 } // namespace

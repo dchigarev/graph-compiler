@@ -304,6 +304,12 @@ struct KernelAttrs : public GcAttrs<const char *, StringRef> {
   }
   void setThreads(ArrayRef<size_t> threads) { set(THREADS, threads); }
 
+  // Number of subgroups per non-reduction dim, i.e. wgTile/sgTile.
+  std::optional<SmallVector<size_t>> getSgLayout() {
+    return get<SmallVector<size_t>>(SG_LAYOUT);
+  }
+  void setSgLayout(ArrayRef<size_t> layout) { set(SG_LAYOUT, layout); }
+
   std::optional<SmallVector<StringRef>> getDepends() {
     return get<SmallVector<StringRef>>(DEPENDS);
   }
@@ -323,18 +329,10 @@ struct KernelAttrs : public GcAttrs<const char *, StringRef> {
     set(SG_SIZE, static_cast<T>(sgSize));
   }
 
-  template <typename T = size_t> std::optional<T> getSgCount() {
-    auto sgSize = getSgSize();
-    auto threads = getThreads();
-    if (!sgSize || !threads) return std::nullopt;
-    auto prod = std::accumulate(threads->begin(), threads->end(), 1,
-                                std::multiplies<>());
-    return static_cast<T>(prod / *sgSize);
-  }
-
 private:
   static constexpr char TILES[] = "tiles";
   static constexpr char THREADS[] = "threads";
+  static constexpr char SG_LAYOUT[] = "sg_layout";
   static constexpr char WG_SIZE[] = "wg_size";
   static constexpr char SG_SIZE[] = "sg_size";
   static constexpr char DEPENDS[] = "depends";
