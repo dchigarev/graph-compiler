@@ -157,7 +157,7 @@ build_llvm() {
     elif ! is_true "$LLVM_NO_PATCH"; then
         cd "$LLVM_DIR"
         [ $(git -C "$LLVM_DIR" rev-parse HEAD) = "$LLVM_TAG" ] || git fetch --no-tags --depth=1 origin ${LLVM_TAG}
-        git reset --hard ${LLVM_TAG}
+        git reset --hard FETCH_HEAD
         [ -z "$CLEANUP" ] || git clean -xffd;
     else
       cd "$LLVM_DIR"

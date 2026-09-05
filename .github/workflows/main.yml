@@ -1,10 +1,10 @@
 name: Build and test
 run-name: >
   ${{
-    github.event_name == 'schedule' && 'CI (nightly)' ||
+    github.event_name == 'schedule' && format('{0} (nightly)', github.workflow) ||
     (github.event.inputs.LLVM_TAG || github.event.inputs.LLVM_URL) &&
-      format('CI {0} {1}', github.event.inputs.LLVM_TAG, github.event.inputs.LLVM_URL) ||
-    'CI'
+      format('{0} {1} {2}', github.workflow, github.event.inputs.LLVM_TAG, github.event.inputs.LLVM_URL) ||
+    github.workflow
   }}
 
 on:

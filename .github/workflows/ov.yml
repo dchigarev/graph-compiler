@@ -1,4 +1,11 @@
 name: OpenVINO integration
+run-name: >
+  ${{
+    github.event_name == 'schedule' && format('{0} (nightly)', github.workflow) ||
+    (github.event.inputs.LLVM_TAG || github.event.inputs.LLVM_URL) &&
+      format('{0} {1} {2}', github.workflow, github.event.inputs.LLVM_TAG, github.event.inputs.LLVM_URL) ||
+    github.workflow
+  }}
 
 on:
   pull_request:
@@ -69,6 +76,11 @@ jobs:
             echo 'OV_MLIR_DEBUG=1' >> "$GITHUB_ENV"
             echo 'GC_FILE_CACHE_OFF=1' >> "$GITHUB_ENV"
           fi
+
+          PROJECT_DIR="$PWD"
+          . scripts/build.sh
+          echo "LLVM_TAG=$(git_sha "$LLVM_URL" "$LLVM_TAG")" >> "$GITHUB_ENV"
+          echo "OV_TAG=$(git_sha "$OV_URL" "$OV_TAG")" >> "$GITHUB_ENV"
 
       - name: Create Python venv
         run: |
