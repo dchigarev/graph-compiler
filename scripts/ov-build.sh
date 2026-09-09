@@ -72,7 +72,8 @@ build_ov() {
         -DCMAKE_BUILD_TYPE=$OV_BUILD_TYPE \
         -DMLIR_DIR="$MLIR_DIR" \
         -DLLVM_DIR="$llvm_dir" \
-        -DENABLE_GPU_MLIR=ON \
+        -DENABLE_MLIR_FOR_GPU=ON \
+        -DENABLE_DEBUG_CAPS=ON \
         -DLLVM_DYLINK=$GC_DYLINK \
         -DENABLE_INTEL_GPU=ON \
         -DENABLE_TESTS=ON \
