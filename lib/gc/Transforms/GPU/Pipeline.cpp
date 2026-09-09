@@ -306,6 +306,8 @@ void populateGPUPipeline(OpPassManager &pm,
     pm.addPass(bufferization::createBufferResultsToOutParamsPass(
         {true, true, true, true}));
     pm.addPass(memref::createFoldMemRefAliasOpsPass());
+    pm.addNestedPass<func::FuncOp>(createCSEPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createRemoveAllocs());
     pm.addNestedPass<func::FuncOp>(createDropUnitDims());
   });

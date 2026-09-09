@@ -20,6 +20,7 @@
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/Support/Casting.h"
 #include <cmath>
+#include <numeric>
 #include <utility>
 
 using namespace mlir;
@@ -154,6 +155,42 @@ inline bool isParallel(Operation *op) {
 inline bool isReduction(Operation *op) {
   return allIterators(op, utils::IteratorType::reduction);
 }
+
+// Tile size constraints of a single tiled dim, collected from the fusible
+// subgraph. The two rules are opposite in direction, thus can't be expressed
+// as a single upper bound:
+//  * A reshape group can only be fused if the tile covers whole groups or
+//    divides one, i.e. the tile must divide the group's inner product.
+//  * A pack/unpack inner tile can only be fused if the tile covers it
+//    completely, i.e. the tile must be a multiple of the inner tile.
+struct DimConstraint {
+  size_t divisorOf = 0;  // tile must divide this, 0 = unconstrained
+  size_t multipleOf = 1; // tile must be a multiple of this
+
+  bool divides(size_t tile) const {
+    return tile && (!divisorOf || divisorOf % tile == 0);
+  }
+
+  bool satisfies(size_t tile) const {
+    return divides(tile) && tile % multipleOf == 0;
+  }
+
+  void narrow(size_t size) {
+    if (size) divisorOf = divisorOf ? std::gcd(divisorOf, size) : size;
+  }
+
+  void align(size_t size) {
+    if (size) multipleOf = std::lcm(multipleOf, size);
+  }
+};
+
+// Block sizes and tile multipliers supported by the target for a tiled op.
+struct BlockSizes {
+  SmallVector<unsigned> widths, heights, counts;
+  unsigned sgMul = 1;  // SG-tile multiplier
+  unsigned wgMulW = 1; // WG-tile multiplier of the width dim
+  unsigned wgMulH = 1; // WG-tile multiplier of the height dim
+};
 
 enum class Level : char { WG, SG };
 struct Target {
@@ -348,45 +385,43 @@ protected:
 
     bool unit = wDim == 0;
     size_t hDim = unit ? wDim : wDim - 1;
-    size_t wTile = wgTiles[wDim];
-    size_t hTile = unit ? 1 : wgTiles[hDim];
+    DimConstraint cw, ch;
+    cw.narrow(wgTiles[wDim]);
+    if (!unit) ch.narrow(wgTiles[hDim]);
     for (auto &t : wgTiles) t = 1;
-    adjustMaxTileSizes(tg, reduction, wTile, hTile);
+    collectTileConstraints(tg, cw, ch);
     // TODO: parameterize sgMul and wgMul in kernel attributes so they can
     // be used for auto tuning.
-    auto [widths, heights, counts, sgMul, wgMul] =
-        getSupportedBlockSizes(tg, reduction, wTile, hTile);
-    if (unit) {
-      heights = {1};
-    } else if (reduction) {
-      sgMul = wgMul = 1;
-    } else {
-      sgMul = std::sqrt(sgMul);
-      wgMul = std::sqrt(wgMul);
-    }
+    auto bs = getSupportedBlockSizes(tg, reduction, cw, ch);
+    if (unit) bs.heights = {1};
+    if (reduction) bs.sgMul = bs.wgMulW = bs.wgMulH = 1;
 
-    auto sgSize = getSgSize(tg);
-    auto wgSize = getWgSize(tg);
-    auto maxMul = reduction ? 1 : wgSize / sgSize;
+    auto maxMul = reduction ? 1 : getWgSize(tg) / getSgSize(tg);
 
-    for (auto w : widths)
-      for (auto h : heights)
-        for (auto c : counts)
-          for (auto sm = sgMul; sm; sm /= 2)
-            for (auto wm = wgMul; wm; wm /= 2) {
-              if ((unit ? wm : wm * wm) > maxMul) continue;
-              auto sgw = w * c * sm, sgh = h * sm;
-              auto wgw = sgw * wm, wgh = sgh * wm;
-              if (wTile % wgw || (!unit && hTile % wgh)) continue;
-              wgTiles[wDim] = wgw;
-              sgTiles[wDim] = sgw;
-              if (!unit) {
-                wgTiles[hDim] = wgh;
-                sgTiles[hDim] = sgh;
-              }
-              tg.setTiles(wgTiles, sgTiles, reduction);
-              return;
-            }
+    // The second round drops the `multipleOf` constraints: if no tile can
+    // satisfy them, the reshape just won't fuse, but tiling must still happen.
+    for (bool strict : {true, false})
+      for (auto w : bs.widths)
+        for (auto h : bs.heights)
+          for (auto c : bs.counts)
+            for (auto sm = bs.sgMul; sm; sm /= 2)
+              for (auto wmw = bs.wgMulW; wmw; wmw /= 2)
+                for (auto wmh = unit ? 1u : bs.wgMulH; wmh; wmh /= 2) {
+                  if ((unit ? wmw : wmw * wmh) > maxMul) continue;
+                  size_t sgw = w * c * sm, sgh = h * sm;
+                  size_t wgw = sgw * wmw, wgh = sgh * wmh;
+                  if (!(strict ? cw.satisfies(wgw) : cw.divides(wgw))) continue;
+                  if (!unit && !(strict ? ch.satisfies(wgh) : ch.divides(wgh)))
+                    continue;
+                  wgTiles[wDim] = wgw;
+                  sgTiles[wDim] = sgw;
+                  if (!unit) {
+                    wgTiles[hDim] = wgh;
+                    sgTiles[hDim] = sgh;
+                  }
+                  tg.setTiles(wgTiles, sgTiles, reduction);
+                  return;
+                }
 
     wgTiles[wDim] = 1;
     wgTiles[hDim] = 1;
@@ -396,10 +431,10 @@ protected:
   }
 
   // If there is a reshape in the fusible subgraph, that reshapes one or both of
-  // the last 2 dims (height x width), adjust the height and width maximum
-  // values, so that they could be properly reshaped.
-  virtual void adjustMaxTileSizes(Target &tg, bool reduction, size_t &width,
-                                  size_t &height) {
+  // the last 2 dims (height x width), constrain the width and height tiles, so
+  // that the reshape could be fused.
+  virtual void collectTileConstraints(Target &tg, DimConstraint &width,
+                                      DimConstraint &height) {
     auto canFuse = [&](Operation *user) {
       return user->getBlock() == tg.op->getBlock() && isParallel(user);
     };
@@ -423,9 +458,8 @@ protected:
               int64_t ip = 1;
               for (size_t i = 1; i < group.size(); ++i)
                 ip *= dstType.getDimSize(group[i]);
-              if (srcDim == rank - 1) width = std::min(width, (size_t)ip);
-              else if (srcDim == rank - 2)
-                height = std::min(height, (size_t)ip);
+              if (srcDim == rank - 1) width.narrow(ip);
+              else if (srcDim == rank - 2) height.narrow(ip);
             }
             stack.push_back(user);
           } else if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(user)) {
@@ -436,20 +470,26 @@ protected:
               if (group.size() <= 1) continue;
               int64_t ip = 1;
               for (auto d : group) ip *= srcType.getDimSize(d);
-              if (dstDim == rank - 1) width = std::min(width, (size_t)ip);
-              else if (dstDim == rank - 2)
-                height = std::min(height, (size_t)ip);
+              if (dstDim == rank - 1) width.narrow(ip);
+              else if (dstDim == rank - 2) height.narrow(ip);
             }
             stack.push_back(user);
           } else if (auto pack = dyn_cast<linalg::PackOp>(user)) {
+            // The tile must cover whole inner tiles. Narrow it to a single one
+            // as well - a bigger tile would fuse, but a multiple of the inner
+            // tile is what the consumers of the packed value expect.
             auto tiles = pack.getMixedTiles();
             auto n = tiles.size();
             if (n >= 1)
-              if (auto v = getConstantIntValue(tiles[n - 1]))
-                width = std::min(width, (size_t)*v);
+              if (auto v = getConstantIntValue(tiles[n - 1])) {
+                width.align(*v);
+                width.narrow(*v);
+              }
             if (n >= 2)
-              if (auto v = getConstantIntValue(tiles[n - 2]))
-                height = std::min(height, (size_t)*v);
+              if (auto v = getConstantIntValue(tiles[n - 2])) {
+                height.align(*v);
+                height.narrow(*v);
+              }
             stack.push_back(user);
           } else if (canFuse(user)) {
             stack.push_back(user);
@@ -459,15 +499,11 @@ protected:
     }
   }
 
-  // Get the supported block sizes, that can be used for tiling of the specified
-  // width and height.
-  //
-  // Returns block widths, heights, counts, SG-tile multiplier,
-  // WG-tile multiplier
-  virtual std::tuple<SmallVector<unsigned>, SmallVector<unsigned>,
-                     SmallVector<unsigned>, unsigned, unsigned>
-  getSupportedBlockSizes(Target &tg, bool reduction, size_t width,
-                         size_t height) {
+  // Get the supported block sizes, that can be used for tiling of the dims
+  // described by the width and height constraints.
+  virtual BlockSizes getSupportedBlockSizes(Target &tg, bool reduction,
+                                            const DimConstraint &cw,
+                                            const DimConstraint &ch) {
     Type elTy;
     // Get the operand with maximum width
     for (auto o : tg.op.getOperation()->getOperands()) {
@@ -486,8 +522,7 @@ protected:
 
     if (!elTy) {
       tg.op->emitError() << "At least one operand must be of ShapedType";
-      return std::make_tuple(SmallVector<unsigned>{1}, SmallVector<unsigned>{1},
-                             SmallVector<unsigned>{1}, 1, 1);
+      return {};
     }
 
     // The block sizes computation is based on the assumption, that the kernel
@@ -508,40 +543,55 @@ protected:
 
     // Get only the common sizes from both instructions and filter out those
     // that do not divide the tile sizes.
-    SmallVector<unsigned> widths, heights, counts;
+    BlockSizes bs;
     for (unsigned w : std::get<0>(loadSizes))
-      if (width % w == 0 && llvm::is_contained(std::get<0>(storeSizes), w))
-        widths.push_back(w);
+      if (cw.divides(w) && llvm::is_contained(std::get<0>(storeSizes), w))
+        bs.widths.push_back(w);
     for (unsigned h : std::get<1>(loadSizes))
-      if (height % h == 0 && llvm::is_contained(std::get<1>(storeSizes), h))
-        heights.push_back(h);
+      if (ch.divides(h) && llvm::is_contained(std::get<1>(storeSizes), h))
+        bs.heights.push_back(h);
     for (unsigned c : std::get<2>(loadSizes))
-      if (llvm::is_contained(std::get<2>(storeSizes), c)) counts.push_back(c);
-    for (auto l : {&widths, &heights, &counts})
+      if (llvm::is_contained(std::get<2>(storeSizes), c))
+        bs.counts.push_back(c);
+    for (auto l : {&bs.widths, &bs.heights, &bs.counts})
       if (!llvm::is_contained(*l, 1)) l->push_back(1);
 
-    llvm::sort(widths, std::greater<unsigned>());
-    llvm::sort(heights, std::greater<unsigned>());
-    llvm::sort(counts, std::greater<unsigned>());
-    return std::make_tuple(widths, heights, counts, 2, getSgSize(tg));
+    llvm::sort(bs.widths, std::greater<unsigned>());
+    llvm::sort(bs.heights, std::greater<unsigned>());
+    llvm::sort(bs.counts, std::greater<unsigned>());
+    bs.wgMulW = bs.wgMulH = std::sqrt(getSgSize(tg));
+    return bs;
   }
 
-  virtual SmallVector<size_t> computeThreads(Target &tg) {
-    size_t threads = getSgSize(tg);
-    size_t maxThreads = 1;
+  // Number of subgroups the wg tile is distributed over, per non-reduction dim.
+  virtual SmallVector<size_t> computeSgLayout(Target &tg) {
+    SmallVector<size_t> layout;
+    size_t nonUnit = 0;
     for (auto [wg, sg, s, r] :
          llvm::zip(tg.tiles, tg.sgTiles, tg.sizes, tg.reductions)) {
       if (!r) {
-        threads *= wg / sg;
-        maxThreads *= s / sg;
+        layout.push_back(wg / sg);
+        if (s != 1) nonUnit = layout.size();
       }
     }
-    threads = std::min(threads, maxThreads);
+    // The trailing unit dims are removed by the DropUnitDims pass.
+    layout.truncate(nonUnit);
+    return layout;
+  }
 
-    auto wgSize = getWgSize(tg);
-    assert(threads <= wgSize && "wg/sg tiling exceeds max wg size");
-    // Divide by 2 due to -ze-opt-large-register-file
-    return {std::min(threads, wgSize / 2), 1, 1};
+  virtual SmallVector<size_t> computeThreads(Target &tg) {
+    auto sgLayout = computeSgLayout(tg);
+    auto sgs = [&] {
+      return std::accumulate(sgLayout.begin(), sgLayout.end(), size_t{1},
+                             std::multiplies<>());
+    };
+    // Divide by 2 due to -ze-opt-large-register-file.
+    auto maxSgs = getWgSize(tg) / 2 / getSgSize(tg);
+    for (auto &d : llvm::reverse(sgLayout))
+      for (; sgs() > maxSgs && d > 1; d /= 2);
+    assert(sgs() <= maxSgs && "wg/sg tiling exceeds max wg size");
+    tg.kernelAttrs.setSgLayout(sgLayout);
+    return {getSgSize(tg) * sgs(), 1, 1};
   }
 
   virtual size_t getWgSize(Target &tg) {
@@ -668,9 +718,14 @@ protected:
 
   static bool fuseConsumers(Target &tg, LoopLikeOpInterface &loop,
                             AffineMap prodMap) {
-    auto isFusible = [&](Operation *op) {
-      return canFuse(loop, op) ||
-             isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp>(op);
+    std::function<bool(Operation *)> isFusible = [&](Operation *op) {
+      if (canFuse(loop, op)) return true;
+      if (!isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp>(op))
+        return false;
+      for (auto user : op->getUsers()) {
+        if (isFusible(user)) return true;
+      }
+      return false;
     };
 
     for (bool fused = true; fused;) {

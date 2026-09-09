@@ -43,12 +43,16 @@ std::optional<SmallVector<int32_t>> adjustLayout(Operation *op,
                                                  SmallVector<int32_t> &shape) {
   auto fn = op->getParentOfType<gpu::GPUFuncOp>();
   if (!fn) return std::nullopt;
-  KernelAttrs kernel(op, fn.getName().str());
-  auto nSgs = kernel.getSgCount<int32_t>();
-  if (!nSgs) return std::nullopt;
-  int32_t m = 1, n = 1;
-  for (int32_t i = *nSgs; i > 1; i /= 2) (m <= n ? m : n) *= 2;
   auto rank = shape.size();
+  if (rank < 2) return std::nullopt;
+  auto sgLayout = KernelAttrs(op, fn.getName().str()).getSgLayout();
+  if (!sgLayout) return std::nullopt;
+
+  // Only the innermost 2 dims are tiled, the leading ones are always 1.
+  auto s = sgLayout->size();
+  int32_t n = s ? static_cast<int32_t>((*sgLayout)[s - 1]) : 1;
+  int32_t m = s > 1 ? static_cast<int32_t>((*sgLayout)[s - 2]) : 1;
+  if (shape[rank - 2] % m || shape[rank - 1] % n) return std::nullopt;
   SmallVector<int32_t> layout(rank, 1);
   layout[rank - 2] = m;
   layout[rank - 1] = n;

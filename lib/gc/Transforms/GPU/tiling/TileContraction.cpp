@@ -16,15 +16,16 @@ struct TileContraction final
 
   bool isSupportedOp(TilingInterface ti) override { return isMatmulOp(ti); }
 
-  virtual std::tuple<SmallVector<unsigned>, SmallVector<unsigned>,
-                     SmallVector<unsigned>, unsigned, unsigned>
-  getSupportedBlockSizes(Target &tg, bool reduction, size_t width,
-                         size_t height) override {
+  BlockSizes getSupportedBlockSizes(Target &tg, bool reduction,
+                                    const DimConstraint &cw,
+                                    const DimConstraint &ch) override {
+    BlockSizes bs;
     if (reduction) {
       auto tiles = tg.kernelAttrs.getTiles().value();
-      return std::make_tuple(
-          SmallVector<unsigned>{static_cast<unsigned>(tiles.back())},
-          SmallVector<unsigned>{1}, SmallVector<unsigned>{1}, 1, 1);
+      bs.widths = {static_cast<unsigned>(tiles.back())};
+      bs.heights = {1};
+      bs.counts = {1};
+      return bs;
     }
 
     auto ua = tg.devAttrs.getUarch();
@@ -35,8 +36,7 @@ struct TileContraction final
     auto elType =
         cast<ShapedType>(tg.op.getOperation()->getOperand(0).getType())
             .getElementType();
-    auto [widths, heights, counts, sgMul, wgMul] =
-        TilingPass::getSupportedBlockSizes(tg, false, width, height);
+    bs = TilingPass::getSupportedBlockSizes(tg, false, cw, ch);
     auto supportedM = instr->getSupportedM(elType);
     auto supportedN = instr->getSupportedN(elType);
     auto supportedK =
@@ -45,54 +45,59 @@ struct TileContraction final
         });
     llvm::sort(supportedK, std::greater<unsigned>());
 
-    size_t kSize = tg.sizes.back();
-    unsigned mul = std::sqrt(getSgSize(tg));
-    std::function<bool(size_t, unsigned)> mMatch;
-    std::function<bool(size_t, unsigned)> nMatch;
-    if (tg.sizes[tg.sizes.size() - 3] == height) {
-      mMatch = [height](size_t m, unsigned mul) {
-        return height % (m * mul) == 0;
-      };
-    } else {
-      mMatch = [height](size_t m, unsigned mul) { return height == (m * mul); };
-      mul = std::max<unsigned>(mul, height);
+    bs.widths = llvm::filter_to_vector(bs.widths, [&](unsigned c) {
+      return llvm::is_contained(supportedN, c);
+    });
+    bs.heights = llvm::filter_to_vector(bs.heights, [&](unsigned c) {
+      return llvm::is_contained(supportedM, c);
+    });
+    bs.counts = {1};
+    if (bs.widths.empty() || bs.heights.empty() || supportedK.empty()) {
+      tg.op->emitWarning("No supported DPAS block size found");
+      bs.wgMulW = bs.wgMulH = 1;
+      return bs;
     }
-    if (tg.sizes[tg.sizes.size() - 2] == width) {
-      nMatch = [width](size_t n, unsigned mul) {
-        return width % (n * mul) == 0;
-      };
-    } else {
-      nMatch = [width](size_t n, unsigned mul) { return width == (n * mul); };
-      mul = std::max<unsigned>(mul, width);
-    }
-    widths = llvm::filter_to_vector(
-        widths, [&](unsigned c) { return llvm::is_contained(supportedN, c); });
-    heights = llvm::filter_to_vector(
-        heights, [&](unsigned c) { return llvm::is_contained(supportedM, c); });
-    counts = {1};
 
-    for (; mul >= 1; mul /= 2)
-      for (auto m : heights)
-        for (auto n : widths)
-          for (auto k : supportedK)
-            if (kSize % (k * mul) == 0 && mMatch(m, mul) && nMatch(n, mul)) {
-              heights = {m};
-              widths = {n};
-              supportedK = {k};
-              goto setTiles;
-            }
-  setTiles:
-    SmallVector<size_t> tiles = {heights.front() * mul, widths.front() * mul,
-                                 supportedK.front() * mul};
-    tg.kernelAttrs.setTiles(tiles);
-    return std::make_tuple(widths, heights, counts, 1, mul * mul);
+    size_t kSize = tg.sizes.back();
+    unsigned base = std::sqrt(getSgSize(tg));
+    unsigned maxMul = getWgSize(tg) / getSgSize(tg);
+    for (auto n : bs.widths)
+      for (auto mulN = base; mulN; mulN /= 2) {
+        if (!cw.satisfies(n * mulN)) continue;
+        for (auto m : bs.heights)
+          for (auto mulM = base; mulM; mulM /= 2) {
+            if (mulM * mulN > maxMul || !ch.satisfies(m * mulM)) continue;
+            for (auto k : supportedK)
+              for (auto mulK = mulN; mulK; mulK /= 2)
+                if (kSize % (k * mulK) == 0) {
+                  tg.kernelAttrs.setTiles(
+                      {m * mulM, n * mulN, size_t{k} * mulK});
+                  bs.widths = {n};
+                  bs.heights = {m};
+                  bs.wgMulW = mulN;
+                  bs.wgMulH = mulM;
+                  return bs;
+                }
+          }
+      }
+
+    // Nothing satisfies the constraints, fall back to a single DPAS block.
+    tg.kernelAttrs.setTiles(
+        {bs.heights.front(), bs.widths.front(), supportedK.front()});
+    bs.widths = {bs.widths.front()};
+    bs.heights = {bs.heights.front()};
+    bs.wgMulW = bs.wgMulH = 1;
+    return bs;
   }
 
-  SmallVector<size_t> computeThreads(Target &tg) override {
-    auto sgSize = getSgSize(tg);
-    auto threads = TilingPass::computeThreads(tg);
-    threads[0] = std::max<size_t>(sgSize, threads[0] / sgSize);
-    return threads;
+  SmallVector<size_t> computeSgLayout(Target &tg) override {
+    auto layout = TilingPass::computeSgLayout(tg);
+    auto count = std::accumulate(layout.begin(), layout.end(), size_t{1},
+                                 std::multiplies<>());
+    size_t m = 1, n = 1;
+    for (size_t i = std::max<size_t>(1, count / getSgSize(tg)); i > 1; i /= 2)
+      (m <= n ? m : n) *= 2;
+    return {m, n};
   }
 };
 } // namespace
