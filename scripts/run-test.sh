@@ -33,6 +33,6 @@ echo "$OUTPUT" > "$DUMP_FILE"
 [ "$GC_DUMP_IR" = "1" ] && echo "$OUTPUT" && exit $EC
 
 echo "Running test again with IR dumps enabled:" >> "$DUMP_FILE"
-GC_DUMP_IR=1 GC_FILE_CACHE_OFF=1 OV_MLIR_DEBUG=1 "$@" >> "$DUMP_FILE" 2>&1
+GC_DUMP_IR=1 GC_FILE_CACHE_OFF=1 OV_GPU_MLIR_DEBUG=1 "$@" >> "$DUMP_FILE" 2>&1
 cat "$DUMP_FILE"
 exit $EC

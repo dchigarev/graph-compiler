@@ -83,7 +83,7 @@ jobs:
             set_gh_env_var LLVM_TAG '${{ github.event.inputs.LLVM_TAG }}'
           fi
           if is_true "$GC_DUMP_IR"; then
-            echo 'OV_MLIR_DEBUG=1' >> "$GITHUB_ENV"
+            echo 'OV_GPU_MLIR_DEBUG=1' >> "$GITHUB_ENV"
             echo 'GC_FILE_CACHE_OFF=1' >> "$GITHUB_ENV"
           fi
 
