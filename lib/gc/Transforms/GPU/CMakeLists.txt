@@ -6,6 +6,7 @@ gc_add_mlir_library(
   GcGpuPasses
   tiling/TileContraction.cpp
   tiling/TileAttention.cpp
+  tiling/TileGroupedMatmul.cpp
   tiling/TileParallel.cpp
   AddContextArg.cpp
   ApplyPaddingLevel.cpp

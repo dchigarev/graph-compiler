@@ -79,6 +79,53 @@ AffineMap AttentionOp::getMatchingIndexingMap(OpOperand *operand) {
            operand->getOperandNumber());
 }
 
+//===----------------------------------------------------------------------===//
+// GroupedMatmulOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult GroupedMatmulOp::verify() {
+  auto lhsTy = dyn_cast<ShapedType>(getLhs().getType());
+  auto weiTy = dyn_cast<ShapedType>(getWeights().getType());
+  auto idxTy = dyn_cast<ShapedType>(getIndices().getType());
+  auto outTy = dyn_cast<ShapedType>(getOutput().getType());
+  if (!lhsTy || !weiTy || !idxTy || !outTy)
+    return emitOpError("expects shaped operands");
+  if (lhsTy.getRank() != 3 || weiTy.getRank() != 3 || outTy.getRank() != 3)
+    return emitOpError("expects rank-3 lhs [S, M, K], weights [E, N, K] and "
+                       "output [S, M, N]");
+  if (idxTy.getRank() != 2)
+    return emitOpError("expects rank-2 indices [M, S]");
+  if (!idxTy.getElementType().isSignlessInteger())
+    return emitOpError("expects integer indices");
+  if (getIndexingMaps().size() != 4)
+    return emitOpError("expects 4 indexing maps (lhs, weights, indices, "
+                       "output)");
+  if (getTileM() <= 0)
+    return emitOpError("expects a positive 'tile_m'");
+  return success();
+}
+
+ArrayRef<int64_t> GroupedMatmulOp::getShape(OpOperand *opOperand) {
+  assert(opOperand->getOwner() == this->getOperation());
+  if (auto shapedType = dyn_cast<ShapedType>(opOperand->get().getType()))
+    return shapedType.getShape();
+  return {};
+}
+
+MutableOperandRange GroupedMatmulOp::getDpsInitsMutable() {
+  return MutableOperandRange(*this, /*numInputs=*/3, /*numInits=*/1);
+}
+
+SmallVector<AffineMap> GroupedMatmulOp::getIndexingMapsArray() {
+  return SmallVector<AffineMap>(
+      getIndexingMaps().getAsValueRange<AffineMapAttr>());
+}
+
+AffineMap GroupedMatmulOp::getMatchingIndexingMap(OpOperand *operand) {
+  return *(getIndexingMaps().getAsValueRange<AffineMapAttr>().begin() +
+           operand->getOperandNumber());
+}
+
 /////// Operations corresponding to library calls defined with Tablegen ////////
 
 #define GET_OP_CLASSES

@@ -37,6 +37,14 @@ def TileContraction : Pass<"tile-contract", "func::FuncOp"> {
   }];
 }
 
+def TileGroupedMatmul : Pass<"tile-grouped-matmul", "func::FuncOp"> {
+  let summary = "Tile grouped matmul operations.";
+  let description = [{
+    Tile 'linalgx.grouped_matmul' ops (work-group level) and the contractions
+    they decompose into (sub-group level). Must run after 'tile-contract'.
+  }];
+}
+
 def TileAttention : Pass<"tile-attention", "func::FuncOp"> {
   let summary = "Tile attention operations.";
   let description = [{

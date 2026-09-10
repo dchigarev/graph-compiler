@@ -5,6 +5,8 @@
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -294,6 +296,158 @@ FailureOr<TilingResult> AttentionOp::generateResultTileValue(
       llvm::map_to_vector(iterationDomain, [](Range x) { return x.size; });
   SmallVector<OpFoldResult> normalizedOffsets(getIterationDomainRank(),
                                               builder.getIndexAttr(0));
+  ArrayRef<AffineExpr> outputDims = getOutputMap().getResults();
+  for (size_t i = 0; i < outputDims.size(); i++) {
+    int dim = cast<AffineDimExpr>(outputDims[i]).getPosition();
+    normalizedOffsets[dim] = offsets[i];
+    normalizedSizes[dim] = sizes[i];
+  }
+  return getTiledImplementation(builder, normalizedOffsets, normalizedSizes,
+                                innerTileAlignments);
+}
+
+//===----------------------------------------------------------------------===//
+// GroupedMatmulOp
+//===----------------------------------------------------------------------===//
+
+SmallVector<Range> GroupedMatmulOp::getIterationDomain(OpBuilder &b) {
+  Location loc = getLoc();
+  OpFoldResult zero = b.getIndexAttr(0);
+  OpFoldResult one = b.getIndexAttr(1);
+  SmallVector<Range> bounds(4);
+  for (Range &r : bounds) {
+    r.offset = zero;
+    r.stride = one;
+  }
+  // (slot, m, n) come from the output, k from the lhs.
+  bounds[kSlotDim].size = getDim(b, loc, getOutput(), 0);
+  bounds[kMDim].size = getDim(b, loc, getOutput(), 1);
+  bounds[kNDim].size = getDim(b, loc, getOutput(), 2);
+  bounds[kKDim].size = getDim(b, loc, getLhs(), 2);
+  return bounds;
+}
+
+SmallVector<utils::IteratorType> GroupedMatmulOp::getLoopIteratorTypes() {
+  return {utils::IteratorType::parallel, utils::IteratorType::parallel,
+          utils::IteratorType::parallel, utils::IteratorType::reduction};
+}
+
+FailureOr<TilingResult>
+GroupedMatmulOp::getTiledImplementation(OpBuilder &builder,
+                                        ArrayRef<OpFoldResult> offsets,
+                                        ArrayRef<OpFoldResult> sizes) {
+  return getTiledImplementation(builder, offsets, sizes, {});
+}
+
+FailureOr<TilingResult> GroupedMatmulOp::getTiledImplementation(
+    OpBuilder &builder, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes,
+    ArrayRef<InnerTileAlignment> innerTileAlignments) {
+  (void)innerTileAlignments;
+  assert(offsets.size() == 4 && sizes.size() == 4);
+
+  if (!hasPureTensorSemantics())
+    return emitOpError("tiling is only implemented for tensor semantics");
+
+  // The whole point of the op is that the expert index is uniform inside a
+  // tile, which only holds if the slot dim is tiled to 1 (it is a leading dim,
+  // so the tiling heuristics do that by default).
+  auto slotTile = getConstantIntValue(sizes[kSlotDim]);
+  if (!slotTile || *slotTile != 1)
+    return emitOpError("expects the slot dimension to be tiled to 1");
+
+  Location loc = getLoc();
+  OpFoldResult zero = builder.getIndexAttr(0);
+  OpFoldResult one = builder.getIndexAttr(1);
+
+  // Expert index of this tile: indices[m_offset, slot_offset].
+  Value mIdx = getValueOrCreateConstantIndexOp(builder, loc, offsets[kMDim]);
+  Value sIdx = getValueOrCreateConstantIndexOp(builder, loc, offsets[kSlotDim]);
+  Value expertI =
+      tensor::ExtractOp::create(builder, loc, getIndices(), ValueRange{mIdx, sIdx});
+  Value expert = arith::IndexCastOp::create(builder, loc, builder.getIndexType(),
+                                            expertI);
+
+  // A single lhs row feeds all the slots when lhs' leading dim is 1.
+  auto lhsType = cast<RankedTensorType>(getLhs().getType());
+  OpFoldResult lhsSlot =
+      lhsType.getDimSize(0) == 1 ? zero : offsets[kSlotDim];
+
+  SmallVector<OpFoldResult> unitStrides(3, one);
+  auto lhsSlice = tensor::ExtractSliceOp::create(
+      builder, loc, getLhs(),
+      SmallVector<OpFoldResult>{lhsSlot, offsets[kMDim], offsets[kKDim]},
+      SmallVector<OpFoldResult>{one, sizes[kMDim], sizes[kKDim]}, unitStrides);
+  auto weiSlice = tensor::ExtractSliceOp::create(
+      builder, loc, getWeights(),
+      SmallVector<OpFoldResult>{expert, offsets[kNDim], offsets[kKDim]},
+      SmallVector<OpFoldResult>{one, sizes[kNDim], sizes[kKDim]}, unitStrides);
+  auto outSlice = tensor::ExtractSliceOp::create(
+      builder, loc, getOutput(),
+      SmallVector<OpFoldResult>{offsets[kSlotDim], offsets[kMDim],
+                                offsets[kNDim]},
+      SmallVector<OpFoldResult>{one, sizes[kMDim], sizes[kNDim]}, unitStrides);
+
+  // With the expert resolved, the tile is a plain (batch-1) contraction:
+  //   out[0, m, n] += lhs[0, m, k] * wei[0, n, k]
+  // Kept as a linalg.generic so that no named-op flavour has to exist for the
+  // transposed-B form; LinalgSpecializeGenericOps may specialize it later.
+  MLIRContext *ctx = builder.getContext();
+  AffineExpr b0, m, n, k;
+  bindDims(ctx, b0, m, n, k);
+  SmallVector<AffineMap> maps = {AffineMap::get(4, 0, {b0, m, k}, ctx),
+                                 AffineMap::get(4, 0, {b0, n, k}, ctx),
+                                 AffineMap::get(4, 0, {b0, m, n}, ctx)};
+  SmallVector<utils::IteratorType> iterTypes = {
+      utils::IteratorType::parallel, utils::IteratorType::parallel,
+      utils::IteratorType::parallel, utils::IteratorType::reduction};
+
+  auto matmul = linalg::GenericOp::create(
+      builder, loc, TypeRange{outSlice.getResult().getType()},
+      ValueRange{lhsSlice.getResult(), weiSlice.getResult()},
+      ValueRange{outSlice.getResult()}, maps, iterTypes,
+      [](OpBuilder &nested, Location nestedLoc, ValueRange args) {
+        Value mul = arith::MulFOp::create(nested, nestedLoc, args[0], args[1]);
+        Value add = arith::AddFOp::create(nested, nestedLoc, mul, args[2]);
+        linalg::YieldOp::create(nested, nestedLoc, add);
+      });
+
+  return TilingResult{{matmul.getOperation()},
+                      SmallVector<Value>(matmul->getResults()),
+                      {lhsSlice.getOperation(), weiSlice.getOperation(),
+                       outSlice.getOperation()}};
+}
+
+LogicalResult GroupedMatmulOp::getResultTilePosition(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes, SmallVector<OpFoldResult> &resultOffsets,
+    SmallVector<OpFoldResult> &resultSizes) {
+  if (resultNumber != 0)
+    return failure();
+  resultOffsets.clear();
+  resultSizes.clear();
+  for (AffineExpr dimExpr : getOutputMap().getResults()) {
+    int dim = cast<AffineDimExpr>(dimExpr).getPosition();
+    resultOffsets.push_back(offsets[dim]);
+    resultSizes.push_back(sizes[dim]);
+  }
+  return success();
+}
+
+FailureOr<TilingResult> GroupedMatmulOp::generateResultTileValue(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes) {
+  return generateResultTileValue(builder, resultNumber, offsets, sizes, {});
+}
+
+FailureOr<TilingResult> GroupedMatmulOp::generateResultTileValue(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes,
+    ArrayRef<InnerTileAlignment> innerTileAlignments) {
+  SmallVector<Range> iterationDomain(getIterationDomain(builder));
+  SmallVector<OpFoldResult> normalizedSizes =
+      llvm::map_to_vector(iterationDomain, [](Range x) { return x.size; });
+  SmallVector<OpFoldResult> normalizedOffsets(4, builder.getIndexAttr(0));
   ArrayRef<AffineExpr> outputDims = getOutputMap().getResults();
   for (size_t i = 0; i < outputDims.size(); i++) {
     int dim = cast<AffineDimExpr>(outputDims[i]).getPosition();
