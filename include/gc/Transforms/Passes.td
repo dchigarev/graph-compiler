@@ -116,6 +116,34 @@ def Vectorize : Pass<"vectorize", "func::FuncOp"> {
   }];
 }
 
+def FoldUnitExtentMaps : Pass<"fold-unit-extent-maps", "func::FuncOp"> {
+  let summary = "Fold non-dim indexing map results over unit-extent operands.";
+  let description = [{
+    Replaces an indexing map result of a `linalg.generic` with the constant `0`
+    when the operand dim it addresses has a static extent of `1`. Only in-bounds
+    indices are legal in linalg, so `0` is the only possible value and the
+    rewrite is correct by construction.
+
+    This turns the group-quantization access pattern into something the
+    vectorizer accepts. An untiled dequant reads its per-group scales through
+
+      affine_map<(e, n, k) -> (e, n, k floordiv 64)>
+
+    which tiles correctly (the slice becomes one group at offset
+    `k floordiv 64`) but is rejected by `vectorizeLinalgOpPrecondition`, since it
+    is not a projected permutation. After tiling the scales slice has extent 1
+    along the group dim, so the map folds to
+
+      affine_map<(e, n, k) -> (e, n, 0)>
+
+    which is a projected permutation with a zero result and vectorizes into a
+    broadcasting `vector.transfer_read`.
+
+    Must run after tiling/fusion and before `vectorize`.
+  }];
+  let dependentDialects = ["linalg::LinalgDialect"];
+}
+
 def DropUnitDims : Pass<"drop-unit-dims", "func::FuncOp"> {
   let summary = "Drop unit dims.";
   let description = [{

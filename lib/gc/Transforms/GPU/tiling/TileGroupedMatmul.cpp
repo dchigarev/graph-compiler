@@ -10,11 +10,6 @@ namespace mlir::gc {
 
 namespace {
 
-// N-dim work-group tile used for 'linalgx.grouped_matmul'. Deliberately fixed
-// for now; the M tile is dictated by the op ('tile_m' attribute) and K is left
-// to the sub-group/reduction level.
-constexpr size_t kNTile = 32;
-
 // Tiles 'linalgx.grouped_matmul' at the work-group level and the contraction it
 // decomposes into at the sub-group level.
 //
@@ -29,20 +24,38 @@ struct TileGroupedMatmul final
     return isa<linalgx::GroupedMatmulOp>(ti) || isMatmulOp(ti);
   }
 
-  void computeWgTiles(Target &tg) override {
-    auto gmm = dyn_cast<linalgx::GroupedMatmulOp>(tg.op.getOperation());
-    if (!gmm) {
-      TilingPass::computeWgTiles(tg);
-      return;
+  // The parallel domain is (slot, m, n), so 'm' is the height dim and 'n' the
+  // width dim of the generic block-size search. Pin the height to 'tile_m': it
+  // is a correctness contract of the op, not a tuning knob.
+  void collectTileConstraints(Target &tg, DimConstraint &width,
+                              DimConstraint &height) override {
+    TilingPass::collectTileConstraints(tg, width, height);
+    if (auto gmm = dyn_cast<linalgx::GroupedMatmulOp>(tg.op.getOperation())) {
+      auto tileM = static_cast<size_t>(gmm.getTileM());
+      height.narrow(tileM);
+      height.align(tileM);
     }
-    // Iteration domain is (slot, m, n, k); 0 means "do not tile this dim".
-    SmallVector<size_t> tiles(tg.tiles.size(), 0);
-    SmallVector<size_t> sgTiles(tg.tiles.size(), 1);
-    tiles[linalgx::GroupedMatmulOp::kSlotDim] = 1;
-    tiles[linalgx::GroupedMatmulOp::kMDim] =
-        static_cast<size_t>(gmm.getTileM());
-    tiles[linalgx::GroupedMatmulOp::kNDim] = kNTile;
-    tg.setTiles(tiles, sgTiles, /*reduction=*/false);
+  }
+
+  void computeWgTiles(Target &tg) override {
+    // Run the generic search so that the M/N tiles are actually distributed
+    // over sub-groups (the tile emitted by getTiledImplementation() is a plain
+    // 2-D matmul, so it wants a real 2-D sg layout).
+    TilingPass::computeWgTiles(tg);
+    auto gmm = dyn_cast<linalgx::GroupedMatmulOp>(tg.op.getOperation());
+    if (!gmm) return;
+
+    using GMM = linalgx::GroupedMatmulOp;
+    // The expert index is read once per tile, which is only uniform within a
+    // single slot and a single 'tile_m' block. The constraint above normally
+    // makes the search land on 'tile_m' already, but it is dropped by the
+    // non-strict fallback pass, so enforce it here.
+    tg.tiles[GMM::kSlotDim] = 1;
+    tg.sgTiles[GMM::kSlotDim] = 1;
+    auto tileM = static_cast<size_t>(gmm.getTileM());
+    tg.tiles[GMM::kMDim] = tileM;
+    while (tg.sgTiles[GMM::kMDim] > 1 && tileM % tg.sgTiles[GMM::kMDim])
+      tg.sgTiles[GMM::kMDim] /= 2;
   }
 
   void computeSgTiles(Target &tg) override {

@@ -90,9 +90,10 @@ LogicalResult GroupedMatmulOp::verify() {
   auto outTy = dyn_cast<ShapedType>(getOutput().getType());
   if (!lhsTy || !weiTy || !idxTy || !outTy)
     return emitOpError("expects shaped operands");
-  if (lhsTy.getRank() != 3 || weiTy.getRank() != 3 || outTy.getRank() != 3)
-    return emitOpError("expects rank-3 lhs [S, M, K], weights [E, N, K] and "
-                       "output [S, M, N]");
+  if (lhsTy.getRank() != 2)
+    return emitOpError("expects rank-2 lhs [M, K]");
+  if (weiTy.getRank() != 3 || outTy.getRank() != 3)
+    return emitOpError("expects rank-3 weights [E, N, K] and output [S, M, N]");
   if (idxTy.getRank() != 2)
     return emitOpError("expects rank-2 indices [M, S]");
   if (!idxTy.getElementType().isSignlessInteger())

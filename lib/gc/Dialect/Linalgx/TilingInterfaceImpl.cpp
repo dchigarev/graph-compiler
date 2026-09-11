@@ -310,6 +310,15 @@ FailureOr<TilingResult> AttentionOp::generateResultTileValue(
 // GroupedMatmulOp
 //===----------------------------------------------------------------------===//
 
+/// Position of `dim` in `map`'s results, or -1 if `map` does not address it.
+static int64_t findDimInMap(AffineMap map, int64_t dim) {
+  for (auto [i, expr] : llvm::enumerate(map.getResults()))
+    if (auto d = dyn_cast<AffineDimExpr>(expr);
+        d && static_cast<int64_t>(d.getPosition()) == dim)
+      return static_cast<int64_t>(i);
+  return -1;
+}
+
 SmallVector<Range> GroupedMatmulOp::getIterationDomain(OpBuilder &b) {
   Location loc = getLoc();
   OpFoldResult zero = b.getIndexAttr(0);
@@ -319,11 +328,15 @@ SmallVector<Range> GroupedMatmulOp::getIterationDomain(OpBuilder &b) {
     r.offset = zero;
     r.stride = one;
   }
-  // (slot, m, n) come from the output, k from the lhs.
+  // (slot, m, n) come from the output, k from the lhs. The k position inside
+  // lhs is taken from the indexing map rather than hardcoded, so that the op
+  // stays valid if lhs ever grows a leading dim again.
   bounds[kSlotDim].size = getDim(b, loc, getOutput(), 0);
   bounds[kMDim].size = getDim(b, loc, getOutput(), 1);
   bounds[kNDim].size = getDim(b, loc, getOutput(), 2);
-  bounds[kKDim].size = getDim(b, loc, getLhs(), 2);
+  int64_t lhsK = findDimInMap(getLhsMap(), kKDim);
+  assert(lhsK >= 0 && "lhs must address the reduction dim");
+  bounds[kKDim].size = getDim(b, loc, getLhs(), lhsK);
   return bounds;
 }
 
@@ -357,7 +370,6 @@ FailureOr<TilingResult> GroupedMatmulOp::getTiledImplementation(
     return emitOpError("expects the slot dimension to be tiled to 1");
 
   Location loc = getLoc();
-  OpFoldResult zero = builder.getIndexAttr(0);
   OpFoldResult one = builder.getIndexAttr(1);
 
   // Expert index of this tile: indices[m_offset, slot_offset].
@@ -368,49 +380,56 @@ FailureOr<TilingResult> GroupedMatmulOp::getTiledImplementation(
   Value expert = arith::IndexCastOp::create(builder, loc, builder.getIndexType(),
                                             expertI);
 
-  // A single lhs row feeds all the slots when lhs' leading dim is 1.
-  auto lhsType = cast<RankedTensorType>(getLhs().getType());
-  OpFoldResult lhsSlot =
-      lhsType.getDimSize(0) == 1 ? zero : offsets[kSlotDim];
+  // Drops the leading dim of a [1, x, y] slice type, giving [x, y].
+  auto dropLeadingDim = [](RankedTensorType t) {
+    return RankedTensorType::get(t.getShape().drop_front(), t.getElementType());
+  };
 
-  SmallVector<OpFoldResult> unitStrides(3, one);
+  // lhs [M, K] -> [tile_m, tile_k]: already 2-D, nothing to reduce.
+  SmallVector<OpFoldResult> strides2(2, one);
   auto lhsSlice = tensor::ExtractSliceOp::create(
       builder, loc, getLhs(),
-      SmallVector<OpFoldResult>{lhsSlot, offsets[kMDim], offsets[kKDim]},
-      SmallVector<OpFoldResult>{one, sizes[kMDim], sizes[kKDim]}, unitStrides);
+      SmallVector<OpFoldResult>{offsets[kMDim], offsets[kKDim]},
+      SmallVector<OpFoldResult>{sizes[kMDim], sizes[kKDim]}, strides2);
+
+  // weights [E, N, K] -> [tile_n, tile_k] and output [S, M, N] ->
+  // [tile_m, tile_n]: the expert / slot dim is sliced to 1 and then dropped, so
+  // the tile is 2-D. Rank-reducing extract_slice is handled by the tile-and-fuse
+  // driver (tensor::replaceExtractSliceWithTiledProducer restores the reduced
+  // type after fusing a producer), and the tiled value is written back with a
+  // rank-reducing tensor.parallel_insert_slice, which is likewise legal.
+  SmallVector<OpFoldResult> strides3(3, one);
+  SmallVector<OpFoldResult> weiOffsets{expert, offsets[kNDim], offsets[kKDim]};
+  SmallVector<OpFoldResult> weiSizes{one, sizes[kNDim], sizes[kKDim]};
+  auto weiTileType = dropLeadingDim(tensor::ExtractSliceOp::inferResultType(
+      cast<RankedTensorType>(getWeights().getType()), weiSizes));
   auto weiSlice = tensor::ExtractSliceOp::create(
-      builder, loc, getWeights(),
-      SmallVector<OpFoldResult>{expert, offsets[kNDim], offsets[kKDim]},
-      SmallVector<OpFoldResult>{one, sizes[kNDim], sizes[kKDim]}, unitStrides);
+      builder, loc, weiTileType, getWeights(), weiOffsets, weiSizes, strides3);
+
+  SmallVector<OpFoldResult> outOffsets{offsets[kSlotDim], offsets[kMDim],
+                                       offsets[kNDim]};
+  SmallVector<OpFoldResult> outSizes{one, sizes[kMDim], sizes[kNDim]};
+  auto outTileType = dropLeadingDim(tensor::ExtractSliceOp::inferResultType(
+      cast<RankedTensorType>(getOutput().getType()), outSizes));
   auto outSlice = tensor::ExtractSliceOp::create(
-      builder, loc, getOutput(),
-      SmallVector<OpFoldResult>{offsets[kSlotDim], offsets[kMDim],
-                                offsets[kNDim]},
-      SmallVector<OpFoldResult>{one, sizes[kMDim], sizes[kNDim]}, unitStrides);
+      builder, loc, outTileType, getOutput(), outOffsets, outSizes, strides3);
 
-  // With the expert resolved, the tile is a plain (batch-1) contraction:
-  //   out[0, m, n] += lhs[0, m, k] * wei[0, n, k]
-  // Kept as a linalg.generic so that no named-op flavour has to exist for the
-  // transposed-B form; LinalgSpecializeGenericOps may specialize it later.
+  // With the expert resolved, the tile is a plain matmul with a transposed B:
+  //   out[m, n] += lhs[m, k] * wei[n, k]
   MLIRContext *ctx = builder.getContext();
-  AffineExpr b0, m, n, k;
-  bindDims(ctx, b0, m, n, k);
-  SmallVector<AffineMap> maps = {AffineMap::get(4, 0, {b0, m, k}, ctx),
-                                 AffineMap::get(4, 0, {b0, n, k}, ctx),
-                                 AffineMap::get(4, 0, {b0, m, n}, ctx)};
-  SmallVector<utils::IteratorType> iterTypes = {
-      utils::IteratorType::parallel, utils::IteratorType::parallel,
-      utils::IteratorType::parallel, utils::IteratorType::reduction};
+  AffineExpr m, n, k;
+  bindDims(ctx, m, n, k);
+  SmallVector<Attribute> maps = {
+      AffineMapAttr::get(AffineMap::get(3, 0, {m, k}, ctx)),
+      AffineMapAttr::get(AffineMap::get(3, 0, {n, k}, ctx)),
+      AffineMapAttr::get(AffineMap::get(3, 0, {m, n}, ctx))};
+  NamedAttribute indexingMaps(builder.getStringAttr("indexing_maps"),
+                              builder.getArrayAttr(maps));
 
-  auto matmul = linalg::GenericOp::create(
-      builder, loc, TypeRange{outSlice.getResult().getType()},
+  auto matmul = linalg::MatmulOp::create(
+      builder, loc, TypeRange{outTileType},
       ValueRange{lhsSlice.getResult(), weiSlice.getResult()},
-      ValueRange{outSlice.getResult()}, maps, iterTypes,
-      [](OpBuilder &nested, Location nestedLoc, ValueRange args) {
-        Value mul = arith::MulFOp::create(nested, nestedLoc, args[0], args[1]);
-        Value add = arith::AddFOp::create(nested, nestedLoc, mul, args[2]);
-        linalg::YieldOp::create(nested, nestedLoc, add);
-      });
+      ValueRange{outSlice.getResult()}, ArrayRef<NamedAttribute>{indexingMaps});
 
   return TilingResult{{matmul.getOperation()},
                       SmallVector<Value>(matmul->getResults()),
@@ -454,6 +473,31 @@ FailureOr<TilingResult> GroupedMatmulOp::generateResultTileValue(
     normalizedOffsets[dim] = offsets[i];
     normalizedSizes[dim] = sizes[i];
   }
-  return getTiledImplementation(builder, normalizedOffsets, normalizedSizes,
-                                innerTileAlignments);
+  auto tiled = getTiledImplementation(builder, normalizedOffsets,
+                                      normalizedSizes, innerTileAlignments);
+  if (failed(tiled))
+    return failure();
+
+  // getTiledImplementation() yields a 2-D tile, but a consumer that slices this
+  // op's result expects a tile of the result's rank. Expand the dropped slot dim
+  // back; tensor::replaceExtractSliceWithTiledProducer re-reduces it if the
+  // consumer's slice was itself rank-reducing.
+  assert(tiled->tiledValues.size() == 1);
+  auto tileType = cast<RankedTensorType>(tiled->tiledValues[0].getType());
+  auto expandedType = tensor::ExtractSliceOp::inferResultType(
+      cast<RankedTensorType>(getOutput().getType()),
+      SmallVector<OpFoldResult>{builder.getIndexAttr(1), normalizedSizes[kMDim],
+                                normalizedSizes[kNDim]});
+  if (tileType != expandedType) {
+    auto reassociation =
+        getReassociationIndicesForReshape(tileType, expandedType);
+    if (!reassociation)
+      return emitOpError("cannot expand the tiled result back to the tile shape "
+                         "expected by a consumer");
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointAfterValue(tiled->tiledValues[0]);
+    tiled->tiledValues[0] = tensor::ExpandShapeOp::create(
+        builder, getLoc(), expandedType, tiled->tiledValues[0], *reassociation);
+  }
+  return tiled;
 }

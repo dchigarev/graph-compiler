@@ -448,12 +448,20 @@ inline void replaceEmptySlices(OpRewriter &rw, LoopLikeOpInterface loop) {
     if (auto empty = slice.getSource().getDefiningOp<tensor::EmptyOp>();
         empty && empty->getParentOfType<LoopLikeOpInterface>() != loop) {
       auto type = slice.getType();
-      rw.setInsertionPointAfter(slice);
+      rw.setInsertionPoint(slice);
+      // The dynamic sizes are taken from the slice's own size operands, which
+      // are defined before it. A tensor.dim on the slice's result must not be
+      // used here: replaceOp() below would rewrite it into a self-reference on
+      // the newly created empty tensor, breaking dominance.
       SmallVector<Value> dynDims;
-      for (int64_t i = 0, r = type.getRank(); i < r; ++i) {
-        if (type.isDynamicDim(i)) {
-          dynDims.push_back(rw.create<tensor::DimOp>(slice, i));
-        }
+      auto sizes = slice.getMixedSizes();
+      auto dropped = slice.getDroppedDims();
+      for (int64_t i = 0, r = 0, n = sizes.size(); i < n; ++i) {
+        if (dropped.test(i)) continue;
+        if (type.isDynamicDim(r))
+          dynDims.push_back(
+              getValueOrCreateConstantIndexOp(rw, rw.loc, sizes[i]));
+        ++r;
       }
       rw.replaceOp(slice, rw.create<tensor::EmptyOp>(
                               type.getShape(), type.getElementType(), dynDims));

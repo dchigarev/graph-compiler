@@ -285,6 +285,7 @@ void populateGPUPipeline(OpPassManager &pm,
   });
 
   phase("Vectorization", [&]() {
+    pm.addNestedPass<func::FuncOp>(createFoldUnitExtentMaps());
     pm.addNestedPass<func::FuncOp>(createVectorize());
     pm.addNestedPass<func::FuncOp>(createHoistForLoopTransferRead());
     pm.addNestedPass<func::FuncOp>(createPeeledForToIf());

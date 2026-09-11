@@ -1,6 +1,7 @@
 #ifndef TILING_UTILS_H
 #define TILING_UTILS_H
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Dialect/Affine/ViewLikeInterfaceUtils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -92,7 +93,20 @@ inline void tagTileAndFuseResult(Operation *origConsumer,
   auto it = result.tiledAndFusedOps.begin();
   // Set tile-size attribute for the tiled op itself (e.g. linalg.matmul),
   // it's always the first element in the tiledAndFusedOps list.
-  mergeWgTileSizesAttr(*it++, consumerTiles);
+  //
+  // The tiled op's iteration domain can be smaller than the original consumer's:
+  // linalgx.grouped_matmul tiles its slot dim to 1 and emits a 2-D matmul,
+  // dropping it. The dropped dims are leading, so align on the trailing entries;
+  // writing the unaligned vector would make ApplyPaddingLevel pad to nonsense
+  // shapes.
+  SmallVector<int64_t> tiledOpTiles(consumerTiles);
+  if (auto ti = dyn_cast<TilingInterface>(*it)) {
+    size_t rank = ti.getLoopIteratorTypes().size();
+    if (rank < tiledOpTiles.size())
+      tiledOpTiles.erase(tiledOpTiles.begin(),
+                         tiledOpTiles.begin() + (tiledOpTiles.size() - rank));
+  }
+  mergeWgTileSizesAttr(*it++, tiledOpTiles);
 
   auto consumerIdx = dyn_cast<IndexingMapOpInterface>(origConsumer);
   // If the consumer doesn't have indexing maps, we can't remap the tiles to
@@ -132,6 +146,38 @@ inline void tagTileAndFuseResult(Operation *origConsumer,
                          remapTiles(tiles, consumerMap, prodMap,
                                     prodTi.getLoopIteratorTypes().size()));
   }
+}
+
+// Whether `op` can be tiled and fused by the SCF driver.
+//
+// The tiling interface itself only requires the *init* maps to be projected
+// permutations (see LinalgOpTilingInterface::getIterationDomainTileFromOperand
+// and friends). An input may legitimately be addressed through a
+// `floordiv`/`mod` of a tiled dim - that is how a group-quantized operand (one
+// scale per group of K elements) is expressed without a reshape. Such maps are
+// handled correctly by computeSliceParameters(): the slice offset becomes
+// `k floordiv group` and its size `((tile - 1) floordiv group) + 1`.
+//
+// Only these two forms are allowed through; anything else (e.g. the `d0 + d3`
+// of a convolution) stays rejected, since the rest of the pipeline is not
+// prepared for it.
+inline bool hasTileableIndexingMaps(linalg::LinalgOp op) {
+  for (OpOperand &operand : op->getOpOperands()) {
+    AffineMap map = op.getMatchingIndexingMap(&operand);
+    if (map.isProjectedPermutation()) continue;
+    if (op.isDpsInit(&operand)) return false;
+    for (AffineExpr expr : map.getResults()) {
+      if (isa<AffineDimExpr, AffineConstantExpr>(expr)) continue;
+      auto bin = dyn_cast<AffineBinaryOpExpr>(expr);
+      if (!bin || (bin.getKind() != AffineExprKind::FloorDiv &&
+                   bin.getKind() != AffineExprKind::Mod))
+        return false;
+      if (!isa<AffineDimExpr>(bin.getLHS()) ||
+          !isa<AffineConstantExpr>(bin.getRHS()))
+        return false;
+    }
+  }
+  return true;
 }
 
 inline bool hasIterator(Operation *op, utils::IteratorType type) {
@@ -683,6 +729,19 @@ protected:
     if (tg.level == Level::WG) {
       if (!fuseConsumers(tg, opReplacement, prodMap)) return nullptr;
       else fuseProducers(tg, opReplacement);
+    } else {
+      // A rank-reducing tile (getTiledImplementation() drops the expert/slot dim
+      // of its weight/output tiles) leaves a unit-dim-dropping extract_slice
+      // between the producer fused at WG level and the slices created here. The
+      // SCF driver cannot fuse through it - extract_slice has no TilingInterface
+      // - so merge the chain first and then retry the producers.
+      mergeSliceChains(tg.rw, opReplacement);
+      fuseProducers(tg, opReplacement);
+      // The producers fused above bring in slices of their own destinations,
+      // which are tensor.empty ops living outside the loop. Left alone they
+      // bufferize to a full-size scratch buffer that the loop writes and reads
+      // back one tile at a time.
+      replaceEmptySlices(tg.rw, opReplacement);
     }
 
     canonicalizeLoop(opReplacement);
@@ -712,6 +771,8 @@ protected:
         isOperandDependsOnOp(isMatmulOp, candidateSliceOp)) {
       return std::nullopt;
     }
+
+    if (!coversInnerTiles(op, candidateSliceOp)) return std::nullopt;
 
     return SCFTileAndFuseOptions::ControlFnResult{};
   }
@@ -790,6 +851,31 @@ protected:
     return true;
   }
 
+  // Collapse `extract_slice(extract_slice(x))` chains inside `loop` into a
+  // single slice of `x`. Same rewrite as tensor's MergeConsecutiveExtractSlice
+  // pattern (which handles the rank-reducing case, unlike the canonicalizer),
+  // applied directly - a pattern driver would need an IsolatedFromAbove root.
+  static void mergeSliceChains(OpRewriter &rw, LoopLikeOpInterface loop) {
+    SmallVector<tensor::ExtractSliceOp> candidates;
+    loop->walk([&](tensor::ExtractSliceOp next) {
+      if (next.getSource().getDefiningOp<tensor::ExtractSliceOp>())
+        candidates.push_back(next);
+    });
+    for (auto next : candidates) {
+      auto prev = next.getSource().getDefiningOp<tensor::ExtractSliceOp>();
+      if (!prev) continue;
+      SmallVector<OpFoldResult> offsets, sizes, strides;
+      OpBuilder::InsertionGuard guard(rw);
+      rw.setInsertionPoint(next);
+      if (failed(affine::mergeOffsetsSizesAndStrides(
+              rw, next.getLoc(), prev, next, prev.getDroppedDims(), offsets,
+              sizes, strides)))
+        continue;
+      rw.replaceOpWithNewOp<tensor::ExtractSliceOp>(
+          next, next.getType(), prev.getSource(), offsets, sizes, strides);
+    }
+  }
+
   // Fuse producers of extract_slice ops inside the loop
   static void fuseProducers(Target &tg, LoopLikeOpInterface &loop) {
     SmallVector<tensor::ExtractSliceOp> candidates;
@@ -799,6 +885,7 @@ protected:
       if (isOpDependsOnResult<0>(isMatmulOp, slice) &&
           isOperandDependsOnOp(isMatmulOp, slice))
         return;
+      if (!coversInnerTiles(producer, slice)) return;
       candidates.push_back(slice);
     });
     SmallVector<LoopLikeOpInterface> loops = {loop};
@@ -809,12 +896,30 @@ protected:
   }
 
 private:
+  // An unpack producer can only be fused if the consumer's slice covers whole
+  // inner tiles. A partial tile makes the fused producer's operands dynamically
+  // sized (the tile may span 1 or 2 inner tiles), which is both inefficient and
+  // not supported by the subsequent decomposition of pack/unpack ops.
+  static bool coversInnerTiles(Operation *producer,
+                               tensor::ExtractSliceOp slice) {
+    auto unpack = dyn_cast<linalg::UnPackOp>(producer);
+    if (!unpack) return true;
+    auto sizes = slice.getMixedSizes();
+    for (auto [dim, tile] :
+         llvm::zip_equal(unpack.getInnerDimsPos(), unpack.getMixedTiles())) {
+      auto innerTile = getConstantIntValue(tile);
+      auto size = getConstantIntValue(sizes[dim]);
+      if (!innerTile || !size || *size % *innerTile != 0) return false;
+    }
+    return true;
+  }
+
   static bool canFuse(LoopLikeOpInterface loop, Operation *op,
                       bool isConsumer = true) {
     if (op->getBlock() != loop->getBlock()) return false;
     if (containsMatmulOp(op)) return false;
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
-        linalgOp && !linalgOp.hasOnlyProjectedPermutations()) {
+        linalgOp && !hasTileableIndexingMaps(linalgOp)) {
       return false;
     }
     if (isParallel(op)) return true;

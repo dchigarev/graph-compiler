@@ -137,19 +137,23 @@ def Linalgx_GroupedMatmulOp : Linalgx_Op<"grouped_matmul",
   let description = [{
     Computes, for every slot `s` and every token `m`:
 
-      out[s, m, :] = lhs[lhs_slot(s), m, :] * weights[indices[m, s], :, :]^T
+      out[s, m, :] = lhs[m, :] * weights[indices[m, s], :, :]^T
 
     i.e. a matmul whose weight matrix is picked at runtime out of `weights`'
-    leading (expert) dimension. `lhs_slot(s)` is `0` when `lhs`' leading
-    dimension is 1 (the same token row feeds every slot) and `s` otherwise.
+    leading (expert) dimension. In a MoE top-k routing the same token row feeds
+    every slot, so `lhs` does not have a slot dimension at all.
 
-    Operand ranks: `lhs` [S, M, K], `weights` [E, N, K] (transposed, i.e. the
+    Operand ranks: `lhs` [M, K], `weights` [E, N, K] (transposed, i.e. the
     reduction dim is the innermost one), `indices` [M, S] (i32/i64),
     `output` [S, M, N].
 
     Iteration domain is `(slot, m, n, k)` where `k` is the only reduction dim.
     Note that `weights` is indexed by `(n, k)` only: its leading dimension is
     addressed through `indices` and is therefore not part of the domain.
+
+    Keeping `lhs` 2-D is what makes the tiled form a plain `linalg.matmul`: the
+    slot dim is tiled to 1, so `weights` and `output` are sliced rank-reducingly
+    and every operand of the tile is 2-D. See `getTiledImplementation()`.
 
     CONTRACT, to be guaranteed by whoever produces `indices`: all tokens of one
     `tile_m`-sized block must share the same expert, i.e. `indices[m, s]` is

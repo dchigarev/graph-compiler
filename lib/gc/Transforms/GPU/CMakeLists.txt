@@ -13,6 +13,7 @@ gc_add_mlir_library(
   TensorMaskingOpInterface.cpp
   Decomposition.cpp
   DropUnitDims.cpp
+  FoldUnitExtentMaps.cpp
   GpuDeviceProps.cpp
   GpuKernelOutline.cpp
   MemrefCopyToGpuMemcpy.cpp
