@@ -26,9 +26,19 @@ struct DropUnitDims final : gc::impl::DropUnitDimsBase<DropUnitDims> {
 
   void runOnOperation() override {
     auto fn = getOperation();
-    // Drop the inner most unit dims from vector transfers
     RewritePatternSet patterns(&getContext());
+    // Drop the inner most unit dims from vector transfers.
     vector::populateDropInnerMostUnitDimsXferOpPatterns(patterns);
+    // Drop leading unit dims. An op whose iteration domain is one rank higher
+    // than the 2-D tile it feeds (e.g. a group-quantized dequant over
+    // (expert, n, k) producing the B operand of a 2-D matmul) vectorizes to
+    // vector<1xAxB>. Left alone, that rank-3 vector round-trips through memory
+    // to reach the rank-2 consumer and does not survive the 2-D XeGPU
+    // sub-group distribution.
+    vector::populateCastAwayVectorLeadingOneDimPatterns(patterns);
+    vector::populateDropUnitDimWithShapeCastPatterns(patterns);
+    vector::populateVectorTransferDropUnitDimsPatterns(patterns);
+    // Cancels out the shape_casts the patterns above insert.
     vector::ShapeCastOp::getCanonicalizationPatterns(patterns, &getContext());
     if (failed(applyPatternsGreedily(fn, std::move(patterns))))
       signalPassFailure();

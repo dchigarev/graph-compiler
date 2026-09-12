@@ -229,17 +229,54 @@ static bool matchFillOnEmpty(Value val, Value &fillScalar,
   return false;
 }
 
+// Match an init arg that is a full slice (zero offsets, unit strides) of a
+// statically shaped tensor whose shape is `expectedStaticTy` modulo dropped unit
+// dims. `staticSrc` is set to that static tensor - the caller rank-reduces it if
+// needed.
+//
+// Two things make this looser than a plain `srcTy == expectedStaticTy`:
+//  * the padded producer is left behind as `extract_slice(padded_result)`, so
+//    there is a non-rank-reducing slice in between and nothing merges such
+//    chains before this pass runs;
+//  * the producer may live in a higher-rank space than the loop's accumulator
+//    tile - linalgx.grouped_matmul fills a [S, M, N] output but accumulates over
+//    a 2-D [M, N] tile, so the init slice drops the unit slot dim.
 static bool matchSliceOfStatic(Value val, Value &staticSrc,
                                SmallVectorImpl<Value> &dynDims,
                                RankedTensorType expectedStaticTy) {
   auto sliceOp = val.getDefiningOp<tensor::ExtractSliceOp>();
   if (!sliceOp) return false;
-  auto srcTy = cast<RankedTensorType>(sliceOp.getSource().getType());
-  if (!srcTy.hasStaticShape()) return false;
-  if (srcTy != expectedStaticTy) return false;
   if (!allZero(sliceOp.getMixedOffsets()) || !allOne(sliceOp.getMixedStrides()))
     return false;
-  staticSrc = sliceOp.getSource();
+
+  // Only the outermost slice may drop dims, so that `dropped` below stays
+  // indexed by the static source's rank.
+  llvm::SmallBitVector dropped = sliceOp.getDroppedDims();
+  Value src = sliceOp.getSource();
+  while (!cast<RankedTensorType>(src.getType()).hasStaticShape()) {
+    auto prev = src.getDefiningOp<tensor::ExtractSliceOp>();
+    if (!prev) return false;
+    if (!allZero(prev.getMixedOffsets()) || !allOne(prev.getMixedStrides()))
+      return false;
+    if (prev.getDroppedDims().any()) return false;
+    src = prev.getSource();
+  }
+
+  auto srcTy = cast<RankedTensorType>(src.getType());
+  if (srcTy.getRank() != (int64_t)dropped.size()) return false;
+  if (srcTy.getElementType() != expectedStaticTy.getElementType()) return false;
+
+  SmallVector<int64_t> kept;
+  for (int64_t d = 0, e = srcTy.getRank(); d < e; ++d) {
+    if (dropped.test(d)) {
+      if (srcTy.getDimSize(d) != 1) return false;
+      continue;
+    }
+    kept.push_back(srcTy.getDimSize(d));
+  }
+  if (!llvm::equal(kept, expectedStaticTy.getShape())) return false;
+
+  staticSrc = src;
   for (OpFoldResult sz : sliceOp.getMixedSizes()) {
     if (auto v = dyn_cast<Value>(sz)) dynDims.push_back(v);
   }
@@ -428,7 +465,21 @@ static void hoistForToStatic(scf::ForOp forOp, ArrayRef<ForHoistInfo> infos,
                                  forOp.getInitArgs().end());
   for (auto &info : infos) {
     if (info.staticSrc) {
-      newInitArgs[info.argIdx] = info.staticSrc;
+      Value src = info.staticSrc;
+      auto srcTy = cast<RankedTensorType>(src.getType());
+      if (srcTy != info.staticTy) {
+        // matchSliceOfStatic() allows the static source to carry extra unit dims
+        // (a [1, M, N] fill feeding an [M, N] accumulator). Drop them.
+        int64_t rank = srcTy.getRank();
+        SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
+        SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
+        SmallVector<OpFoldResult> sizes;
+        for (int64_t d = 0; d < rank; ++d)
+          sizes.push_back(rewriter.getIndexAttr(srcTy.getDimSize(d)));
+        src = tensor::ExtractSliceOp::create(rewriter, loc, info.staticTy, src,
+                                            offsets, sizes, strides);
+      }
+      newInitArgs[info.argIdx] = src;
     } else {
       Value staticEmpty =
           tensor::EmptyOp::create(rewriter, loc, info.staticTy.getShape(),

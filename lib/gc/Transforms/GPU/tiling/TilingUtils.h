@@ -125,6 +125,15 @@ inline void tagTileAndFuseResult(Operation *origConsumer,
        ++it, ++fp) {
     auto *tiledProd = *it;
     auto *origProd = *fp;
+    // When the consumer's tile is rank-reducing, the SCF driver records the
+    // rank-reduction compensation slice as the "tiled and fused producer" (see
+    // tensor::replaceExtractSliceWithTiledProducer), so look through it to reach
+    // the op that actually wants the tile sizes.
+    while (auto slice = dyn_cast<tensor::ExtractSliceOp>(tiledProd)) {
+      Operation *src = slice.getSource().getDefiningOp();
+      if (!src) break;
+      tiledProd = src;
+    }
     auto prodTi = dyn_cast<TilingInterface>(tiledProd);
     if (!prodTi) continue;
     AffineMap consumerMap, prodMap;
