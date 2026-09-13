@@ -24,38 +24,20 @@ struct TileGroupedMatmul final
     return isa<linalgx::GroupedMatmulOp>(ti) || isMatmulOp(ti);
   }
 
-  // The parallel domain is (slot, m, n), so 'm' is the height dim and 'n' the
-  // width dim of the generic block-size search. Pin the height to 'tile_m': it
-  // is a correctness contract of the op, not a tuning knob.
-  void collectTileConstraints(Target &tg, DimConstraint &width,
-                              DimConstraint &height) override {
-    TilingPass::collectTileConstraints(tg, width, height);
-    if (auto gmm = dyn_cast<linalgx::GroupedMatmulOp>(tg.op.getOperation())) {
-      auto tileM = static_cast<size_t>(gmm.getTileM());
-      height.narrow(tileM);
-      height.align(tileM);
-    }
-  }
-
   void computeWgTiles(Target &tg) override {
-    // Run the generic search so that the M/N tiles are actually distributed
-    // over sub-groups (the tile emitted by getTiledImplementation() is a plain
-    // 2-D matmul, so it wants a real 2-D sg layout).
+    // The generic search handles the (expert, m, n) parallel domain as-is: it
+    // sets the leading dims to 1 and picks the M/N tiles from the target's block
+    // sizes, so the 2-D matmul emitted by getTiledImplementation() gets a real
+    // 2-D sub-group layout. Unlike a block-aligned formulation, the M tile is
+    // free here - getTiledImplementation() clamps each tile to the group's real
+    // length, so no tile can cross a group boundary.
     TilingPass::computeWgTiles(tg);
-    auto gmm = dyn_cast<linalgx::GroupedMatmulOp>(tg.op.getOperation());
-    if (!gmm) return;
-
+    if (!isa<linalgx::GroupedMatmulOp>(tg.op.getOperation())) return;
+    // One expert per tile; the search does this already, enforce it anyway
+    // because getTiledImplementation() rejects anything else.
     using GMM = linalgx::GroupedMatmulOp;
-    // The expert index is read once per tile, which is only uniform within a
-    // single slot and a single 'tile_m' block. The constraint above normally
-    // makes the search land on 'tile_m' already, but it is dropped by the
-    // non-strict fallback pass, so enforce it here.
-    tg.tiles[GMM::kSlotDim] = 1;
-    tg.sgTiles[GMM::kSlotDim] = 1;
-    auto tileM = static_cast<size_t>(gmm.getTileM());
-    tg.tiles[GMM::kMDim] = tileM;
-    while (tg.sgTiles[GMM::kMDim] > 1 && tileM % tg.sgTiles[GMM::kMDim])
-      tg.sgTiles[GMM::kMDim] /= 2;
+    tg.tiles[GMM::kExpertDim] = 1;
+    tg.sgTiles[GMM::kExpertDim] = 1;
   }
 
   void computeSgTiles(Target &tg) override {

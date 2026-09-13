@@ -310,15 +310,6 @@ FailureOr<TilingResult> AttentionOp::generateResultTileValue(
 // GroupedMatmulOp
 //===----------------------------------------------------------------------===//
 
-/// Position of `dim` in `map`'s results, or -1 if `map` does not address it.
-static int64_t findDimInMap(AffineMap map, int64_t dim) {
-  for (auto [i, expr] : llvm::enumerate(map.getResults()))
-    if (auto d = dyn_cast<AffineDimExpr>(expr);
-        d && static_cast<int64_t>(d.getPosition()) == dim)
-      return static_cast<int64_t>(i);
-  return -1;
-}
-
 SmallVector<Range> GroupedMatmulOp::getIterationDomain(OpBuilder &b) {
   Location loc = getLoc();
   OpFoldResult zero = b.getIndexAttr(0);
@@ -328,16 +319,59 @@ SmallVector<Range> GroupedMatmulOp::getIterationDomain(OpBuilder &b) {
     r.offset = zero;
     r.stride = one;
   }
-  // (slot, m, n) come from the output, k from the lhs. The k position inside
-  // lhs is taken from the indexing map rather than hardcoded, so that the op
-  // stays valid if lhs ever grows a leading dim again.
-  bounds[kSlotDim].size = getDim(b, loc, getOutput(), 0);
-  bounds[kMDim].size = getDim(b, loc, getOutput(), 1);
-  bounds[kNDim].size = getDim(b, loc, getOutput(), 2);
-  int64_t lhsK = findDimInMap(getLhsMap(), kKDim);
-  assert(lhsK >= 0 && "lhs must address the reduction dim");
-  bounds[kKDim].size = getDim(b, loc, getLhs(), lhsK);
+  // The row dim is group-relative, so its bound is the largest group, not the
+  // total row count. Everything else comes from the operand shapes.
+  bounds[kExpertDim].size = getDim(b, loc, getWeights(), 0);
+  bounds[kMDim].size = getMaxGroupSize();
+  bounds[kNDim].size = getDim(b, loc, getWeights(), 1);
+  bounds[kKDim].size = getDim(b, loc, getLhs(), 1);
   return bounds;
+}
+
+/// Emits the [start, end) row range of expert `expert` from `offsets`, which
+/// holds exclusive prefix ends with an implicit leading zero.
+static std::pair<Value, Value> emitGroupRange(OpBuilder &b, Location loc,
+                                              Value offsets, Value expert) {
+  Value zero = arith::ConstantIndexOp::create(b, loc, 0);
+  Value one = arith::ConstantIndexOp::create(b, loc, 1);
+  Value isFirst = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq,
+                                        expert, zero);
+  // Clamped so that the load stays in bounds for expert 0; its value is
+  // discarded by the select below.
+  Value prevIdx = arith::SelectOp::create(
+      b, loc, isFirst, zero, arith::SubIOp::create(b, loc, expert, one));
+  auto toIndex = [&](Value v) {
+    return arith::IndexCastOp::create(b, loc, b.getIndexType(), v).getResult();
+  };
+  Value prev = toIndex(
+      tensor::ExtractOp::create(b, loc, offsets, ValueRange{prevIdx}));
+  Value start = arith::SelectOp::create(b, loc, isFirst, zero, prev);
+  Value end = toIndex(
+      tensor::ExtractOp::create(b, loc, offsets, ValueRange{expert}));
+  return {start, end};
+}
+
+/// Row offset and size of the tile at group-relative offset `mOffset`, clamped
+/// to the real length of expert `expert`'s group:
+///   row0 = min(start + mOffset, end)
+///   size = clamp(mSize, 0, end - row0)
+/// A tile past the end of a short group gets size 0 and does nothing, which is
+/// what keeps the iteration domain rectangular without padding the rows. `row0`
+/// is clamped too, so that even an empty tile addresses a valid row.
+static std::pair<OpFoldResult, OpFoldResult>
+emitClampedRowTile(OpBuilder &b, Location loc, Value offsets, Value expert,
+                   OpFoldResult mOffset, OpFoldResult mSize) {
+  auto [start, end] = emitGroupRange(b, loc, offsets, expert);
+  Value mOff = getValueOrCreateConstantIndexOp(b, loc, mOffset);
+  Value tile = getValueOrCreateConstantIndexOp(b, loc, mSize);
+
+  Value row0 = arith::MinSIOp::create(
+      b, loc, arith::AddIOp::create(b, loc, start, mOff), end);
+  Value avail = arith::SubIOp::create(b, loc, end, row0);
+  Value zero = arith::ConstantIndexOp::create(b, loc, 0);
+  Value size = arith::MaxSIOp::create(
+      b, loc, zero, arith::MinSIOp::create(b, loc, tile, avail));
+  return {OpFoldResult(row0), OpFoldResult(size)};
 }
 
 SmallVector<utils::IteratorType> GroupedMatmulOp::getLoopIteratorTypes() {
@@ -362,42 +396,42 @@ FailureOr<TilingResult> GroupedMatmulOp::getTiledImplementation(
   if (!hasPureTensorSemantics())
     return emitOpError("tiling is only implemented for tensor semantics");
 
-  // The whole point of the op is that the expert index is uniform inside a
-  // tile, which only holds if the slot dim is tiled to 1 (it is a leading dim,
-  // so the tiling heuristics do that by default).
-  auto slotTile = getConstantIntValue(sizes[kSlotDim]);
-  if (!slotTile || *slotTile != 1)
-    return emitOpError("expects the slot dimension to be tiled to 1");
+  // One expert per tile: the weight matrix is picked per tile, so the expert dim
+  // must be tiled to 1 (it is a leading dim, so the heuristics do that anyway).
+  auto expertTile = getConstantIntValue(sizes[kExpertDim]);
+  if (!expertTile || *expertTile != 1)
+    return emitOpError("expects the expert dimension to be tiled to 1");
 
   Location loc = getLoc();
   OpFoldResult one = builder.getIndexAttr(1);
+  Value expert =
+      getValueOrCreateConstantIndexOp(builder, loc, offsets[kExpertDim]);
 
-  // Expert index of this tile: indices[m_offset, slot_offset].
-  Value mIdx = getValueOrCreateConstantIndexOp(builder, loc, offsets[kMDim]);
-  Value sIdx = getValueOrCreateConstantIndexOp(builder, loc, offsets[kSlotDim]);
-  Value expertI =
-      tensor::ExtractOp::create(builder, loc, getIndices(), ValueRange{mIdx, sIdx});
-  Value expert = arith::IndexCastOp::create(builder, loc, builder.getIndexType(),
-                                            expertI);
+  // Absolute row range of this tile inside the concatenated rows, clamped to the
+  // group's real length.
+  auto [rowOffset, rowSize] = emitClampedRowTile(
+      builder, loc, getOffsets(), expert, offsets[kMDim], sizes[kMDim]);
 
   // Drops the leading dim of a [1, x, y] slice type, giving [x, y].
   auto dropLeadingDim = [](RankedTensorType t) {
     return RankedTensorType::get(t.getShape().drop_front(), t.getElementType());
   };
 
-  // lhs [M, K] -> [tile_m, tile_k]: already 2-D, nothing to reduce.
+  // lhs [total, K] -> [rows, tile_k] and output [total, N] -> [rows, tile_n]:
+  // both natively 2-D, nothing to rank-reduce.
   SmallVector<OpFoldResult> strides2(2, one);
   auto lhsSlice = tensor::ExtractSliceOp::create(
-      builder, loc, getLhs(),
-      SmallVector<OpFoldResult>{offsets[kMDim], offsets[kKDim]},
-      SmallVector<OpFoldResult>{sizes[kMDim], sizes[kKDim]}, strides2);
+      builder, loc, getLhs(), SmallVector<OpFoldResult>{rowOffset, offsets[kKDim]},
+      SmallVector<OpFoldResult>{rowSize, sizes[kKDim]}, strides2);
+  auto outSlice = tensor::ExtractSliceOp::create(
+      builder, loc, getOutput(),
+      SmallVector<OpFoldResult>{rowOffset, offsets[kNDim]},
+      SmallVector<OpFoldResult>{rowSize, sizes[kNDim]}, strides2);
 
-  // weights [E, N, K] -> [tile_n, tile_k] and output [S, M, N] ->
-  // [tile_m, tile_n]: the expert / slot dim is sliced to 1 and then dropped, so
-  // the tile is 2-D. Rank-reducing extract_slice is handled by the tile-and-fuse
-  // driver (tensor::replaceExtractSliceWithTiledProducer restores the reduced
-  // type after fusing a producer), and the tiled value is written back with a
-  // rank-reducing tensor.parallel_insert_slice, which is likewise legal.
+  // weights [E, N, K] -> [tile_n, tile_k]: the expert dim is sliced to 1 and
+  // then dropped. Rank-reducing extract_slice is handled by the tile-and-fuse
+  // driver - tensor::replaceExtractSliceWithTiledProducer restores the reduced
+  // type after fusing a producer.
   SmallVector<OpFoldResult> strides3(3, one);
   SmallVector<OpFoldResult> weiOffsets{expert, offsets[kNDim], offsets[kKDim]};
   SmallVector<OpFoldResult> weiSizes{one, sizes[kNDim], sizes[kKDim]};
@@ -406,13 +440,7 @@ FailureOr<TilingResult> GroupedMatmulOp::getTiledImplementation(
   auto weiSlice = tensor::ExtractSliceOp::create(
       builder, loc, weiTileType, getWeights(), weiOffsets, weiSizes, strides3);
 
-  SmallVector<OpFoldResult> outOffsets{offsets[kSlotDim], offsets[kMDim],
-                                       offsets[kNDim]};
-  SmallVector<OpFoldResult> outSizes{one, sizes[kMDim], sizes[kNDim]};
-  auto outTileType = dropLeadingDim(tensor::ExtractSliceOp::inferResultType(
-      cast<RankedTensorType>(getOutput().getType()), outSizes));
-  auto outSlice = tensor::ExtractSliceOp::create(
-      builder, loc, outTileType, getOutput(), outOffsets, outSizes, strides3);
+  auto outTileType = cast<RankedTensorType>(outSlice.getResult().getType());
 
   // With the expert resolved, the tile is a plain matmul with a transposed B:
   //   out[m, n] += lhs[m, k] * wei[n, k]
@@ -443,13 +471,17 @@ LogicalResult GroupedMatmulOp::getResultTilePosition(
     SmallVector<OpFoldResult> &resultSizes) {
   if (resultNumber != 0)
     return failure();
-  resultOffsets.clear();
-  resultSizes.clear();
-  for (AffineExpr dimExpr : getOutputMap().getResults()) {
-    int dim = cast<AffineDimExpr>(dimExpr).getPosition();
-    resultOffsets.push_back(offsets[dim]);
-    resultSizes.push_back(sizes[dim]);
-  }
+  Location loc = getLoc();
+  Value expert =
+      getValueOrCreateConstantIndexOp(builder, loc, offsets[kExpertDim]);
+  // The output map is (e, m, n, k) -> (m, n), but `m` is group-relative in the
+  // domain and absolute in the tensor, so the row position comes from the same
+  // clamp getTiledImplementation() uses rather than from a lookup through the
+  // map. CSE merges the two offsets loads.
+  auto [rowOffset, rowSize] = emitClampedRowTile(
+      builder, loc, getOffsets(), expert, offsets[kMDim], sizes[kMDim]);
+  resultOffsets = {rowOffset, offsets[kNDim]};
+  resultSizes = {rowSize, sizes[kNDim]};
   return success();
 }
 
@@ -463,41 +495,14 @@ FailureOr<TilingResult> GroupedMatmulOp::generateResultTileValue(
     OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
     ArrayRef<OpFoldResult> sizes,
     ArrayRef<InnerTileAlignment> innerTileAlignments) {
-  SmallVector<Range> iterationDomain(getIterationDomain(builder));
-  SmallVector<OpFoldResult> normalizedSizes =
-      llvm::map_to_vector(iterationDomain, [](Range x) { return x.size; });
-  SmallVector<OpFoldResult> normalizedOffsets(4, builder.getIndexAttr(0));
-  ArrayRef<AffineExpr> outputDims = getOutputMap().getResults();
-  for (size_t i = 0; i < outputDims.size(); i++) {
-    int dim = cast<AffineDimExpr>(outputDims[i]).getPosition();
-    normalizedOffsets[dim] = offsets[i];
-    normalizedSizes[dim] = sizes[i];
-  }
-  auto tiled = getTiledImplementation(builder, normalizedOffsets,
-                                      normalizedSizes, innerTileAlignments);
-  if (failed(tiled))
-    return failure();
-
-  // getTiledImplementation() yields a 2-D tile, but a consumer that slices this
-  // op's result expects a tile of the result's rank. Expand the dropped slot dim
-  // back; tensor::replaceExtractSliceWithTiledProducer re-reduces it if the
-  // consumer's slice was itself rank-reducing.
-  assert(tiled->tiledValues.size() == 1);
-  auto tileType = cast<RankedTensorType>(tiled->tiledValues[0].getType());
-  auto expandedType = tensor::ExtractSliceOp::inferResultType(
-      cast<RankedTensorType>(getOutput().getType()),
-      SmallVector<OpFoldResult>{builder.getIndexAttr(1), normalizedSizes[kMDim],
-                                normalizedSizes[kNDim]});
-  if (tileType != expandedType) {
-    auto reassociation =
-        getReassociationIndicesForReshape(tileType, expandedType);
-    if (!reassociation)
-      return emitOpError("cannot expand the tiled result back to the tile shape "
-                         "expected by a consumer");
-    OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointAfterValue(tiled->tiledValues[0]);
-    tiled->tiledValues[0] = tensor::ExpandShapeOp::create(
-        builder, getLoc(), expandedType, tiled->tiledValues[0], *reassociation);
-  }
-  return tiled;
+  (void)builder;
+  (void)resultNumber;
+  (void)offsets;
+  (void)sizes;
+  (void)innerTileAlignments;
+  // Not implementable: a consumer hands us a slice of the *rows* of the result,
+  // and recovering the (expert, group-relative row) pair from an absolute row
+  // needs a search through `offsets`. Returning failure just means this op is
+  // never fused as a producer; it is still tiled as a consumer.
+  return failure();
 }

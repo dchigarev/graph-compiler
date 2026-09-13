@@ -86,23 +86,36 @@ AffineMap AttentionOp::getMatchingIndexingMap(OpOperand *operand) {
 LogicalResult GroupedMatmulOp::verify() {
   auto lhsTy = dyn_cast<ShapedType>(getLhs().getType());
   auto weiTy = dyn_cast<ShapedType>(getWeights().getType());
-  auto idxTy = dyn_cast<ShapedType>(getIndices().getType());
+  auto offTy = dyn_cast<ShapedType>(getOffsets().getType());
   auto outTy = dyn_cast<ShapedType>(getOutput().getType());
-  if (!lhsTy || !weiTy || !idxTy || !outTy)
+  if (!lhsTy || !weiTy || !offTy || !outTy)
     return emitOpError("expects shaped operands");
   if (lhsTy.getRank() != 2)
-    return emitOpError("expects rank-2 lhs [M, K]");
-  if (weiTy.getRank() != 3 || outTy.getRank() != 3)
-    return emitOpError("expects rank-3 weights [E, N, K] and output [S, M, N]");
-  if (idxTy.getRank() != 2)
-    return emitOpError("expects rank-2 indices [M, S]");
-  if (!idxTy.getElementType().isSignlessInteger())
-    return emitOpError("expects integer indices");
+    return emitOpError("expects rank-2 lhs [total, K]");
+  if (weiTy.getRank() != 3)
+    return emitOpError("expects rank-3 weights [E, N, K]");
+  if (outTy.getRank() != 2)
+    return emitOpError("expects rank-2 output [total, N]");
+  if (offTy.getRank() != 1)
+    return emitOpError("expects rank-1 offsets [E]");
+  if (!offTy.getElementType().isSignlessInteger())
+    return emitOpError("expects integer offsets");
   if (getIndexingMaps().size() != 4)
-    return emitOpError("expects 4 indexing maps (lhs, weights, indices, "
-                       "output)");
-  if (getTileM() <= 0)
-    return emitOpError("expects a positive 'tile_m'");
+    return emitOpError("expects 4 indexing maps (lhs, weights, offsets, "
+                       "output); 'max_group_size' is a scalar and has none");
+
+  // Static shape agreement. Dynamic dims are unchecked.
+  auto sameIfStatic = [](int64_t a, int64_t b) {
+    return ShapedType::isDynamic(a) || ShapedType::isDynamic(b) || a == b;
+  };
+  if (!sameIfStatic(lhsTy.getDimSize(0), outTy.getDimSize(0)))
+    return emitOpError("expects lhs and output to have the same number of rows");
+  if (!sameIfStatic(lhsTy.getDimSize(1), weiTy.getDimSize(2)))
+    return emitOpError("expects lhs' K to match weights' innermost dim");
+  if (!sameIfStatic(outTy.getDimSize(1), weiTy.getDimSize(1)))
+    return emitOpError("expects output's N to match weights' middle dim");
+  if (!sameIfStatic(offTy.getDimSize(0), weiTy.getDimSize(0)))
+    return emitOpError("expects one offset per expert");
   return success();
 }
 
@@ -114,7 +127,7 @@ ArrayRef<int64_t> GroupedMatmulOp::getShape(OpOperand *opOperand) {
 }
 
 MutableOperandRange GroupedMatmulOp::getDpsInitsMutable() {
-  return MutableOperandRange(*this, /*numInputs=*/3, /*numInits=*/1);
+  return MutableOperandRange(*this, /*numInputs=*/4, /*numInits=*/1);
 }
 
 SmallVector<AffineMap> GroupedMatmulOp::getIndexingMapsArray() {
@@ -123,8 +136,15 @@ SmallVector<AffineMap> GroupedMatmulOp::getIndexingMapsArray() {
 }
 
 AffineMap GroupedMatmulOp::getMatchingIndexingMap(OpOperand *operand) {
-  return *(getIndexingMaps().getAsValueRange<AffineMapAttr>().begin() +
-           operand->getOperandNumber());
+  assert(operand->getOwner() == this->getOperation());
+  unsigned pos = operand->getOperandNumber();
+  // 'max_group_size' is a scalar: it has no map, and the maps of the operands
+  // after it are shifted by one.
+  if (pos == kMaxGroupSizeOperand)
+    return AffineMap::get(getIterationDomainRank(), 0, getContext());
+  if (pos > kMaxGroupSizeOperand)
+    --pos;
+  return getIndexingMapsArray()[pos];
 }
 
 /////// Operations corresponding to library calls defined with Tablegen ////////

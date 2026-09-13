@@ -133,42 +133,55 @@ def Linalgx_GroupedMatmulOp : Linalgx_Op<"grouped_matmul",
        "getResultTilePosition",
        "getTiledImplementation",
        "generateResultTileValue"]>]> {
-  let summary = [{Grouped (per-expert) matmul with a runtime weight selector.}];
+  let summary = [{Ragged (per-expert) matmul over group-partitioned rows.}];
   let description = [{
-    Computes, for every slot `s` and every token `m`:
+    A jagged / segmented batched matmul: the batch dimension is the expert, but
+    the number of rows per expert is a runtime value carried by `offsets` rather
+    than part of any shape. This mirrors oneDNN's `grouped_gemm` and
+    `torch.nn.functional.grouped_mm`.
 
-      out[s, m, :] = lhs[m, :] * weights[indices[m, s], :, :]^T
+    For every expert `e` and every row `r` of its group:
 
-    i.e. a matmul whose weight matrix is picked at runtime out of `weights`'
-    leading (expert) dimension. In a MoE top-k routing the same token row feeds
-    every slot, so `lhs` does not have a slot dimension at all.
+      start(e) = e == 0 ? 0 : offsets[e - 1]
+      end(e)   = offsets[e]
+      out[start(e) + r, :] = lhs[start(e) + r, :] * weights[e, :, :]^T
+                             for r in [0, end(e) - start(e))
 
-    Operand ranks: `lhs` [M, K], `weights` [E, N, K] (transposed, i.e. the
-    reduction dim is the innermost one), `indices` [M, S] (i32/i64),
-    `output` [S, M, N].
+    Operands:
+      `lhs`             [total, K]     rows of all groups, concatenated
+      `weights`         [E, N, K]      dense, transposed (K innermost)
+      `offsets`         [E] i32/i64    cumulative *ends* of the groups
+      `max_group_size`  index          upper bound on `end(e) - start(e)`
+      `output`          [total, N]     same row partitioning as `lhs`
 
-    Iteration domain is `(slot, m, n, k)` where `k` is the only reduction dim.
-    Note that `weights` is indexed by `(n, k)` only: its leading dimension is
-    addressed through `indices` and is therefore not part of the domain.
+    `offsets` holds exclusive prefix ends with an implicit leading zero, exactly
+    like oneDNN: counts [1, 3, 5] are passed as [1, 4, 9], `offsets[E-1]` equals
+    `total`, and an inactive expert is a zero-length group (`offsets[e] ==
+    offsets[e-1]`). Rows are NOT padded to any granularity - the tiled
+    implementation clamps the row tile to the group's real length, so a tile
+    never crosses a group boundary and the M tile size is a free tiling
+    parameter.
 
-    Keeping `lhs` 2-D is what makes the tiled form a plain `linalg.matmul`: the
-    slot dim is tiled to 1, so `weights` and `output` are sliced rank-reducingly
-    and every operand of the tile is 2-D. See `getTiledImplementation()`.
+    In a MoE layer the caller flattens top-k routing into `total = tokens * k`
+    rows, sorted by expert, and un-permutes plus applies the router weights
+    afterwards. The op has no notion of top-k slots.
 
-    CONTRACT, to be guaranteed by whoever produces `indices`: all tokens of one
-    `tile_m`-sized block must share the same expert, i.e. `indices[m, s]` is
-    constant for `m` in `[b * tile_m, (b + 1) * tile_m)`. The tiled
-    implementation reads the expert index once per tile, so the op is only
-    correct for inputs whose rows are already grouped by expert. `tile_m` is
-    therefore a contract, not a free tiling parameter: the tiling pass must use
-    exactly this size along `m`.
+    Iteration domain is `(expert, m, n, k)` with `k` the only reduction dim,
+    where `m` is *group-relative*: the tiled implementation adds `start(e)` when
+    slicing `lhs` and `output`. The domain is rectangular - `m` runs over
+    `max_group_size` - so tiles of short groups are clamped to zero size and do
+    nothing. Pass `total` for `max_group_size` if no tighter bound is known; the
+    result is the same, only the loop nest is over-provisioned.
+
+    The expert dim must be tiled to 1, which makes every operand of the tile 2-D
+    and the tile itself a plain `linalg.matmul`. See `getTiledImplementation()`.
   }];
 
   let arguments = (ins AnyShaped:$lhs,
                        AnyShaped:$weights,
-                       AnyShaped:$indices,
+                       AnyShaped:$offsets,
+                       Index:$max_group_size,
                        AnyShaped:$output,
-                       I64Attr:$tile_m,
                        AffineMapArrayAttr:$indexing_maps
   );
 
@@ -176,7 +189,9 @@ def Linalgx_GroupedMatmulOp : Linalgx_Op<"grouped_matmul",
   let hasVerifier = 1;
   let assemblyFormat = [{
     attr-dict
-    `ins` `(` $lhs `,` $weights `,` $indices `:` type($lhs) `,` type($weights) `,` type($indices) `)`
+    `ins` `(` $lhs `,` $weights `,` $offsets `,` $max_group_size `:`
+              type($lhs) `,` type($weights) `,` type($offsets) `,`
+              type($max_group_size) `)`
     `outs` `(` $output `:` type($output) `)`
     (`->` type($results)^)?
   }];
@@ -186,18 +201,23 @@ def Linalgx_GroupedMatmulOp : Linalgx_Op<"grouped_matmul",
 
     ArrayRef<int64_t> getShape(OpOperand* opOperand);
 
+    /* `indexing_maps` holds one map per *shaped* operand, in operand order;
+       `max_group_size` is a scalar and has no map. */
     AffineMap getLhsMap() { return getIndexingMapsArray()[0]; }
     AffineMap getWeightsMap() { return getIndexingMapsArray()[1]; }
-    AffineMap getIndicesMap() { return getIndexingMapsArray()[2]; }
+    AffineMap getOffsetsMap() { return getIndexingMapsArray()[2]; }
     AffineMap getOutputMap() { return getIndexingMapsArray()[3]; }
 
     int64_t getIterationDomainRank() { return getLhsMap().getNumDims(); }
 
     /* Iteration domain dim positions. */
-    static constexpr int64_t kSlotDim = 0;
+    static constexpr int64_t kExpertDim = 0;
     static constexpr int64_t kMDim = 1;
     static constexpr int64_t kNDim = 2;
     static constexpr int64_t kKDim = 3;
+
+    /* Operand numbers. */
+    static constexpr unsigned kMaxGroupSizeOperand = 3;
   }];
 }
 
