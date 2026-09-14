@@ -290,54 +290,168 @@ struct FoldAllocCopyIntoDirectWrite final : OpRewritePattern<memref::CopyOp> {
   }
 };
 
-// Fold alloc → transfer_write → reshape → transfer_read into shape_cast:
-//   %alloc = memref.alloc()
-//   vector.transfer_write %v, %alloc[0,0,...]
-//   %rs = memref.expand_shape / collapse_shape %alloc
-//   %r  = vector.transfer_read %rs[0,0,...]
-// → %r = vector.shape_cast %v  (+ erase alloc, write, reshape)
-struct FoldAllocWriteReshapeRead
+// Length of the linear prefix of a memref of shape `shape` covered by an access
+// of `sizes` elements per dimension starting at index 0, or std::nullopt if the
+// access is not a contiguous prefix of the memref.
+static std::optional<int64_t> getPrefixLength(ArrayRef<int64_t> sizes,
+                                              ArrayRef<int64_t> shape) {
+  int64_t length = 1;
+  bool truncated = false;
+  for (auto [size, dim] : llvm::zip_equal(sizes, shape)) {
+    if (ShapedType::isDynamic(size) || ShapedType::isDynamic(dim) || size > dim)
+      return std::nullopt;
+    // A partially covered dimension is a prefix only if all the dimensions
+    // outside of it are single slices and all the ones inside are full.
+    if (size != dim) {
+      if (truncated || length != 1) return std::nullopt;
+      truncated = true;
+    }
+    length *= size;
+  }
+  return length;
+}
+
+// True if `type` is a static row-major contiguous memref starting at the
+// beginning of its underlying buffer.
+static bool isContiguousFromStart(MemRefType type) {
+  if (!memref::isStaticShapeAndContiguousRowMajor(type)) return false;
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  return succeeded(type.getStridesAndOffset(strides, offset)) && offset == 0;
+}
+
+// True if `v` addresses exactly the first `v.getType().getNumElements()`
+// elements of `alloc` in row-major order, i.e. it is reachable from the alloc
+// through reshapes and zero-offset subviews keeping the memory contiguous.
+static bool isAllocPrefix(Value v, memref::AllocOp alloc) {
+  auto type = dyn_cast<MemRefType>(v.getType());
+  if (!type || !isContiguousFromStart(type)) return false;
+  if (v == alloc.getResult()) return true;
+
+  auto view = v.getDefiningOp<ViewLikeOpInterface>();
+  if (!view || !isAllocPrefix(view.getViewSource(), alloc)) return false;
+
+  // Reshapes address the same elements in the same order.
+  if (isa<memref::ExpandShapeOp, memref::CollapseShapeOp>(view.getOperation()))
+    return true;
+
+  auto subview = dyn_cast<memref::SubViewOp>(view.getOperation());
+  if (!subview || !subview.hasUnitStride()) return false;
+  for (OpFoldResult offset : subview.getMixedOffsets())
+    if (!isConstantIntValue(offset, 0)) return false;
+  return getPrefixLength(subview.getStaticSizes(),
+                         subview.getSourceType().getShape())
+      .has_value();
+}
+
+// Number of the leading elements of the base memref accessed by `xfer`, or
+// std::nullopt if the access is not a contiguous prefix of that memref.
+template <typename XferOp>
+static std::optional<int64_t> getTransferPrefixLength(XferOp xfer) {
+  auto baseType = dyn_cast<MemRefType>(xfer.getBase().getType());
+  auto vecType = xfer.getVectorType();
+  if (!baseType || vecType.isScalable() ||
+      baseType.getElementType() != vecType.getElementType() ||
+      vecType.getRank() > baseType.getRank())
+    return std::nullopt;
+  if (xfer.getMask() || !xfer.getPermutationMap().isMinorIdentity())
+    return std::nullopt;
+  for (Value idx : xfer.getIndices())
+    if (!isConstantIntValue(idx, 0)) return std::nullopt;
+
+  // The dimensions not covered by the vector are accessed at index 0 only.
+  SmallVector<int64_t> sizes(baseType.getRank() - vecType.getRank(), 1);
+  llvm::append_range(sizes, vecType.getShape());
+  return getPrefixLength(sizes, baseType.getShape());
+}
+
+// The transitive uses of an alloc, reached through view-like ops.
+struct AllocAccesses {
+  SmallVector<Operation *> views;
+  SmallVector<Operation *> deallocs;
+  SmallVector<vector::TransferReadOp> reads;
+  SmallVector<vector::TransferWriteOp> writes;
+};
+
+// Collect the uses of `memref` into `accesses`, failing if any of them is
+// neither a view, a dealloc nor a vector transfer.
+static LogicalResult collectAllocAccesses(Value memref,
+                                          AllocAccesses &accesses) {
+  for (Operation *user : memref.getUsers()) {
+    if (auto view = dyn_cast<ViewLikeOpInterface>(user)) {
+      accesses.views.push_back(user);
+      if (failed(collectAllocAccesses(view->getResult(0), accesses)))
+        return failure();
+    } else if (auto read = dyn_cast<vector::TransferReadOp>(user)) {
+      accesses.reads.push_back(read);
+    } else if (auto write = dyn_cast<vector::TransferWriteOp>(user)) {
+      accesses.writes.push_back(write);
+    } else if (isa<memref::DeallocOp>(user)) {
+      accesses.deallocs.push_back(user);
+    } else {
+      return failure();
+    }
+  }
+  return success();
+}
+
+// True if `a` is always executed before `b`: either earlier in the same block
+// or in an enclosing one.
+static bool isExecutedBefore(Operation *a, Operation *b) {
+  for (Operation *op = b; op; op = op->getParentOp())
+    if (op->getBlock() == a->getBlock()) return a->isBeforeInBlock(op);
+  return false;
+}
+
+// Forward a vector.transfer_write into the vector.transfer_read ops reading the
+// same elements back from a local allocation:
+//   %alloc = memref.alloc() : memref<1x64x16xf16>
+//   vector.transfer_write %v, %alloc[0, 0, 0] : vector<1x64x16xf16>, ...
+//   %r = vector.transfer_read %alloc[0, 0, 0] : ..., vector<64x16xf16>
+// → %r = vector.shape_cast %v  (+ erase the write and the alloc)
+// Both transfers may reach the alloc through reshapes and zero-offset subviews
+// and may leave the leading unit dims of the buffer implicit, so the write and
+// the read vector types only have to agree on the number of elements.
+struct ForwardAllocWriteToRead
     : public OpRewritePattern<vector::TransferReadOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(vector::TransferReadOp read,
                                 PatternRewriter &rw) const override {
-    auto isZero = [](Value v) {
-      auto cst = getConstantIntValue(v);
-      return cst && *cst == 0;
-    };
-    if (!llvm::all_of(read.getIndices(), isZero)) return failure();
-
-    auto *reshape = read.getBase().getDefiningOp();
-    if (!isa_and_present<memref::ExpandShapeOp, memref::CollapseShapeOp>(
-            reshape))
-      return failure();
-
-    auto reshapeInput = cast<ViewLikeOpInterface>(reshape).getViewSource();
-    auto alloc = reshapeInput.getDefiningOp<memref::AllocOp>();
+    auto alloc = traceToAlloc(read.getBase());
     if (!alloc) return failure();
 
-    // Find the single transfer_write into alloc.
-    vector::TransferWriteOp write;
-    for (auto &use : alloc.getResult().getUses()) {
-      if (auto w = dyn_cast<vector::TransferWriteOp>(use.getOwner())) {
-        if (write || !llvm::all_of(w.getIndices(), isZero)) return failure();
-        write = w;
-      } else if (!isa<memref::DeallocOp, memref::ExpandShapeOp,
-                      memref::CollapseShapeOp>(use.getOwner())) {
-        return failure(); // unexpected use
-      }
-    }
-    if (!write) return failure();
+    AllocAccesses accesses;
+    if (failed(collectAllocAccesses(alloc.getResult(), accesses)) ||
+        accesses.writes.size() != 1)
+      return failure();
 
-    auto srcType = cast<VectorType>(write.getVector().getType());
-    auto dstType = cast<VectorType>(read.getResult().getType());
-    if (srcType.getNumElements() != dstType.getNumElements()) return failure();
+    // The single write must cover the elements read back and be visible to all
+    // the reads, so that no read observes an uninitialized buffer.
+    auto write = accesses.writes.front();
+    auto writeLength = getTransferPrefixLength(write);
+    if (!writeLength || !isAllocPrefix(write.getBase(), alloc))
+      return failure();
+    for (auto other : accesses.reads)
+      if (!isExecutedBefore(write, other)) return failure();
 
-    rw.replaceOpWithNewOp<vector::ShapeCastOp>(read, dstType,
-                                               write.getVector());
-    if (reshape->use_empty()) rw.eraseOp(reshape);
-    if (write->use_empty()) rw.eraseOp(write);
+    if (getTransferPrefixLength(read) != writeLength ||
+        !isAllocPrefix(read.getBase(), alloc))
+      return failure();
+
+    if (read.getVectorType() == write.getVectorType())
+      rw.replaceOp(read, write.getVector());
+    else
+      rw.replaceOpWithNewOp<vector::ShapeCastOp>(read, read.getVectorType(),
+                                                 write.getVector());
+
+    // The remaining reads are forwarded by the following iterations; the write
+    // and the buffer can only be dropped along with the last one.
+    if (accesses.reads.size() > 1) return success();
+    rw.eraseOp(write);
+    for (Operation *view : llvm::reverse(accesses.views))
+      if (view->use_empty()) rw.eraseOp(view);
+    for (Operation *dealloc : accesses.deallocs) rw.eraseOp(dealloc);
     if (alloc->use_empty()) rw.eraseOp(alloc);
     return success();
   }
@@ -447,7 +561,7 @@ struct RemoveAllocs final : gc::impl::RemoveAllocsBase<RemoveAllocs> {
 
     RewritePatternSet patterns(&getContext());
     patterns.add<RemoveCopyToArg, RemoveAllocDeallocPair,
-                 FoldAllocCopyIntoDirectWrite, FoldAllocWriteReshapeRead>(
+                 FoldAllocCopyIntoDirectWrite, ForwardAllocWriteToRead>(
         &getContext());
 
     if (failed(applyPatternsGreedily(fn, std::move(patterns)))) {

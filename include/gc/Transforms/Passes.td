@@ -158,7 +158,7 @@ def RemoveAllocs : Pass<"remove-allocs", "func::FuncOp"> {
     Remove unnecessry memref.alloc operations.
   }];
   let dependentDialects = ["gpu::GPUDialect", "memref::MemRefDialect",
-                           "scf::SCFDialect"];
+                           "scf::SCFDialect", "vector::VectorDialect"];
 }
 
 def TensorReshapeToLinalg : Pass<"tensor-reshape-to-linalg", "func::FuncOp"> {
