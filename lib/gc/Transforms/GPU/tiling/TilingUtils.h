@@ -554,6 +554,63 @@ protected:
     }
   }
 
+  // The element types loaded by the tiled op and by the producers that will be
+  // fused into it. A dequantizing producer keeps its low-precision operands out
+  // of the consumer's operand list (it hands over an f16 tensor), but its loads
+  // still have to fit the same block instructions.
+  static SmallVector<Type> collectFusedElementTypes(Target &tg) {
+    SmallVector<Type> types;
+    auto add = [&](Value v) {
+      if (auto shaped = dyn_cast<ShapedType>(v.getType())) {
+        auto et = shaped.getElementType();
+        if (et.isIntOrFloat() && !llvm::is_contained(types, et))
+          types.push_back(et);
+      }
+    };
+
+    SmallVector<Value> worklist;
+    for (auto operand : tg.op.getOperation()->getOperands()) {
+      add(operand);
+      worklist.push_back(operand);
+    }
+
+    llvm::SmallSet<Operation *, 16> visited;
+    while (!worklist.empty()) {
+      auto *def = worklist.pop_back_val().getDefiningOp();
+      // Only walk the producers that can end up in the same kernel loop.
+      if (!def || def->getBlock() != tg.op->getBlock() ||
+          !visited.insert(def).second ||
+          !(isa<tensor::ExtractSliceOp>(def) || isParallel(def)))
+        continue;
+      for (auto operand : def->getOperands()) {
+        add(operand);
+        worklist.push_back(operand);
+      }
+    }
+    return types;
+  }
+
+  // The least common multiple of the smallest legal 2D block width of every
+  // element type in `types`, and the largest legal width among them. Types the
+  // block instruction does not support are skipped: those operands are not
+  // loaded by a block instruction in the first place.
+  static std::pair<unsigned, unsigned> getBlockWidthLimits(
+      ArrayRef<Type> types,
+      const xegpu::uArch::Subgroup2DBlockLoadInstruction *loadIns) {
+    unsigned granularity = 1, maxWidth = 0;
+    for (auto et : types) {
+      auto sizes = loadIns->getBlockWidthHeightCount(et, false, false);
+      if (!sizes) continue;
+      auto widths = std::get<0>(*sizes);
+      if (widths.empty()) continue;
+      granularity = std::lcm(granularity,
+                             static_cast<unsigned>(*llvm::min_element(widths)));
+      maxWidth =
+          std::max(maxWidth, static_cast<unsigned>(*llvm::max_element(widths)));
+    }
+    return {granularity, maxWidth};
+  }
+
   // Get the supported block sizes, that can be used for tiling of the dims
   // described by the width and height constraints.
   virtual BlockSizes getSupportedBlockSizes(Target &tg, bool reduction,
@@ -596,12 +653,34 @@ protected:
     auto storeSizes =
         storeIns->getBlockWidthHeightCount(elTy).value_or(defaults);
 
+    // A block instruction measures a block row in bytes, so the number of
+    // elements in a legal row depends on the element type: 16 for f16, but 32
+    // or 64 for i4. The blocking pass can only split a tile into legal blocks,
+    // never widen it, so a width that is legal for the widest operand can be
+    // impossible for a narrower one - 16 f16 elements are 32 bytes, 16 i4
+    // elements are only 8. Widen the candidates to a multiple that is legal for
+    // every element type involved.
+    //
+    // Only the reduction dim is corrected: it is the contiguous dim of the
+    // contraction operands (A and B are both [.., k] row-major), while the
+    // parallel width dim is contiguous for the output, whose type is `elTy`.
+    // TODO: derive this per operand from its indexing map, so a low-precision
+    // operand that is contiguous along a parallel dim is handled as well.
+    unsigned granularity = 1, maxWidth = 0;
+    if (reduction)
+      std::tie(granularity, maxWidth) =
+          getBlockWidthLimits(collectFusedElementTypes(tg), loadIns);
+
     // Get only the common sizes from both instructions and filter out those
     // that do not divide the tile sizes.
     BlockSizes bs;
-    for (unsigned w : std::get<0>(loadSizes))
-      if (cw.divides(w) && llvm::is_contained(std::get<0>(storeSizes), w))
-        bs.widths.push_back(w);
+    for (unsigned w : std::get<0>(loadSizes)) {
+      if (!llvm::is_contained(std::get<0>(storeSizes), w)) continue;
+      unsigned step = std::lcm(w, granularity);
+      for (unsigned tw = step; tw <= std::max(step, maxWidth); tw += step)
+        if (cw.divides(tw) && !llvm::is_contained(bs.widths, tw))
+          bs.widths.push_back(tw);
+    }
     for (unsigned h : std::get<1>(loadSizes))
       if (ch.divides(h) && llvm::is_contained(std::get<1>(storeSizes), h))
         bs.heights.push_back(h);
