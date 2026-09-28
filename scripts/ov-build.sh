@@ -34,7 +34,7 @@ fi
 . "$PROJECT_DIR/scripts/build.sh"
 
 : ${OV_URL:='https://github.com/dchigarev/openvino.git'}
-: ${OV_TAG:='mlir-gpu-gc-integration'}
+: ${OV_TAG:='gc-ci'}
 : ${OV_DIR:="$GC_EXTERNALS_DIR/openvino"}
 : ${OV_BUILD_TYPE:=$GC_BUILD_TYPE}
 : ${OV_BUILD_SFX:="/$OV_BUILD_TYPE"}

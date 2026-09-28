@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "llvm/ADT/APFloat.h"
@@ -46,6 +47,24 @@ static Value createFilled(OpBuilder &b, Location loc,
              b, loc, ValueRange{fillValue},
              ValueRange{createEmpty(b, loc, sizes, elemType)})
       .getResult(0);
+}
+
+template <typename BodyBuilder>
+static linalg::GenericOp createElementwise(OpBuilder &b, Location loc,
+                                           ValueRange inputs, Value output,
+                                           BodyBuilder &&body) {
+  int64_t rank = cast<ShapedType>(output.getType()).getRank();
+  SmallVector<AffineMap> indexingMaps(inputs.size() + 1,
+                                      b.getMultiDimIdentityMap(rank));
+  SmallVector<utils::IteratorType> iteratorTypes(rank,
+                                                 utils::IteratorType::parallel);
+  return linalg::GenericOp::create(
+      b, loc, TypeRange{output.getType()}, inputs, ValueRange{output},
+      indexingMaps, iteratorTypes,
+      [&](OpBuilder &bodyBuilder, Location bodyLoc, ValueRange args) {
+        linalg::YieldOp::create(bodyBuilder, bodyLoc,
+                                body(bodyBuilder, bodyLoc, args));
+      });
 }
 
 namespace {
@@ -173,7 +192,7 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
 
   Value scaleF32 = scale;
   if (scale.getType() != accElemType)
-    scaleF32 = arith::ExtFOp::create(b, loc, accElemType, scale);
+    scaleF32 = arith::ExtFOp::create(b, loc, accElemType, scale, {});
 
   // Accumulator inits. These fills precede the k-loop and deliberately get no
   // tiling attributes.
@@ -251,9 +270,13 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
         Value scaleTensor =
             createFilled(nb, loc, {seqDim, k2}, accElemType, scaleF32);
         tag(scaleTensor.getDefiningOp(), {M, K2});
-        auto scaleMul = linalg::MulOp::create(
+        auto scaleMul = createElementwise(
             nb, loc, ValueRange{qk, scaleTensor},
-            createEmpty(nb, loc, {seqDim, k2}, accElemType));
+            createEmpty(nb, loc, {seqDim, k2}, accElemType),
+            [](OpBuilder &eb, Location el, ValueRange args) {
+              return arith::MulFOp::create(eb, el, args[0], args[1])
+                  .getResult();
+            });
         Value scaled = scaleMul.getResult(0);
         tag(scaleMul, {M, K2});
 
@@ -278,15 +301,19 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
                 [&](OpBuilder &eb, Location el, ValueRange args) {
                   linalg::YieldOp::create(
                       eb, el,
-                      arith::ExtFOp::create(eb, el, accElemType, args[0])
+                      arith::ExtFOp::create(eb, el, accElemType, args[0], {})
                           .getResult());
                 });
             maskBlock = castOp.getResult(0);
             tag(castOp, {M, K2});
           }
-          auto addOp = linalg::AddOp::create(
+          auto addOp = createElementwise(
               nb, loc, ValueRange{scaled, maskBlock},
-              createEmpty(nb, loc, {seqDim, k2}, accElemType));
+              createEmpty(nb, loc, {seqDim, k2}, accElemType),
+              [](OpBuilder &eb, Location el, ValueRange args) {
+                return arith::AddFOp::create(eb, el, args[0], args[1])
+                    .getResult();
+              });
           scaled = addOp.getResult(0);
           tag(addOp, {M, K2});
         }
@@ -303,9 +330,13 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
                       .getResult());
             });
         tag(rowMaxOp, {M, K2});
-        auto mCurOp = linalg::MaxOp::create(
+        auto mCurOp = createElementwise(
             nb, loc, ValueRange{mPrev, rowMaxOp.getResult(0)},
-            createEmpty(nb, loc, {seqDim}, accElemType));
+            createEmpty(nb, loc, {seqDim}, accElemType),
+            [](OpBuilder &eb, Location el, ValueRange args) {
+              return arith::MaximumFOp::create(eb, el, args[0], args[1])
+                  .getResult();
+            });
         Value mCur = mCurOp.getResult(0);
         tag(mCurOp, {M});
 
@@ -314,13 +345,20 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
             nb, loc, mCur, createEmpty(nb, loc, {seqDim, k2}, accElemType),
             ArrayRef<int64_t>{1});
         tag(mBcastOp, {M, K2});
-        auto centerOp = linalg::SubOp::create(
+        auto centerOp = createElementwise(
             nb, loc, ValueRange{scaled, mBcastOp.getResult()[0]},
-            createEmpty(nb, loc, {seqDim, k2}, accElemType));
+            createEmpty(nb, loc, {seqDim, k2}, accElemType),
+            [](OpBuilder &eb, Location el, ValueRange args) {
+              return arith::SubFOp::create(eb, el, args[0], args[1])
+                  .getResult();
+            });
         tag(centerOp, {M, K2});
-        auto expOp = linalg::ExpOp::create(
-            nb, loc, centerOp.getResult(0),
-            createEmpty(nb, loc, {seqDim, k2}, accElemType));
+        auto expOp = createElementwise(
+            nb, loc, ValueRange{centerOp.getResult(0)},
+            createEmpty(nb, loc, {seqDim, k2}, accElemType),
+            [](OpBuilder &eb, Location el, ValueRange args) {
+              return math::ExpOp::create(eb, el, args[0]).getResult();
+            });
         Value P = expOp.getResult(0);
         tag(expOp, {M, K2});
 
@@ -337,22 +375,37 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
         tag(rowSumOp, {M, K2});
 
         // alpha = exp(mPrev - mCur); lCur = alpha * lPrev + rowSum.
-        auto alphaSubOp =
-            linalg::SubOp::create(nb, loc, ValueRange{mPrev, mCur},
-                                  createEmpty(nb, loc, {seqDim}, accElemType));
+        auto alphaSubOp = createElementwise(
+            nb, loc, ValueRange{mPrev, mCur},
+            createEmpty(nb, loc, {seqDim}, accElemType),
+            [](OpBuilder &eb, Location el, ValueRange args) {
+              return arith::SubFOp::create(eb, el, args[0], args[1])
+                  .getResult();
+            });
         tag(alphaSubOp, {M});
-        auto alphaOp =
-            linalg::ExpOp::create(nb, loc, alphaSubOp.getResult(0),
-                                  createEmpty(nb, loc, {seqDim}, accElemType));
+        auto alphaOp = createElementwise(
+            nb, loc, ValueRange{alphaSubOp.getResult(0)},
+            createEmpty(nb, loc, {seqDim}, accElemType),
+            [](OpBuilder &eb, Location el, ValueRange args) {
+              return math::ExpOp::create(eb, el, args[0]).getResult();
+            });
         Value alpha = alphaOp.getResult(0);
         tag(alphaOp, {M});
-        auto lScaleOp =
-            linalg::MulOp::create(nb, loc, ValueRange{lPrev, alpha},
-                                  createEmpty(nb, loc, {seqDim}, accElemType));
+        auto lScaleOp = createElementwise(
+            nb, loc, ValueRange{lPrev, alpha},
+            createEmpty(nb, loc, {seqDim}, accElemType),
+            [](OpBuilder &eb, Location el, ValueRange args) {
+              return arith::MulFOp::create(eb, el, args[0], args[1])
+                  .getResult();
+            });
         tag(lScaleOp, {M});
-        auto lCurOp = linalg::AddOp::create(
+        auto lCurOp = createElementwise(
             nb, loc, ValueRange{lScaleOp.getResult(0), rowSumOp.getResult(0)},
-            createEmpty(nb, loc, {seqDim}, accElemType));
+            createEmpty(nb, loc, {seqDim}, accElemType),
+            [](OpBuilder &eb, Location el, ValueRange args) {
+              return arith::AddFOp::create(eb, el, args[0], args[1])
+                  .getResult();
+            });
         Value lCur = lCurOp.getResult(0);
         tag(lCurOp, {M});
 
@@ -362,9 +415,13 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
             createEmpty(nb, loc, {seqDim, headDim}, accElemType),
             ArrayRef<int64_t>{1});
         tag(alphaBcastOp, {M, N});
-        auto accScaleOp = linalg::MulOp::create(
+        auto accScaleOp = createElementwise(
             nb, loc, ValueRange{acc, alphaBcastOp.getResult()[0]},
-            createEmpty(nb, loc, {seqDim, headDim}, accElemType));
+            createEmpty(nb, loc, {seqDim, headDim}, accElemType),
+            [](OpBuilder &eb, Location el, ValueRange args) {
+              return arith::MulFOp::create(eb, el, args[0], args[1])
+                  .getResult();
+            });
         tag(accScaleOp, {M, N});
 
         // P (truncated to query type) @ V, accumulated into accScaled.
@@ -404,9 +461,12 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
       b, loc, lFinal, createEmpty(b, loc, {seqDim, headDim}, accElemType),
       ArrayRef<int64_t>{1});
   tag(lBcastOp, {M, N});
-  auto divOp = linalg::DivOp::create(
+  auto divOp = createElementwise(
       b, loc, ValueRange{acc, lBcastOp.getResult()[0]},
-      createEmpty(b, loc, {seqDim, headDim}, accElemType));
+      createEmpty(b, loc, {seqDim, headDim}, accElemType),
+      [](OpBuilder &eb, Location el, ValueRange args) {
+        return arith::DivFOp::create(eb, el, args[0], args[1]).getResult();
+      });
   Value result = divOp.getResult(0);
   tag(divOp, {M, N});
 

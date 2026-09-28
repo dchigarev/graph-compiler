@@ -14,6 +14,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/XeGPU/IR/XeGPU.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -36,8 +37,7 @@ findVLoadChain(xegpu::DpasOp secondDpas, Region *loopBodyRegion) {
 
   // V operand might be the direct result of load_nd
   auto vLoad = dyn_cast_or_null<xegpu::LoadNdOp>(vOperand.getDefiningOp());
-  if (!vLoad)
-    return std::nullopt;
+  if (!vLoad) return std::nullopt;
 
   // Collect the full backward slice of the load operation
   DenseSet<Operation *> visited;
@@ -64,39 +64,6 @@ static xegpu::LoadNdOp findKLoad(xegpu::DpasOp firstDpas) {
   return nullptr;
 }
 
-/// Check if any operation in the chain depends on values computed after kLoad.
-static bool dependsOnOpsAfterKLoad(const SmallVector<Operation *> &vLoadChain,
-                                   Operation *kLoad, Block *loopBody) {
-  // Collect all operations after kLoad in the loop body
-  llvm::DenseSet<Operation *> opsAfterKLoad;
-  bool foundKLoad = false;
-  for (Operation &op : loopBody->getOperations()) {
-    if (&op == kLoad) {
-      foundKLoad = true;
-      continue;
-    }
-    if (foundKLoad) {
-      opsAfterKLoad.insert(&op);
-    }
-  }
-
-  // Check if any op in vLoadChain uses a result from opsAfterKLoad
-  for (Operation *op : vLoadChain) {
-    // Skip if it's in the chain itself
-    if (llvm::is_contained(vLoadChain, op))
-      continue;
-
-    for (Value operand : op->getOperands()) {
-      if (auto defOp = operand.getDefiningOp()) {
-        if (opsAfterKLoad.contains(defOp))
-          return true;
-      }
-    }
-  }
-
-  return false;
-}
-
 /// Hoist the V-load chain right after the K-load.
 static bool hoistVLoadChain(xegpu::DpasOp firstDpas,
                             const SmallVector<Operation *> &vLoadChain) {
@@ -108,16 +75,43 @@ static bool hoistVLoadChain(xegpu::DpasOp firstDpas,
   }
 
   Block *loopBody = firstDpas->getBlock();
+  if (kLoad->getBlock() != loopBody) return false;
 
-  // Check if we can safely move the chain (no dependencies on ops after kLoad)
-  if (dependsOnOpsAfterKLoad(vLoadChain, kLoad, loopBody)) {
-    return false;
+  DenseSet<Operation *> moving;
+  for (Operation *op : vLoadChain) {
+    if (op->getBlock() != loopBody) return false;
+    if (kLoad->isBeforeInBlock(op)) moving.insert(op);
   }
 
-  // Move each operation in the chain right after the K load
-  // We need to insert them in order, so each one goes after the previous
+  if (moving.empty()) return false;
+
+  auto mayWrite = [](Operation *op) {
+    auto effects = getEffectsRecursively(op);
+    return !effects || llvm::any_of(*effects, [](const auto &effect) {
+      return isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect());
+    });
+  };
+
+  for (Operation *op : vLoadChain) {
+    if (!moving.contains(op)) continue;
+    if (mayWrite(op)) return false;
+    for (Value operand : op->getOperands()) {
+      Operation *def = operand.getDefiningOp();
+      if (def && def->getBlock() == loopBody && kLoad->isBeforeInBlock(def) &&
+          !moving.contains(def))
+        return false;
+    }
+  }
+
+  // Do not move a read across intervening writes, frees, or unknown effects.
+  for (Operation *op = kLoad->getNextNode(); op != vLoadChain.back();
+       op = op->getNextNode()) {
+    if (!moving.contains(op) && mayWrite(op)) return false;
+  }
+
   Operation *insertAfter = kLoad;
   for (Operation *op : vLoadChain) {
+    if (!moving.contains(op)) continue;
     op->moveAfter(insertAfter);
     insertAfter = op;
   }
@@ -137,8 +131,7 @@ struct HoistAttentionVLoad final
       auto dpasOps = gc::attention::collectDpasOps(forOp);
 
       // We're looking for flash-attention pattern with at least 2 dpas ops
-      if (dpasOps.size() < 2)
-        return;
+      if (dpasOps.size() < 2) return;
 
       // Take the first and second dpas operations
       xegpu::DpasOp firstDpas = dpasOps[0];
@@ -146,8 +139,7 @@ struct HoistAttentionVLoad final
 
       // Find the V-load chain before the second dpas
       auto vLoadChain = findVLoadChain(secondDpas, &forOp.getRegion());
-      if (!vLoadChain.has_value() || vLoadChain->empty())
-        return;
+      if (!vLoadChain.has_value() || vLoadChain->empty()) return;
 
       // Hoist the V-load chain to after the K-load
       if (hoistVLoadChain(firstDpas, *vLoadChain)) {
@@ -155,8 +147,7 @@ struct HoistAttentionVLoad final
       }
     });
 
-    if (!changed)
-      return;
+    if (!changed) return;
   }
 };
 

@@ -5,13 +5,18 @@
 // CHECK:   linalg.fill {{.*}}gc.tiling.wg_tile_sizes = array<i64: [[#WGM:]], [[#WGN:]]>
 // CHECK:   scf.for
 // CHECK:     linalg.matmul {{.*}}gc.tiling.wg_tile_sizes = array<i64: [[#WGM]], [[#WGN]], [[#WGK:]]>
-// CHECK:   linalg.add {{.*}}gc.tiling.wg_tile_sizes = array<i64: [[#WGM]], [[#WGN]]>
+// CHECK:   linalg.generic {{.*}}gc.tiling.wg_tile_sizes = array<i64: [[#WGM]], [[#WGN]]>
 func.func @matmul_add(%arg0: tensor<1024x512xf16>, %arg1: tensor<512x1024xf16>) -> tensor<1024x1024xf16> {
   %cst = arith.constant 0.000000e+00 : f16
   %0 = tensor.empty() : tensor<1024x1024xf16>
   %1 = linalg.fill ins(%cst : f16) outs(%0 : tensor<1024x1024xf16>) -> tensor<1024x1024xf16>
   %2 = linalg.matmul ins(%arg0, %arg1 : tensor<1024x512xf16>, tensor<512x1024xf16>) outs(%1 : tensor<1024x1024xf16>) -> tensor<1024x1024xf16>
-  %3 = linalg.add ins(%2, %1 : tensor<1024x1024xf16>, tensor<1024x1024xf16>) outs(%0 : tensor<1024x1024xf16>) -> tensor<1024x1024xf16>
+  %3 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]}
+      ins(%2, %1 : tensor<1024x1024xf16>, tensor<1024x1024xf16>) outs(%0 : tensor<1024x1024xf16>) {
+    ^bb0(%lhs: f16, %rhs: f16, %out: f16):
+      %sum = arith.addf %lhs, %rhs : f16
+      linalg.yield %sum : f16
+  } -> tensor<1024x1024xf16>
   return %3 : tensor<1024x1024xf16>
 }
 
@@ -23,7 +28,7 @@ func.func @matmul_add(%arg0: tensor<1024x512xf16>, %arg1: tensor<512x1024xf16>) 
 // CHECK:   scf.for
 // CHECK:     linalg.transpose {{.*}}gc.tiling.wg_tile_sizes = array<i64: [[#WGK:]], [[#WGN]]>
 // CHECK:     linalg.matmul {{.*}}gc.tiling.wg_tile_sizes = array<i64: [[#WGM]], [[#WGN]], [[#WGK]]>
-// CHECK:   linalg.add {{.*}}gc.tiling.wg_tile_sizes = array<i64: [[#WGM]], [[#WGN]]>
+// CHECK:   linalg.generic {{.*}}gc.tiling.wg_tile_sizes = array<i64: [[#WGM]], [[#WGN]]>
 func.func @transpose_matmul_add(%arg0: tensor<1024x512xf16>, %argB: tensor<1024x512xf16>) -> tensor<1024x1024xf16> {
   %cst = arith.constant 0.000000e+00 : f16
   %0 = tensor.empty() : tensor<1024x1024xf16>
@@ -31,7 +36,12 @@ func.func @transpose_matmul_add(%arg0: tensor<1024x512xf16>, %argB: tensor<1024x
   %bt = linalg.transpose ins(%argB : tensor<1024x512xf16>) outs(%bt_init : tensor<512x1024xf16>) permutation = [1, 0]
   %1 = linalg.fill ins(%cst : f16) outs(%0 : tensor<1024x1024xf16>) -> tensor<1024x1024xf16>
   %2 = linalg.matmul ins(%arg0, %bt : tensor<1024x512xf16>, tensor<512x1024xf16>) outs(%1 : tensor<1024x1024xf16>) -> tensor<1024x1024xf16>
-  %3 = linalg.add ins(%2, %1 : tensor<1024x1024xf16>, tensor<1024x1024xf16>) outs(%0 : tensor<1024x1024xf16>) -> tensor<1024x1024xf16>
+  %3 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]}
+      ins(%2, %1 : tensor<1024x1024xf16>, tensor<1024x1024xf16>) outs(%0 : tensor<1024x1024xf16>) {
+    ^bb0(%lhs: f16, %rhs: f16, %out: f16):
+      %sum = arith.addf %lhs, %rhs : f16
+      linalg.yield %sum : f16
+  } -> tensor<1024x1024xf16>
   return %3 : tensor<1024x1024xf16>
 }
 

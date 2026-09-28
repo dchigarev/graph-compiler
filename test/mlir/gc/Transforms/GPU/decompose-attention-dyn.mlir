@@ -28,14 +28,18 @@
 // CHECK:           linalg.matmul {{.*}}gc.tiling.wg_tile_sizes = array<i64: 128, 64, 0>
 // CHECK:           linalg.reduce
 // CHECK-SAME:        gc.tiling.wg_tile_sizes = array<i64: 128, 64>
-// CHECK:           linalg.max {{.*}}gc.tiling.wg_tile_sizes = array<i64: 128>
+// CHECK:           linalg.generic {{.*}}gc.tiling.wg_tile_sizes = array<i64: 128>
+// CHECK-NEXT:      ^bb0
+// CHECK-NEXT:        %{{.*}} = arith.maximumf
 // PV matmul: iteration (m, n, k2) -> [128, 0, 64]
 // CHECK:           linalg.matmul {{.*}}gc.tiling.wg_tile_sizes = array<i64: 128, 0, 64>
 // CHECK:         } {gc.tiling.level = 1 : i8, gc.tiling.wg_tile_sizes = array<i64: 1, 1, 128, 0, 0, 0>}
 
 // Suffix ops (after the loop) use the 2D (m, n) tile space.
 // CHECK:         linalg.broadcast {{.*}}gc.tiling.wg_tile_sizes = array<i64: 128, 0>
-// CHECK:         linalg.div {{.*}}gc.tiling.wg_tile_sizes = array<i64: 128, 0>
+// CHECK:         linalg.generic {{.*}}gc.tiling.wg_tile_sizes = array<i64: 128, 0>
+// CHECK-NEXT:    ^bb0
+// CHECK-NEXT:      %{{.*}} = arith.divf
 
 module @fragment_name attributes {gc.module = {device = {arch = "bmg", max_wg_size = 1024 : i64, sg_sizes = [16, 32]}, kernels = {entry_kernel = {threads = [128, 1, 1]}}}} {
   func.func @entry(%arg0: memref<?x16x?x64xf16>, %arg1: memref<?x16x?x64xf16>, %arg2: memref<?x16x?x64xf16>, %arg3: memref<?x16x?x64xf16>) attributes {gc.num_kernels = 1 : i32} {

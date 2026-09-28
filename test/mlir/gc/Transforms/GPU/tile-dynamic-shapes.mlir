@@ -10,7 +10,7 @@
 // CHECK:         scf.forall (%{{.+}}, %{{.+}}) = (0, 0) to (%[[M]], %[[N]]) step (32, 64)
 // CHECK:           scf.for %{{.+}} = %[[C0]] to %[[K]] step %[[C64]]
 // CHECK:             linalg.matmul {gc.tiling.level = 1
-// CHECK:           linalg.add {gc.tiling.level = 0
+// CHECK:           linalg.generic {{.*}}gc.tiling.level = 0
 func.func @entry(%arg0: memref<?x?xf16>, %arg1: memref<?x?xf16>, %arg2: memref<?x?xf16>) {
   %cst = arith.constant 0.000000e+00 : f16
   %c1 = arith.constant 1 : index
@@ -22,7 +22,12 @@ func.func @entry(%arg0: memref<?x?xf16>, %arg1: memref<?x?xf16>, %arg2: memref<?
   %2 = tensor.empty(%dim, %dim_0) : tensor<?x?xf16>
   %3 = linalg.fill ins(%cst : f16) outs(%2 : tensor<?x?xf16>) -> tensor<?x?xf16>
   %4 = linalg.matmul ins(%1, %0 : tensor<?x?xf16>, tensor<?x?xf16>) outs(%3 : tensor<?x?xf16>) -> tensor<?x?xf16>
-  %5 = linalg.add ins(%4, %1 : tensor<?x?xf16>, tensor<?x?xf16>) outs(%2 : tensor<?x?xf16>) -> tensor<?x?xf16>
+  %5 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]}
+      ins(%4, %1 : tensor<?x?xf16>, tensor<?x?xf16>) outs(%2 : tensor<?x?xf16>) {
+    ^bb0(%lhs: f16, %rhs: f16, %out: f16):
+      %sum = arith.addf %lhs, %rhs : f16
+      linalg.yield %sum : f16
+  } -> tensor<?x?xf16>
   bufferization.materialize_in_destination %5 in restrict writable %arg2 : (tensor<?x?xf16>, memref<?x?xf16>) -> ()
   return
 }
