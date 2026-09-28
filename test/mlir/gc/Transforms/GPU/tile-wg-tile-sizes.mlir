@@ -61,7 +61,7 @@ func.func @attention(%q: tensor<2x16x1024x64xf16>, %k: tensor<2x16x1024x64xf16>,
   %0 = tensor.empty() : tensor<2x16x1024x64xf16>
   %1 = linalg.fill ins(%cst : f16) outs(%0 : tensor<2x16x1024x64xf16>) -> tensor<2x16x1024x64xf16>
   %2 = linalgx.attention
-       { indexing_maps = [#mapQ, #mapK, #mapV, #mapS, #mapO] }
+       <{ indexing_maps = [#mapQ, #mapK, #mapV, #mapS, #mapO] }>
        ins(%q, %k, %v, %scale : tensor<2x16x1024x64xf16>, tensor<2x16x1024x64xf16>, tensor<2x16x1024x64xf16>, f16)
        outs(%1 : tensor<2x16x1024x64xf16>) -> tensor<2x16x1024x64xf16>
   return %2 : tensor<2x16x1024x64xf16>

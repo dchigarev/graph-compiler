@@ -63,6 +63,7 @@ def Linalgx_AttentionOp : Linalgx_Op<"attention",
   let hasCustomAssemblyFormat = 1;
   let assemblyFormat = [{
     attr-dict
+    prop-dict
     `ins` `(` $query `,` $key `,` $value `,` $scale (`,` $mask^)?  `:` type($query) `,` type($key) `,` type($value) `,` type($scale) (`,` type($mask)^ )?`)`
     `outs` `(` $output `:` type($output) `)`
     (`->` type($results)^)?

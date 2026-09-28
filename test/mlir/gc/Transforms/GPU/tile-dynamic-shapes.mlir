@@ -54,7 +54,7 @@ func.func @entry(%arg0: memref<?x16x?x64xf16>, %arg1: memref<?x16x?x64xf16>, %ar
   %dim_1 = memref.dim %arg2, %c2 : memref<?x16x?x64xf16>
   %3 = tensor.empty(%dim, %dim_1) : tensor<?x16x?x64xf16>
   %4 = linalg.fill ins(%cst : f16) outs(%3 : tensor<?x16x?x64xf16>) -> tensor<?x16x?x64xf16>
-  %5 = linalgx.attention {indexing_maps = [affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d4, d3)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d4, d5)>, affine_map<(d0, d1, d2, d3, d4, d5) -> ()>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d5)>]} ins(%2, %1, %0, %cst_0 : tensor<?x16x?x64xf16>, tensor<?x16x?x64xf16>, tensor<?x16x?x64xf16>, f16) outs(%4 : tensor<?x16x?x64xf16>) -> tensor<?x16x?x64xf16>
+  %5 = linalgx.attention <{indexing_maps = [affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d4, d3)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d4, d5)>, affine_map<(d0, d1, d2, d3, d4, d5) -> ()>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d5)>]}> ins(%2, %1, %0, %cst_0 : tensor<?x16x?x64xf16>, tensor<?x16x?x64xf16>, tensor<?x16x?x64xf16>, f16) outs(%4 : tensor<?x16x?x64xf16>) -> tensor<?x16x?x64xf16>
   bufferization.materialize_in_destination %5 in restrict writable %arg3 : (tensor<?x16x?x64xf16>, memref<?x16x?x64xf16>) -> ()
   return
 }

@@ -63,7 +63,7 @@ module @fragment_name attributes {gc.module = {device = {arch = "bmg", max_wg_si
       %extracted_slice_6 = tensor.extract_slice %0[%arg4, %arg5, 0, 0] [1, 1, %dim_4, 64] [1, 1, 1, 1] : tensor<?x16x?x64xf16> to tensor<1x1x?x64xf16>
       %extracted_slice_7 = tensor.extract_slice %arg7[%arg4, %arg5, %arg6, 0] [1, 1, %5, 64] [1, 1, 1, 1] : tensor<?x16x?x64xf16> to tensor<1x1x?x64xf16>
       %6 = linalg.fill ins(%cst : f16) outs(%extracted_slice_7 : tensor<1x1x?x64xf16>) -> tensor<1x1x?x64xf16>
-      %7 = linalgx.attention {gc.tiling.level = 1 : i8, gc.tiling.wg_tile_sizes = array<i64: 1, 1, 128, 0, 0, 0>, indexing_maps = [#map1, #map2, #map3, #map4, #map5]} ins(%extracted_slice, %extracted_slice_5, %extracted_slice_6, %cst_0 : tensor<1x1x?x64xf16>, tensor<1x1x?x64xf16>, tensor<1x1x?x64xf16>, f16) outs(%6 : tensor<1x1x?x64xf16>) -> tensor<1x1x?x64xf16>
+      %7 = linalgx.attention {gc.tiling.level = 1 : i8, gc.tiling.wg_tile_sizes = array<i64: 1, 1, 128, 0, 0, 0>} <{indexing_maps = [#map1, #map2, #map3, #map4, #map5]}> ins(%extracted_slice, %extracted_slice_5, %extracted_slice_6, %cst_0 : tensor<1x1x?x64xf16>, tensor<1x1x?x64xf16>, tensor<1x1x?x64xf16>, f16) outs(%6 : tensor<1x1x?x64xf16>) -> tensor<1x1x?x64xf16>
       scf.forall.in_parallel {
         tensor.parallel_insert_slice %7 into %arg7[%arg4, %arg5, %arg6, 0] [1, 1, %5, 64] [1, 1, 1, 1] : tensor<1x1x?x64xf16> into tensor<?x16x?x64xf16>
       }
