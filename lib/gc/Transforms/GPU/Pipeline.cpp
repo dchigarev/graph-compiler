@@ -247,6 +247,10 @@ void populateGPUPipeline(OpPassManager &pm,
   if (pipelineOpts.deviceProps) {
     deviceProps = *pipelineOpts.deviceProps;
   }
+  // Command line options for the IGC compiler. They are stored in the xevm
+  // target attached to the kernels and passed to the gpu-module-to-binary pass.
+  std::string igcCmdOptions =
+      pipelineOpts.igcCmdOptions + " -ze-opt-large-register-file";
 
   pm.addPass(createCanonicalizerPass());
   if (dump) pm.addPass(createPrintIRPass({"Initial"}));
@@ -313,7 +317,9 @@ void populateGPUPipeline(OpPassManager &pm,
   });
 
   phase("KernelOutlining", [&]() {
-    pm.addPass(createGpuKernelOutline());
+    GpuKernelOutlineOptions opts;
+    opts.cmdOptions = igcCmdOptions;
+    pm.addPass(createGpuKernelOutline(std::move(opts)));
     pm.addNestedPass<func::FuncOp>(createAddContextArg());
   });
 
@@ -333,10 +339,13 @@ void populateGPUPipeline(OpPassManager &pm,
     gpu::GPUToXeVMPipelineOptions opts;
     opts.use64bitIndex = true;
     opts.binaryFormat = "binary";
-    opts.zebinChip = deviceProps.arch;
-    opts.cmdOptions =
-        pipelineOpts.igcCmdOptions + " -ze-opt-large-register-file";
-    opts.optLevel = 3;
+    opts.cmdOptions = igcCmdOptions;
+    // The xevm target is attached by the GpuKernelOutline pass, with the chip
+    // taken from the device attributes. The upstream pipeline would attach
+    // another target with a statically configured chip and, since the two are
+    // not identical, each kernel would be compiled once per target. Disable
+    // the upstream attach by matching no module name.
+    opts.xevmModuleMatcher = "^$";
     gpu::buildLowerToXeVMPassPipeline(pm, opts);
   });
 

@@ -41,6 +41,9 @@ namespace {
 
 struct GpuKernelOutline final
     : gc::impl::GpuKernelOutlineBase<GpuKernelOutline> {
+  explicit GpuKernelOutline() : GpuKernelOutline(GpuKernelOutlineOptions{}) {}
+  explicit GpuKernelOutline(const GpuKernelOutlineOptions &opts)
+      : GpuKernelOutlineBase(opts) {}
 
   void runOnOperation() override {
     IRRewriter rw(&getContext());
@@ -118,10 +121,15 @@ struct GpuKernelOutline final
                        OpPassManager::Nesting::Implicit);
       pm.addPass(createGpuKernelOutliningPass());
       {
+        // Attach the xevm target to the outlined kernel modules. This is the
+        // only target the kernels get, the upstream XeVM pipeline is
+        // configured to not attach its own one (see Pipeline.cpp), otherwise
+        // each kernel would be compiled once per target.
         GpuXeVMAttachTargetOptions opts;
         auto arch = DevAttrs(op).getArch();
         if (arch) opts.chip = arch.value().str();
         opts.optLevel = 3;
+        opts.cmdOptions = cmdOptions;
         pm.addPass(createGpuXeVMAttachTarget(std::move(opts)));
       }
       if (failed(runPipeline(pm, op))) {

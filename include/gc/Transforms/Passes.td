@@ -158,9 +158,17 @@ def HoistForLoopTransferRead : Pass<"hoist-for-loop-transfer-read", "func::FuncO
 def GpuKernelOutline : Pass<"gpu-kernel-outline", "ModuleOp"> {
   let summary = "Outline GPU kernels.";
   let description = [{
-    Convert scf.forall operations into GPU kernels.
+    Convert scf.forall operations into GPU kernels and attach the xevm target
+    to the outlined kernel modules. The target chip is taken from the device
+    attributes, see the GpuDeviceProps pass.
   }];
   let dependentDialects = ["scf::SCFDialect", "gpu::GPUDialect", "xevm::XeVMDialect"];
+  let options = [
+    Option<"cmdOptions", "cmd-options", "std::string",
+           /*default=*/[{""}],
+           "Command line options to pass to the downstream compiler. These are "
+           "stored as the flags of the xevm target.">
+    ];
 }
 
 def SetKernelDepends : Pass<"set-kernel-depends", "func::FuncOp"> {
