@@ -52,6 +52,17 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-Werror -Werror=missing-declarations)
 endif()
 
+
+# Recent MLIR marks some of the default op builders that mlir-tblgen generates
+# as deprecated, and the generated *.inc code itself calls them from other
+# deprecated builders. Our sources never call these builders, so there is
+# nothing to fix on our side. Clang ignores calls made from inside deprecated
+# functions, but GCC warns about them and -Werror turns the warning into a build
+# failure. Keep them as plain warnings for GCC.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+  add_compile_options(-Wno-error=deprecated-declarations)
+endif()
+
 # Silence a false positive GCC -Wunused-but-set-parameter warning
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION
                                            VERSION_LESS "10.0")
