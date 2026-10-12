@@ -263,6 +263,7 @@ void populateGPUPipeline(OpPassManager &pm,
 
   phase("Tiling", [&]() {
     pm.addNestedPass<func::FuncOp>(createTileContraction());
+    pm.addNestedPass<func::FuncOp>(createTileGroupedMatmul());
     pm.addNestedPass<func::FuncOp>(createTileAttention());
     pm.addNestedPass<func::FuncOp>(createTileParallel());
     pm.addNestedPass<func::FuncOp>(createSetKernelDepends());

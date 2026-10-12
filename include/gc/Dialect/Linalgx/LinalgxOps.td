@@ -124,4 +124,80 @@ def Linalgx_AttentionOp : Linalgx_Op<"attention",
   let hasCanonicalizer = 1;
 }
 
+def Linalgx_GroupedMatmulOp : Linalgx_Op<"grouped_matmul",
+    [
+     DeclareOpInterfaceMethods<IndexingMapOpInterface, ["getMatchingIndexingMap"]>,
+     DeclareOpInterfaceMethods<DestinationStyleOpInterface>,
+     DeclareOpInterfaceMethods<TilingInterface,
+      ["getIterationDomain",
+       "getLoopIteratorTypes",
+       "getResultTilePosition",
+       "getTiledImplementation",
+       "generateResultTileValue"]>]> {
+  let summary = [{Grouped matmul with the semantics of PyTorch's grouped_mm.}];
+  let description = [{
+    Same as `torch._grouped_mm(lhs, weights.transpose(-2, -1), offs=offsets)`:
+    the rows of `lhs` are split into consecutive groups, one per expert, and
+    each group is multiplied by its own expert's weights.
+
+      lhs      [total, K]
+      weights  [E, N, K]   (K innermost, i.e. transposed)
+      offsets  [E]         end row of each group (i32/i64)
+      output   [total, N]
+
+    Example: 3 experts with 2, 0 and 3 rows, so `total = 5` and
+    `offsets = [2, 2, 5]`:
+
+      rows [0, 2) -> out = lhs[0:2] * weights[0]^T
+      rows [2, 2) -> expert 1 has no rows
+      rows [2, 5) -> out = lhs[2:5] * weights[2]^T
+
+    `max_group_size` is an optional performance hint: an upper bound on the
+    number of rows in any group. It defaults to `total` and only shrinks the
+    loop over rows, but it must be a real bound - rows of a group longer than
+    `max_group_size` are not computed.
+  }];
+
+  let arguments = (ins AnyShaped:$lhs,
+                       AnyShaped:$weights,
+                       AnyShaped:$offsets,
+                       Optional<Index>:$max_group_size,
+                       AnyShaped:$output,
+                       AffineMapArrayAttr:$indexing_maps
+  );
+
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    attr-dict
+    prop-dict
+    `ins` `(` $lhs `,` $weights `,` $offsets `:`
+              type($lhs) `,` type($weights) `,` type($offsets) `)`
+    (`max_group_size` `(` $max_group_size^ `)`)?
+    `outs` `(` $output `:` type($output) `)`
+    (`->` type($results)^)?
+  }];
+
+  let extraClassDeclaration = [{
+    SmallVector<AffineMap> getIndexingMapsArray();
+
+    ArrayRef<int64_t> getShape(OpOperand* opOperand);
+
+    /* `indexing_maps` holds one map per *shaped* operand, in operand order;
+       `max_group_size` is a scalar and has no map. */
+    AffineMap getLhsMap() { return getIndexingMapsArray()[0]; }
+    AffineMap getWeightsMap() { return getIndexingMapsArray()[1]; }
+    AffineMap getOffsetsMap() { return getIndexingMapsArray()[2]; }
+    AffineMap getOutputMap() { return getIndexingMapsArray()[3]; }
+
+    int64_t getIterationDomainRank() { return getLhsMap().getNumDims(); }
+
+    /* Iteration domain dim positions. */
+    static constexpr int64_t kExpertDim = 0;
+    static constexpr int64_t kMDim = 1;
+    static constexpr int64_t kNDim = 2;
+    static constexpr int64_t kKDim = 3;
+  }];
+}
+
 #endif // LINALGX_OPS

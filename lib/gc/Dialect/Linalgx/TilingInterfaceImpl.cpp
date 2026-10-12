@@ -5,6 +5,8 @@
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -302,4 +304,237 @@ FailureOr<TilingResult> AttentionOp::generateResultTileValue(
   }
   return getTiledImplementation(builder, normalizedOffsets, normalizedSizes,
                                 innerTileAlignments);
+}
+
+//===----------------------------------------------------------------------===//
+// GroupedMatmulOp
+//===----------------------------------------------------------------------===//
+
+SmallVector<Range> GroupedMatmulOp::getIterationDomain(OpBuilder &b) {
+  Location loc = getLoc();
+  OpFoldResult zero = b.getIndexAttr(0);
+  OpFoldResult one = b.getIndexAttr(1);
+  SmallVector<Range> bounds(4);
+  for (Range &r : bounds) {
+    r.offset = zero;
+    r.stride = one;
+  }
+  // The row dim is group-relative, so its bound is the largest group. Without
+  // the hint, the total row count is the only safe bound. Everything else comes
+  // from the operand shapes.
+  bounds[kExpertDim].size = getDim(b, loc, getWeights(), 0);
+  if (Value maxGroupSize = getMaxGroupSize()) {
+    bounds[kMDim].size = maxGroupSize;
+  } else {
+    bounds[kMDim].size = getDim(b, loc, getLhs(), 0);
+  }
+  bounds[kNDim].size = getDim(b, loc, getWeights(), 1);
+  bounds[kKDim].size = getDim(b, loc, getLhs(), 1);
+  return bounds;
+}
+
+/// Emits the [start, end) row range of expert `expertIdx` from `offsets`,
+/// which holds the end row of each group:
+///   start = expertIdx == 0 ? 0 : offsets[expertIdx - 1]
+///   end   = offsets[expertIdx]
+/// E.g. for offsets = [2, 2, 5]:
+///   expertIdx 0 -> [0, 2)
+///   expertIdx 1 -> [2, 2)  (empty group)
+///   expertIdx 2 -> [2, 5)
+static std::pair<Value, Value> emitGroupRange(OpBuilder &b, Location loc,
+                                              Value offsets, Value expertIdx) {
+  Value zero = arith::ConstantIndexOp::create(b, loc, 0);
+  Value one = arith::ConstantIndexOp::create(b, loc, 1);
+  Value isFirst =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, expertIdx, zero);
+  // Clamped so that the load stays in bounds for expert 0; its value is
+  // discarded by the select below.
+  Value prevIdx = arith::SelectOp::create(
+      b, loc, isFirst, zero, arith::SubIOp::create(b, loc, expertIdx, one));
+  auto toIndex = [&](Value v) {
+    return arith::IndexCastOp::create(b, loc, b.getIndexType(), v).getResult();
+  };
+  Value prev =
+      toIndex(tensor::ExtractOp::create(b, loc, offsets, ValueRange{prevIdx}));
+  Value start = arith::SelectOp::create(b, loc, isFirst, zero, prev);
+  Value end = toIndex(
+      tensor::ExtractOp::create(b, loc, offsets, ValueRange{expertIdx}));
+  return {start, end};
+}
+
+/// Row offset and size of the tile at group-relative offset `mOffset`, clamped
+/// to the real length of expert `expertIdx`'s group:
+///   row0 = min(start + mOffset, end)
+///   size = clamp(mSize, 0, end - row0)
+/// A tile past the end of a short group gets size 0 and does nothing, which is
+/// what keeps the iteration domain rectangular without padding the rows. `row0`
+/// is clamped too, so that even an empty tile addresses a valid row.
+static std::pair<OpFoldResult, OpFoldResult>
+emitClampedRowTile(OpBuilder &b, Location loc, Value offsets, Value expertIdx,
+                   OpFoldResult mOffset, OpFoldResult mSize) {
+  auto [start, end] = emitGroupRange(b, loc, offsets, expertIdx);
+  Value mOff = getValueOrCreateConstantIndexOp(b, loc, mOffset);
+  Value tile = getValueOrCreateConstantIndexOp(b, loc, mSize);
+
+  Value row0 = arith::MinSIOp::create(
+      b, loc, arith::AddIOp::create(b, loc, start, mOff), end);
+  Value avail = arith::SubIOp::create(b, loc, end, row0);
+  Value zero = arith::ConstantIndexOp::create(b, loc, 0);
+  Value size = arith::MaxSIOp::create(
+      b, loc, zero, arith::MinSIOp::create(b, loc, tile, avail));
+  return {OpFoldResult(row0), OpFoldResult(size)};
+}
+
+SmallVector<utils::IteratorType> GroupedMatmulOp::getLoopIteratorTypes() {
+  return {utils::IteratorType::parallel, utils::IteratorType::parallel,
+          utils::IteratorType::parallel, utils::IteratorType::reduction};
+}
+
+FailureOr<TilingResult>
+GroupedMatmulOp::getTiledImplementation(OpBuilder &builder,
+                                        ArrayRef<OpFoldResult> offsets,
+                                        ArrayRef<OpFoldResult> sizes) {
+  return getTiledImplementation(builder, offsets, sizes, {});
+}
+
+/// Replaces a tile of the grouped matmul with a plain linalg.matmul. The tile
+/// covers a single expert, so the expert's weight matrix is just a slice of
+/// `weights`, and the rows of the tile are those of the expert's group.
+///
+/// E.g. for offsets = [2, 2, 5], the tile of expert 2 with group-relative rows
+/// [0, 32), N cols [n0, n0 + 64) and the full K = 256 is clamped to the 3 rows
+/// of the group, i.e. rows [2, 5):
+///
+///   %lhs = tensor.extract_slice %lhs[2, 0] [3, 256]
+///   %wei = tensor.extract_slice %weights[2, n0, 0] [1, 64, 256]
+///            : tensor<ExNx256xf16> to tensor<64x256xf16>
+///   %out = tensor.extract_slice %output[2, n0] [3, 64]
+///   %res = linalg.matmul indexing_maps = [(m, n, k) -> (m, k),
+///                                         (m, n, k) -> (n, k),
+///                                         (m, n, k) -> (m, n)]
+///            ins(%lhs, %wei) outs(%out)
+///
+/// The row offset and size are runtime values computed from `offsets`, see
+/// emitClampedRowTile().
+FailureOr<TilingResult> GroupedMatmulOp::getTiledImplementation(
+    OpBuilder &builder, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes,
+    ArrayRef<InnerTileAlignment> innerTileAlignments) {
+  (void)innerTileAlignments;
+  assert(offsets.size() == 4 && sizes.size() == 4);
+
+  if (!hasPureTensorSemantics())
+    return emitOpError("tiling is only implemented for tensor semantics");
+
+  // One expert per tile: the weight matrix is picked per tile, so the expert
+  // dim must be tiled to 1 (it is a leading dim, so the heuristics do that
+  // anyway).
+  auto expertTile = getConstantIntValue(sizes[kExpertDim]);
+  if (!expertTile || *expertTile != 1)
+    return emitOpError("expects the expert dimension to be tiled to 1");
+
+  Location loc = getLoc();
+  OpFoldResult one = builder.getIndexAttr(1);
+  Value expertIdx =
+      getValueOrCreateConstantIndexOp(builder, loc, offsets[kExpertDim]);
+
+  // Absolute row range of this tile inside the concatenated rows, clamped to
+  // the group's real length.
+  auto [rowOffset, rowSize] = emitClampedRowTile(
+      builder, loc, getOffsets(), expertIdx, offsets[kMDim], sizes[kMDim]);
+
+  // Drops the leading dim of a [1, x, y] slice type, giving [x, y].
+  auto dropLeadingDim = [](RankedTensorType t) {
+    return RankedTensorType::get(t.getShape().drop_front(), t.getElementType());
+  };
+
+  // lhs [total, K] -> [rows, tile_k] and output [total, N] -> [rows, tile_n]:
+  // both natively 2-D, nothing to rank-reduce.
+  SmallVector<OpFoldResult> strides2(2, one);
+  auto lhsSlice = tensor::ExtractSliceOp::create(
+      builder, loc, getLhs(),
+      SmallVector<OpFoldResult>{rowOffset, offsets[kKDim]},
+      SmallVector<OpFoldResult>{rowSize, sizes[kKDim]}, strides2);
+  auto outSlice = tensor::ExtractSliceOp::create(
+      builder, loc, getOutput(),
+      SmallVector<OpFoldResult>{rowOffset, offsets[kNDim]},
+      SmallVector<OpFoldResult>{rowSize, sizes[kNDim]}, strides2);
+
+  // weights [E, N, K] -> [tile_n, tile_k]: the expert dim is sliced to 1 and
+  // then dropped. Rank-reducing extract_slice is handled by the tile-and-fuse
+  // driver - tensor::replaceExtractSliceWithTiledProducer restores the reduced
+  // type after fusing a producer.
+  SmallVector<OpFoldResult> strides3(3, one);
+  SmallVector<OpFoldResult> weiOffsets{expertIdx, offsets[kNDim],
+                                       offsets[kKDim]};
+  SmallVector<OpFoldResult> weiSizes{one, sizes[kNDim], sizes[kKDim]};
+  auto weiTileType = dropLeadingDim(tensor::ExtractSliceOp::inferResultType(
+      cast<RankedTensorType>(getWeights().getType()), weiSizes));
+  auto weiSlice = tensor::ExtractSliceOp::create(
+      builder, loc, weiTileType, getWeights(), weiOffsets, weiSizes, strides3);
+
+  auto outTileType = cast<RankedTensorType>(outSlice.getResult().getType());
+
+  // With the expert resolved, the tile is a plain matmul with a transposed B:
+  //   out[m, n] += lhs[m, k] * wei[n, k]
+  MLIRContext *ctx = builder.getContext();
+  AffineExpr m, n, k;
+  bindDims(ctx, m, n, k);
+  SmallVector<Attribute> maps = {
+      AffineMapAttr::get(AffineMap::get(3, 0, {m, k}, ctx)),
+      AffineMapAttr::get(AffineMap::get(3, 0, {n, k}, ctx)),
+      AffineMapAttr::get(AffineMap::get(3, 0, {m, n}, ctx))};
+  NamedAttribute indexingMaps(builder.getStringAttr("indexing_maps"),
+                              builder.getArrayAttr(maps));
+
+  auto matmul = linalg::MatmulOp::create(
+      builder, loc, TypeRange{outTileType},
+      ValueRange{lhsSlice.getResult(), weiSlice.getResult()},
+      ValueRange{outSlice.getResult()}, ArrayRef<NamedAttribute>{indexingMaps});
+
+  return TilingResult{{matmul.getOperation()},
+                      SmallVector<Value>(matmul->getResults()),
+                      {lhsSlice.getOperation(), weiSlice.getOperation(),
+                       outSlice.getOperation()}};
+}
+
+LogicalResult GroupedMatmulOp::getResultTilePosition(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes, SmallVector<OpFoldResult> &resultOffsets,
+    SmallVector<OpFoldResult> &resultSizes) {
+  if (resultNumber != 0) return failure();
+  Location loc = getLoc();
+  Value expertIdx =
+      getValueOrCreateConstantIndexOp(builder, loc, offsets[kExpertDim]);
+  // The output map is (e, m, n, k) -> (m, n), but `m` is group-relative in the
+  // domain and absolute in the tensor, so the row position comes from the same
+  // clamp getTiledImplementation() uses rather than from a lookup through the
+  // map. CSE merges the two offsets loads.
+  auto [rowOffset, rowSize] = emitClampedRowTile(
+      builder, loc, getOffsets(), expertIdx, offsets[kMDim], sizes[kMDim]);
+  resultOffsets = {rowOffset, offsets[kNDim]};
+  resultSizes = {rowSize, sizes[kNDim]};
+  return success();
+}
+
+FailureOr<TilingResult> GroupedMatmulOp::generateResultTileValue(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes) {
+  return generateResultTileValue(builder, resultNumber, offsets, sizes, {});
+}
+
+FailureOr<TilingResult> GroupedMatmulOp::generateResultTileValue(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes,
+    ArrayRef<InnerTileAlignment> innerTileAlignments) {
+  (void)builder;
+  (void)resultNumber;
+  (void)offsets;
+  (void)sizes;
+  (void)innerTileAlignments;
+  // Not implementable: a consumer hands us a slice of the *rows* of the result,
+  // and recovering the (expert, group-relative row) pair from an absolute row
+  // needs a search through `offsets`. Returning failure just means this op is
+  // never fused as a producer; it is still tiled as a consumer.
+  return failure();
 }
