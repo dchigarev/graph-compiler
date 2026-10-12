@@ -77,8 +77,6 @@ struct DpasPattern : OpRewritePattern<xegpu::DpasOp> {
         cast<VectorType>(op.getLhs().getType()).getShape());
     SmallVector<int32_t> dataB(
         cast<VectorType>(op.getRhs().getType()).getShape());
-    layoutA.back() = 1;
-    layoutB[layoutB.size() - 2] = 1;
     dataA[dataA.size() - 2] /= layoutA[dataA.size() - 2];
     dataB[dataB.size() - 1] /= layoutB[dataB.size() - 1];
     auto ctx = op.getContext();
