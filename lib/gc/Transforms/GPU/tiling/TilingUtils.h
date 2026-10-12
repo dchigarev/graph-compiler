@@ -72,6 +72,21 @@ inline void mergeWgTileSizesAttr(Operation *op, ArrayRef<int64_t> tiles) {
                          DenseI64ArrayAttr::get(op->getContext(), merged));
 }
 
+// Whether `tiled` iterates over the same domain as `orig`, i.e. tiles indexed
+// by `orig`'s loops can be attached to `tiled` as is.
+inline bool hasSameIterationDomain(Operation *orig, Operation *tiled) {
+  auto origTi = dyn_cast<TilingInterface>(orig);
+  auto tiledTi = dyn_cast<TilingInterface>(tiled);
+  if (!origTi || !tiledTi ||
+      origTi.getLoopIteratorTypes() != tiledTi.getLoopIteratorTypes())
+    return false;
+  auto origIdx = dyn_cast<IndexingMapOpInterface>(orig);
+  auto tiledIdx = dyn_cast<IndexingMapOpInterface>(tiled);
+  // Without indexing maps there is nothing more to compare.
+  if (!origIdx || !tiledIdx) return true;
+  return origIdx.getIndexingMapsArray() == tiledIdx.getIndexingMapsArray();
+}
+
 // Tag the tiled consumer and fused producers from an SCFTileAndFuseResult
 // with `gc.tiling.wg_tile_sizes` derived from `tiles` (indexed by the original
 // consumer's iteration domain).
@@ -91,8 +106,37 @@ inline void tagTileAndFuseResult(Operation *origConsumer,
       tiles, [](size_t v) { return static_cast<int64_t>(v); });
   auto it = result.tiledAndFusedOps.begin();
   // Set tile-size attribute for the tiled op itself (e.g. linalg.matmul),
-  // it's always the first element in the tiledAndFusedOps list.
-  mergeWgTileSizesAttr(*it++, consumerTiles);
+  // it's always the first element in the tiledAndFusedOps list. The tiled op
+  // may have a different iteration domain (e.g. linalgx.grouped_matmul is
+  // tiled into linalg.matmul), in which case the tiles are remapped through
+  // the result indexing maps.
+  Operation *tiled = *it++;
+  auto tiledTi = dyn_cast<TilingInterface>(tiled);
+  if (tiledTi && !hasSameIterationDomain(origConsumer, tiled)) {
+    assert(llvm::none_of(
+               llvm::zip(
+                   cast<TilingInterface>(origConsumer).getLoopIteratorTypes(),
+                   tiles),
+               [](auto p) {
+                 // iterate over pairs of (iterator type, tile size) and check
+                 // if any reduction dim has a non-zero tile size. It should
+                 // never happen: an op whose tiled op has a different iteration
+                 // domain (e.g. linalgx.grouped_matmul -> linalg.matmul) is
+                 // only tiled at the WG level, and computeWgTiles() tiles
+                 // parallel dims only. The reduction dims are tiled at the SG
+                 // level on the resulting op, which keeps its iteration domain
+                 // and so never gets here.
+                 return std::get<0>(p) == utils::IteratorType::reduction &&
+                        std::get<1>(p) != 0;
+               }) &&
+           "can't remap reduction tiles through the result indexing map");
+    mergeWgTileSizesAttr(
+        tiled, remapTiles(tiles, getResultIndexingMap(origConsumer, 0),
+                          getResultIndexingMap(tiled, 0),
+                          tiledTi.getLoopIteratorTypes().size()));
+  } else {
+    mergeWgTileSizesAttr(tiled, consumerTiles);
+  }
 
   auto consumerIdx = dyn_cast<IndexingMapOpInterface>(origConsumer);
   // If the consumer doesn't have indexing maps, we can't remap the tiles to
