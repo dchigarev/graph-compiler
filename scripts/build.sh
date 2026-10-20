@@ -71,7 +71,7 @@ fi
 GC_EXTERNALS_DIR=$(realpath -m "$GC_EXTERNALS_DIR")
 
 : ${LLVM_URL:='https://github.com/llvm/llvm-project.git'}
-: ${LLVM_TAG:=$(cat "$PROJECT_DIR/cmake/llvm-version.txt")}
+: ${LLVM_TAG:=$(head -n1 "$PROJECT_DIR/cmake/llvm-version.txt")}
 : ${LLVM_DIR:="$GC_EXTERNALS_DIR/llvm-project"}
 : ${LLVM_BUILD_TYPE:=$GC_BUILD_TYPE}
 : ${LLVM_BUILD_SFX:="/$LLVM_BUILD_TYPE"}
@@ -89,8 +89,8 @@ MLIR_DIR=$(realpath -m "$MLIR_DIR")
 GC_BUILD_DIR=$(realpath -m "$GC_BUILD_DIR")
 GC_INSTALL_DIR=$(realpath -m "$GC_INSTALL_DIR")
 
-: ${MAX_JOBS:=$(($(nproc) - 2))}
-[ $MAX_JOBS -gt 0 ] || MAX_JOBS=2
+: ${CMAKE_BUILD_PARALLEL_LEVEL:=$(nproc)}
+: ${MAX_JOBS:=$CMAKE_BUILD_PARALLEL_LEVEL}
 
 repo_hash() {
   [ -d "$1" ] || { head -c 1000 /dev/random | sha1sum; return 0; }
@@ -154,10 +154,14 @@ build_llvm() {
         git remote add origin "$LLVM_URL"
         git fetch --no-tags --depth=1 origin ${LLVM_TAG}
         git checkout FETCH_HEAD
-    elif ! is_true "$LLVM_NO_PATCH"; then
+    elif [ "$GITHUB_ACTIONS" = 'true' ] || ! is_true "$LLVM_NO_PATCH"; then
         cd "$LLVM_DIR"
-        [ $(git -C "$LLVM_DIR" rev-parse HEAD) = "$LLVM_TAG" ] || git fetch --no-tags --depth=1 origin ${LLVM_TAG}
-        git reset --hard FETCH_HEAD
+        local ref=HEAD
+        if [ "$(git rev-parse HEAD)" != "$LLVM_TAG" ]; then
+            git fetch --no-tags --depth=1 "$LLVM_URL" "$LLVM_TAG"
+            ref=FETCH_HEAD
+        fi
+        git reset --hard "$ref"
         [ -z "$CLEANUP" ] || git clean -xffd;
     else
       cd "$LLVM_DIR"
@@ -172,7 +176,9 @@ build_llvm() {
       done
     fi
 
-    export LLVM_HASH=$(repo_hash "$LLVM_DIR" "$LLVM_INSTALL_DIR" $LLVM_BUILD_TYPE $GC_DYLINK)
+    local enable_assert=ON
+    [ "$LLVM_BUILD_TYPE" = "Release" ] && enable_assert=OFF
+    export LLVM_HASH=$(repo_hash "$LLVM_DIR" "$LLVM_INSTALL_DIR" $LLVM_BUILD_TYPE $GC_DYLINK $LLVM_CMAKE_ARGS)
     local hash_not_match=$(echo "$builds" | tr ':' '\n' | while read b; do
       [ "$(get_llvm_hash "$b")" = "$LLVM_HASH" ] || echo 1; done)
     [ -z "$hash_not_match" ] && echo "LLVM build is up-to-date" && return 0
@@ -181,11 +187,12 @@ build_llvm() {
     mkdir -p "$LLVM_BUILD_DIR"
 
     echo "Configuring LLVM..."
-    cmake -G Ninja -S llvm -B "$LLVM_BUILD_DIR" \
+    # Configure checks compile in random TryCompile-* dirs and always miss ccache.
+    CCACHE_DISABLE=1 cmake -G Ninja -S llvm -B "$LLVM_BUILD_DIR" \
         -DCMAKE_BUILD_TYPE=$LLVM_BUILD_TYPE \
         -DCMAKE_CXX_FLAGS_DEBUG="-g -O0" \
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-        -DLLVM_ENABLE_ASSERTIONS=ON \
+        -DLLVM_ENABLE_ASSERTIONS=$enable_assert \
         -DLLVM_ENABLE_RTTI=ON \
         -DLLVM_ENABLE_PROJECTS="mlir" \
         -DLLVM_TARGETS_TO_BUILD="X86" \
@@ -199,13 +206,14 @@ build_llvm() {
         -DLLVM_INCLUDE_DOCS=OFF \
         -DLLVM_INSTALL_UTILS=ON \
         -DLLVM_INSTALL_GTEST=ON \
-        -DLLVM_USE_PERF=ON \
+        -DLLVM_USE_PERF=OFF \
         -DLLVM_ENABLE_BINDINGS=OFF \
         -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
         -DPython3_EXECUTABLE=$(which python3) \
         -DMLIR_ENABLE_LEVELZERO_RUNNER=OFF \
         -DLLVM_FORCE_VC_REPOSITORY="$LLVM_URL" \
-        -DCMAKE_INSTALL_PREFIX="$LLVM_INSTALL_DIR"
+        -DCMAKE_INSTALL_PREFIX="$LLVM_INSTALL_DIR" \
+        $LLVM_CMAKE_ARGS
     cmake --build "$LLVM_BUILD_DIR" --parallel $MAX_JOBS $build_target
     
     echo "$builds" | tr ':' '\n' | while read b; do
@@ -222,18 +230,22 @@ build_gc() {
 
   mkdir -p "$GC_BUILD_DIR"
   local lit_path="$LLVM_BUILD_DIR/bin/llvm-lit"
-  [ -f "$lit_path" ] || lit_path=$(which lit)
+  # -s, not -f: the CI cache truncates unused bin/ files to 0 bytes.
+  [ -s "$lit_path" ] || lit_path="$LLVM_INSTALL_DIR/bin/llvm-lit"
+  [ -s "$lit_path" ] || lit_path=$(which lit || true)
   [ -z "$LLVM_HASH" ] && LLVM_HASH=$(get_llvm_hash "$MLIR_DIR/../../..")
-  GC_HASH=$(repo_hash . "$MLIR_DIR" "$lit_path" $LLVM_HASH $GC_BUILD_TYPE $GC_DYLINK)
+  GC_HASH=$(repo_hash . "$MLIR_DIR" "$lit_path" $LLVM_HASH $GC_BUILD_TYPE $GC_DYLINK $GC_CMAKE_ARGS)
   [ "$(get_gc_hash "$GC_INSTALL_DIR")" = "$GC_HASH" ] && echo "GC build is up-to-date" && return 0
   
-  cmake -G Ninja -S . -B "$GC_BUILD_DIR" \
+  CCACHE_DISABLE=1 cmake -G Ninja -S . -B "$GC_BUILD_DIR" \
       -DCMAKE_BUILD_TYPE=$GC_BUILD_TYPE \
       -DGC_DYLINK=$GC_DYLINK \
       -DMLIR_DIR="$MLIR_DIR" \
+      -DLLVM_DIR="$MLIR_DIR/../llvm" \
       -DGC_EXTERNALS_DIR="$GC_EXTERNALS_DIR" \
       -DLLVM_EXTERNAL_LIT="$lit_path" \
-      -DCMAKE_INSTALL_PREFIX="$GC_INSTALL_DIR"
+      -DCMAKE_INSTALL_PREFIX="$GC_INSTALL_DIR" \
+      $GC_CMAKE_ARGS
   cmake --build "$GC_BUILD_DIR" --parallel $MAX_JOBS --target install
   set_gc_hash "$GC_INSTALL_DIR" "$GC_HASH"
 }
